@@ -631,6 +631,64 @@ def png_header(width, height):
     return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
 
 
+def solid_rgb_png(width, height):
+    """Complete PNG without allocating a width*height RGB fixture array."""
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload)))
+
+    compressor = zlib.compressobj()
+    row = b"\x00" + b"\x80\x40\x20" * width  # PNG filter None, RGB pixels.
+    compressed = []
+    for _ in range(height):
+        block = compressor.compress(row)
+        if block:
+            compressed.append(block)
+    compressed.append(compressor.flush())
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", b"".join(compressed)) + chunk(b"IEND", b""))
+
+
+@test
+def test_valid_png_above_twenty_million_pixels_is_rejected_before_opencv():
+    image = solid_rgb_png(5000, 4001)  # 20,005,000 pixels; below Pillow's bomb threshold.
+    assert len(image) < MAX_PHOTO
+    assert Image.MAX_IMAGE_PIXELS is not None and 20_005_000 < Image.MAX_IMAGE_PIXELS
+    with Image.open(io.BytesIO(image)) as valid:
+        assert valid.format == "PNG" and valid.size == (5000, 4001)
+        assert not valid.is_animated
+        valid.verify()  # Valid CRCs and complete IDAT/IEND, not a truncated header.
+    with api() as (client, engine, model, _store, _root):
+        before = dump(engine)
+        # The real service catches cv2.error. Therefore a mutation reaching this
+        # boundary still returns 422: the independent call assertion must fail.
+        with patch.object(cv2, "imdecode", side_effect=cv2.error("Forbidden pixel allocation")) as decoder:
+            assert_photo_error(create(client, photos=files(content=image), status=422), 0)
+        assert decoder.call_count == 0, "Over-limit PNG reached OpenCV's allocation boundary"
+        assert model.calls == 0 and dump(engine) == before
+
+
+@test
+def test_valid_png_exactly_twenty_million_pixels_is_accepted():
+    image = solid_rgb_png(5000, 4000)
+    assert len(image) < MAX_PHOTO
+    with api() as (client, engine, model, store, _root):
+        detect = model.detect
+        decoded_shapes = []
+
+        def observe_real_frame(decoded, max_num=0):
+            decoded_shapes.append(decoded.shape)
+            return detect(decoded, max_num=max_num)
+
+        with patch.object(model, "detect", side_effect=observe_real_frame):
+            created = create(client, photos=files(content=image))
+        assert decoded_shapes == [(4000, 5000, 3)], "Boundary image must pass real decoding"
+        assert created["faces_count"] == 1 and created["revision"] == 1
+        assert model.calls == 1 and gallery_revision(engine) == 1
+        assert store.match(vector()).employee_id == created["id"]
+
+
 @test
 def test_header_bombs_animated_and_non_jpeg_png_inputs_are_rejected_before_inference():
     animated = io.BytesIO()
@@ -638,7 +696,7 @@ def test_header_bombs_animated_and_non_jpeg_png_inputs_are_rejected_before_infer
                                             append_images=[Image.new("RGB", (112, 112), "blue")], duration=100)
     bmp = io.BytesIO()
     Image.fromarray(CHECKER).save(bmp, format="BMP")
-    for image in (png_header(5000, 4001), png_header(100000, 100000),
+    for image in (png_header(100000, 100000),
                   animated.getvalue(), bmp.getvalue(), photo_bytes()[:24]):
         with api() as (client, engine, model, _store, _root):
             before = dump(engine)
