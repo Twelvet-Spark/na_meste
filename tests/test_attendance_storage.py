@@ -195,6 +195,49 @@ def test_malformed_checks_and_fk_actions_refused():
 
 
 @test
+def test_altered_enum_literal_refused_without_mutation():
+    with database() as (engine, _root):
+        with engine.begin() as connection:
+            table_sql = connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='attendance_cameras'").scalar_one()
+            index_sql = connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='uq_attendance_cameras_enabled_role'").scalar_one()
+            trigger_sql = connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE name='attendance_camera_role_retained'").scalar_one()
+            assert "'ENTRY'" in table_sql
+            connection.exec_driver_sql("DROP TABLE attendance_cameras")
+            connection.exec_driver_sql(table_sql.replace("'ENTRY'", "'entry'"))
+            connection.exec_driver_sql(index_sql)
+            # DROP TABLE also removes its trigger; restore it so only the
+            # case-sensitive enum literal differs from the recognized schema.
+            connection.exec_driver_sql(trigger_sql)
+        with engine.connect() as connection:
+            before = tuple(connection.connection.driver_connection.iterdump())
+        exc = rejects(RuntimeError, lambda: schema.initialize_attendance_schema(engine))
+        assert "table attendance_cameras differs from version 1" in str(exc)
+        with engine.connect() as connection:
+            assert tuple(connection.connection.driver_connection.iterdump()) == before
+
+
+@test
+def test_quoted_partial_index_predicate_refused_without_mutation():
+    with database() as (engine, _root):
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP INDEX uq_attendance_cameras_enabled_role")
+            # SQLite treats this unknown double-quoted name as a string literal,
+            # not as the enabled-column comparison. Removing quotes hides that.
+            connection.exec_driver_sql(
+                'CREATE UNIQUE INDEX uq_attendance_cameras_enabled_role '
+                'ON attendance_cameras(role) WHERE "enabled = 1"')
+        with engine.connect() as connection:
+            before = tuple(connection.connection.driver_connection.iterdump())
+        exc = rejects(RuntimeError, lambda: schema.initialize_attendance_schema(engine))
+        assert "index uq_attendance_cameras_enabled_role differs from version 1" in str(exc)
+        with engine.connect() as connection:
+            assert tuple(connection.connection.driver_connection.iterdump()) == before
+
+
+@test
 def test_ddl_interruption_rolls_back_entire_install():
     with database(False) as (engine, _root):
         def interrupt(_conn, _cursor, statement, _parameters, _context, _many):

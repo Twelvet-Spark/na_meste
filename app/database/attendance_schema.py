@@ -38,11 +38,15 @@ def _refuse(detail: str) -> RuntimeError:
     return RuntimeError(f"Attendance schema refused: {detail}. Restore a pre-attendance backup or repair the installation explicitly.")
 
 
-def _sql_key(sql: str) -> str:
-    # Compare the complete generated DDL, not merely column names. This includes
-    # nullability, defaults, uniques, CHECK expressions, FK targets/actions and
-    # index predicates; formatting/identifier quoting is immaterial.
-    return re.sub(r"\s+", "", sql.replace('"', '').replace('`', '')).rstrip(';').lower()
+def _sql_key(sql: str) -> tuple[str, ...]:
+    # Pin generated DDL while ignoring only whitespace between SQL tokens.
+    # Quoted literals/identifiers retain their exact spelling and delimiters:
+    # 'ENTRY' differs from 'entry', and "enabled = 1" is not enabled = 1.
+    # Keeping words separate also avoids equating NOT NULL with NOTNULL.
+    return tuple(re.findall(
+        r"""'(?:''|[^'])*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_]\w*|\d+|[^\s]""",
+        sql.strip().removesuffix(";"),
+    ))
 
 
 def _catalog(connection) -> dict[str, tuple[str, str | None, str]]:
