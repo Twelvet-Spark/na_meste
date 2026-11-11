@@ -14,13 +14,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from uuid import uuid4
 
 import numpy as np
 
 from app.ai.detector import PersonDetector
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
-from app.ai.tracker import ByteTracker, Track
+from app.ai.tracker import ByteTracker, Track, TrackLifecycle
 
 logger = logging.getLogger("app.ai.service")
 
@@ -36,6 +37,7 @@ class DetectionResult:
     state: str                      # recognized | unknown | detecting
     just_confirmed: bool = False    # подтверждён именно на этом кадре
     global_id: Optional[int] = None # проставляет GlobalIdentityManager (межкамерный слой)
+    association_uncertain: bool = False
 
 
 @dataclass
@@ -43,6 +45,8 @@ class FrameOutcome:
     detections: list[DetectionResult] = field(default_factory=list)
     # (track_id, employee_id, confidence) — только что подтверждённые
     new_recognitions: list[tuple[int, int, float]] = field(default_factory=list)
+    tracking_generation: str = ""
+    track_lifecycle: list[TrackLifecycle] = field(default_factory=list)
 
 
 class RecognitionService:
@@ -69,6 +73,7 @@ class RecognitionService:
         self.min_hits = min_hits
         self.tracker_high_threshold = tracker_high_threshold
         self._trackers: dict[int, ByteTracker] = {}
+        self._generations: dict[int, str] = {}
         self._lock = threading.Lock()  # на случай нескольких AI-воркеров
 
     def process_frame(
@@ -79,6 +84,10 @@ class RecognitionService:
 
         persons = self.detector.detect(frame)
         with self._lock:
+            generation = self._generations.get(camera_id)
+            if generation is None:
+                generation = str(uuid4())
+                self._generations[camera_id] = generation
             tracker = self._trackers.setdefault(
                 camera_id,
                 ByteTracker(lost_timeout=self.track_lost_timeout,
@@ -86,7 +95,9 @@ class RecognitionService:
             )
             tracks = tracker.update(persons, now)
 
-        outcome = FrameOutcome()
+        outcome = FrameOutcome(
+            tracking_generation=generation, track_lifecycle=tracker.lifecycle,
+        )
         for track in tracks:
             if track.is_new:
                 logger.info("Camera %d: person detected track=%d", camera_id, track.track_id)
@@ -103,10 +114,13 @@ class RecognitionService:
             outcome.detections.append(self._to_result(track, w, h))
         return outcome
 
-    def drop_camera(self, camera_id: int) -> None:
-        """Удалить состояние камеры (камера удалена/выключена)."""
+    def reset_camera(self, camera_id: int) -> str:
+        """Discard local identity/continuity, including same-stream tracker resets."""
         with self._lock:
             self._trackers.pop(camera_id, None)
+            generation = str(uuid4())
+            self._generations[camera_id] = generation
+            return generation
 
     # ------------------------------------------------------------ внутреннее
 
@@ -177,4 +191,5 @@ class RecognitionService:
                 min(1.0, x2 / frame_w), min(1.0, y2 / frame_h),
             ),
             state=state,
+            association_uncertain=track.association_uncertain,
         )

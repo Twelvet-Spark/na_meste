@@ -230,6 +230,12 @@ class GlobalIdentityManager:
                             },
                         )
 
+    def drop_camera(self, camera_id: int) -> None:
+        """Forget generation-bound local bindings, never persisted global history."""
+        with self._lock:
+            for key in [key for key in self._bindings if key[0] == camera_id]:
+                self._bindings.pop(key, None)
+
     def camera_tracks(self, camera_id: int) -> list[dict]:
         """Активные локальные треки камеры с global_id (для API/UI)."""
         now = time.monotonic()

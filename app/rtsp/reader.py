@@ -14,12 +14,16 @@ import subprocess
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
+from uuid import uuid4
 
 import numpy as np
 
 from app.rtsp.dahua import mask_url
+from app.time_utils import utcnow
 
 logger = logging.getLogger("app.rtsp.reader")
 
@@ -77,6 +81,17 @@ class Backoff:
         self._attempt = 0
 
 
+@dataclass(frozen=True, slots=True)
+class FramePacket:
+    """Server receipt metadata, not camera exposure time; frame is shared read-only."""
+    stream_id: str
+    source_revision: int
+    seq: int
+    received_at: datetime
+    received_mono: float
+    frame: np.ndarray
+
+
 class FrameBuffer:
     """Буфер последних кадров: при переполнении автоматически отбрасывается
     самый старый кадр (drop old, keep latest).
@@ -86,35 +101,46 @@ class FrameBuffer:
     """
 
     def __init__(self, maxlen: int = 2):
-        self._frames: deque[tuple[int, np.ndarray]] = deque(maxlen=maxlen)
+        self._frames: deque[FramePacket] = deque(maxlen=maxlen)
         self._seq = 0
         self._cond = threading.Condition()
 
-    def put(self, frame: np.ndarray) -> int:
+    def put(
+        self, frame: np.ndarray, *, stream_id: str, source_revision: int,
+        received_at: datetime, received_mono: float,
+    ) -> int:
         with self._cond:
             self._seq += 1
-            self._frames.append((self._seq, frame))
+            self._frames.append(FramePacket(
+                stream_id, source_revision, self._seq, received_at, received_mono, frame,
+            ))
             self._cond.notify_all()
             return self._seq
 
-    def latest(self) -> Optional[tuple[int, np.ndarray]]:
-        """(seq, frame) последнего кадра или None, если кадров нет."""
+    def latest(self) -> FramePacket | None:
+        """Последний опубликованный пакет без копирования изображения."""
         with self._cond:
             return self._frames[-1] if self._frames else None
 
     def wait_for_new(
         self, after_seq: int, timeout: float
-    ) -> Optional[tuple[int, np.ndarray]]:
-        """Ждёт кадр новее after_seq. Возвращает (seq, frame) или None по таймауту."""
+    ) -> FramePacket | None:
+        """Ждёт пакет новее after_seq; последовательность относится к этому буферу."""
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
-                if self._frames and self._frames[-1][0] > after_seq:
+                if self._frames and self._frames[-1].seq > after_seq:
                     return self._frames[-1]
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._cond.wait(remaining)
+
+    def clear(self) -> None:
+        """Discard disconnected frames without reusing sequence numbers."""
+        with self._cond:
+            self._frames.clear()
+            self._cond.notify_all()
 
 
 class RTSPReader:
@@ -134,6 +160,7 @@ class RTSPReader:
         name: str,
         rtsp_url: str,
         *,
+        source_revision: int,
         ffmpeg_path: Optional[str],
         ffprobe_path: Optional[str],
         frame_buffer_size: int = 2,
@@ -145,6 +172,7 @@ class RTSPReader:
         self.camera_id = camera_id
         self.name = name
         self.rtsp_url = rtsp_url
+        self.source_revision = source_revision
 
         self._ffmpeg = ffmpeg_path
         self._ffprobe = ffprobe_path
@@ -200,6 +228,7 @@ class RTSPReader:
     def stop(self, timeout: float = 5.0) -> None:
         """Корректная остановка: сигнал + гашение ffmpeg + join потоков."""
         self._stop_event.set()
+        self.buffer.clear()
         with self._proc_lock:
             self._terminate_process()
         if self._thread:
@@ -207,6 +236,7 @@ class RTSPReader:
         if self._watchdog_thread:
             self._watchdog_thread.join(timeout=1.0)
         self._set_status(CameraStatus.OFFLINE)
+        self.buffer.clear()
 
     # Требуемый интерфейс ридера
     def connect(self) -> None:
@@ -223,8 +253,8 @@ class RTSPReader:
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
-    def read(self) -> Optional[tuple[int, np.ndarray]]:
-        """Неблокирующе возвращает последний кадр (seq, frame) из буфера."""
+    def read(self) -> FramePacket | None:
+        """Неблокирующе возвращает последний пакет из буфера."""
         return self.buffer.latest()
 
     def status(self) -> CameraStatus:
@@ -298,6 +328,7 @@ class RTSPReader:
         Возвращает True, если был получен хотя бы один кадр (подключение
         состоялось). Бросает ConnectionLost/StopRequested.
         """
+        self.buffer.clear()
         width, height, codec, stream_fps = self._probe()
         self._attempt_started_mono = time.monotonic()
 
@@ -331,6 +362,7 @@ class RTSPReader:
                 stderr=subprocess.PIPE,
             )
             self._proc = proc
+        stream_id = str(uuid4())
 
         # ffmpeg не должен блокироваться на переполненном stderr — сливаем его
         stderr_tail: deque[str] = deque(maxlen=3)
@@ -346,6 +378,10 @@ class RTSPReader:
                 if chunk is None:
                     detail = stderr_tail[-1] if stderr_tail else "поток закрыт"
                     raise ConnectionLost(detail)
+                received_mono = time.monotonic()
+                received_at = utcnow()
+                if self._stop_event.is_set():
+                    raise StopRequested()
                 frame = np.frombuffer(chunk, dtype=np.uint8).reshape((height, width, 3))
                 if not got_frame:
                     got_frame = True
@@ -354,9 +390,16 @@ class RTSPReader:
                     self._set_status(CameraStatus.ONLINE)
                     if self.reconnect_count:
                         logger.info("[%s] RECONNECTED", self.name)
-                self._on_frame()
-                self.buffer.put(frame)
+                self._on_frame(received_at, received_mono)
+                self.buffer.put(
+                    frame, stream_id=stream_id, source_revision=self.source_revision,
+                    received_at=received_at, received_mono=received_mono,
+                )
         finally:
+            self.buffer.clear()
+            self._set_status(
+                CameraStatus.OFFLINE if self._stop_event.is_set() else CameraStatus.RECONNECTING
+            )
             with self._proc_lock:
                 self._terminate_process()
             try:
@@ -402,12 +445,12 @@ class RTSPReader:
         self.stream_fps = fps
         return width, height, codec, fps
 
-    def _on_frame(self) -> None:
-        """Обновляет статистику FPS (экспоненциальное сглаживание)."""
-        now_mono = time.monotonic()
+    def _on_frame(self, received_at: datetime, received_mono: float) -> None:
+        """Обновляет FPS по тем же отметкам получения полного кадра."""
+        now_mono = received_mono
         prev = self._last_frame_mono
         self._last_frame_mono = now_mono
-        self.last_frame_at = time.time()
+        self.last_frame_at = received_at.replace(tzinfo=timezone.utc).timestamp()
         if prev is not None:
             dt = now_mono - prev
             if dt > 0:

@@ -25,8 +25,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database.database import get_db
+from app.database.models import AttendanceCamera
 from app.rtsp.manager import ReaderManager
-from app.rtsp.reader import RTSPReader
+from app.rtsp.reader import CameraStatus, RTSPReader
 from app.services import camera_service as service
 from app.services.camera_service import ConnectionTestRequest
 
@@ -51,6 +52,13 @@ def _camera_or_404(db: Session, camera_id: int):
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found")
     return camera
+
+
+def _source_revision(db: Session, camera_id: int) -> int:
+    config = db.get(AttendanceCamera, camera_id)
+    if config is None:
+        raise HTTPException(503, "Attendance camera configuration unavailable")
+    return config.source_revision
 
 
 def _camera_response(camera, manager: ReaderManager, request: Request) -> dict:
@@ -120,7 +128,7 @@ def api_create_camera(
 ):
     camera = service.create_camera(db, payload)
     if camera.enabled:
-        manager.start(camera)
+        manager.start(camera, source_revision=_source_revision(db, camera.id))
     return _camera_response(camera, manager, request)
 
 
@@ -145,7 +153,7 @@ def api_update_camera(
 ):
     camera = _camera_or_404(db, camera_id)
     camera, changed = service.update_camera(db, camera, payload)
-    manager.sync(camera, changed)
+    manager.sync(camera, changed, source_revision=_source_revision(db, camera.id))
     return _camera_response(camera, manager, request)
 
 
@@ -292,12 +300,12 @@ def _mjpeg_generator(reader: Optional[RTSPReader], name: str):
             time.sleep(1.0)
             continue
 
-        seq, frame = result
+        seq = result.seq
         now = time.monotonic()
         if now - last_sent < min_interval:
             continue  # кадр пришёл слишком рано — пропускаем, ждём следующий
         last_sent = now
-        yield _multipart_part(_encode_jpeg(frame))
+        yield _multipart_part(_encode_jpeg(result.frame))
 
 
 @router.get("/{camera_id}/stream")
@@ -327,12 +335,9 @@ def api_camera_snapshot(
     """Один статичный JPEG-кадр из буфера ридера."""
     camera = _camera_or_404(db, camera_id)
     reader = manager.get(camera.id)
-    frame = None
-    if reader is not None and reader.is_alive():
-        item = reader.buffer.latest()
-        if item is not None:
-            frame = item[1]
-    if frame is None:
+    packet = reader.buffer.latest() if reader is not None else None
+    if (reader is None or reader.status() is not CameraStatus.ONLINE or packet is None
+            or time.monotonic() - packet.received_mono > settings.frame_stall_timeout):
         raise HTTPException(503, "Кадр недоступен: камера не подключена")
-    return Response(content=_encode_jpeg(frame), media_type="image/jpeg",
+    return Response(content=_encode_jpeg(packet.frame), media_type="image/jpeg",
                     headers={"Cache-Control": "no-cache, no-store"})

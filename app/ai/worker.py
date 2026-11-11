@@ -19,7 +19,10 @@
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.detector import PersonDetector
 from app.ai.face_detector import FaceEngine
@@ -27,7 +30,9 @@ from app.ai.face_recognition import EmbeddingStore
 from app.ai.providers import provider_label, resolve_providers, setup_cuda_dlls
 from app.ai.recognition_service import RecognitionService
 from app.config import BASE_DIR, settings
+from app.database.models import AttendanceCamera, Camera
 from app.rtsp.manager import ReaderManager
+from app.rtsp.reader import CameraStatus, FramePacket
 from app.services.presence_service import PresenceManager
 
 logger = logging.getLogger("app.ai.worker")
@@ -79,6 +84,14 @@ class DetectionState:
             self._data.pop(camera_id, None)
 
 
+@dataclass(frozen=True, slots=True)
+class _CameraConfiguration:
+    source_revision: int
+    calibration_revision: int
+    enabled: bool
+    attendance: bool
+
+
 class AIWorker(threading.Thread):
     def __init__(
         self,
@@ -87,6 +100,8 @@ class AIWorker(threading.Thread):
         presence: PresenceManager,
         detection_state: DetectionState,
         global_manager=None,
+        *,
+        session_factory,
     ):
         super().__init__(name="ai-worker", daemon=True)
         self.manager = manager
@@ -94,88 +109,169 @@ class AIWorker(threading.Thread):
         self.presence = presence
         self.state = detection_state
         self.global_manager = global_manager
-        self._stop = threading.Event()
+        self._session_factory = session_factory
+        self._stop_event = threading.Event()
         self._last_seq: dict[int, int] = {}
         self._last_ts: dict[int, float] = {}
-        self._last_cleanup = 0.0
+        self._last_received: dict[int, float] = {}
+        self._streams: dict[int, tuple[str, int]] = {}
+        self._configurations: dict[int, _CameraConfiguration] = {}
         self._last_global_cleanup = 0.0
 
     def stop(self, timeout: float = 3.0) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=timeout)
 
     def run(self) -> None:
-        logger.info(
-            "AI worker запущен (AI_FPS=%.1f на камеру)", settings.ai_fps
-        )
-        interval = 1.0 / max(0.5, settings.ai_fps)
-
-        while not self._stop.is_set():
+        logger.info("AI worker запущен (AI_FPS=%.1f на камеру)", settings.ai_fps)
+        while not self._stop_event.is_set():
             did_work = False
-            now = time.monotonic()
+            try:
+                packets = self._collect_frames()
+            except SQLAlchemyError:
+                # Never process a source under an unverified persisted revision.
+                logger.exception("AI worker: настройки камер недоступны")
+                for camera_id in list(self._configurations):
+                    self._reset_camera(camera_id)
+                self._configurations.clear()
+                self._stop_event.wait(0.05)
+                continue
 
-            for camera_id in self._camera_ids():
-                if self._stop.is_set():
+            for camera_id, packet, config in packets:
+                if self._stop_event.is_set():
                     break
-                reader = self.manager.get(camera_id)
-                if reader is None or not reader.is_alive():
-                    self.state.drop_camera(camera_id)
+                started = time.monotonic()
+                if (config.attendance
+                        and started - packet.received_mono > settings.attendance_frame_max_age):
+                    self._reset_camera(camera_id)
                     continue
-                item = reader.buffer.latest()
-                if item is None:
+                fps = settings.attendance_ai_fps if config.attendance else max(0.5, settings.ai_fps)
+                interval = 1.0 / fps
+                if started - self._last_ts.get(camera_id, float("-inf")) < interval:
                     continue
-                seq, frame = item
-                if seq <= self._last_seq.get(camera_id, 0):
-                    continue  # нового кадра нет
-                if now - self._last_ts.get(camera_id, 0.0) < interval:
-                    continue  # ещё рано для этой камеры (лимит AI_FPS)
-                self._last_seq[camera_id] = seq
-                self._last_ts[camera_id] = now
+                self._last_seq[camera_id] = packet.seq
+                self._last_ts[camera_id] = started
+                self._last_received[camera_id] = packet.received_mono
                 try:
-                    outcome = self.service.process_frame(frame, camera_id, now)
+                    outcome = self.service.process_frame(
+                        packet.frame, camera_id, packet.received_mono,
+                    )
                 except Exception:
                     logger.exception("Camera %d: ошибка AI-обработки кадра", camera_id)
+                    self._reset_camera(camera_id)
+                    self._streams[camera_id] = (packet.stream_id, packet.source_revision)
+                    self._last_seq[camera_id] = packet.seq
                     continue
 
-                # межкамерный трекинг: Re-ID + глобальные identity.
-                # Ошибки этого слоя не должны останавливать pipeline —
-                # detection/tracking/presence продолжают работать.
                 if self.global_manager is not None:
                     try:
-                        self.global_manager.process(camera_id, outcome, frame, now)
+                        self.global_manager.process(
+                            camera_id, outcome, packet.frame, packet.received_mono,
+                        )
                     except Exception:
                         logger.exception(
                             "Camera %d: ошибка глобального трекинга — "
                             "локальный трекинг продолжается", camera_id,
                         )
-
                 self.state.update(camera_id, outcome.detections)
                 for _track_id, employee_id, confidence in outcome.new_recognitions:
                     self.presence.on_recognized(camera_id, employee_id, confidence)
                 did_work = True
 
-            # закрыть сессии присутствия, истёкшие по таймауту
             self.presence.tick()
-
-            # подчистить состояние исчезнувших камер
-            if now - self._last_cleanup > 10.0:
-                self._last_cleanup = now
-                for camera_id in list(self._last_seq):
-                    if self.manager.get(camera_id) is None:
-                        self._last_seq.pop(camera_id, None)
-                        self._last_ts.pop(camera_id, None)
-                        self.service.drop_camera(camera_id)
-                        self.state.drop_camera(camera_id)
-                # раз в час — удалить старые глобальные данные
-                if (self.global_manager is not None
-                        and now - self._last_global_cleanup > 3600.0):
-                    self._last_global_cleanup = now
-                    self.global_manager.cleanup()
-
+            now = time.monotonic()
+            if (self.global_manager is not None
+                    and now - self._last_global_cleanup > 3600.0):
+                self._last_global_cleanup = now
+                self.global_manager.cleanup()
             if not did_work:
-                self._stop.wait(0.05)
+                self._stop_event.wait(0.05)
 
+        for camera_id in list(self._configurations):
+            self._reset_camera(camera_id)
         logger.info("AI worker остановлен")
+
+    def _reset_camera(self, camera_id: int) -> None:
+        """Worker-owned reset of every generation-bound consumer."""
+        self.service.reset_camera(camera_id)
+        self.state.drop_camera(camera_id)
+        if self.global_manager is not None:
+            self.global_manager.drop_camera(camera_id)
+        self._streams.pop(camera_id, None)
+        self._last_seq.pop(camera_id, None)
+        self._last_ts.pop(camera_id, None)
+        self._last_received.pop(camera_id, None)
+
+    def _read_configurations(self) -> dict[int, _CameraConfiguration]:
+        with self._session_factory() as db:
+            rows = db.query(
+                AttendanceCamera.camera_id, AttendanceCamera.source_revision,
+                AttendanceCamera.revision, AttendanceCamera.role,
+                AttendanceCamera.enabled, Camera.enabled,
+            ).join(Camera, Camera.id == AttendanceCamera.camera_id).all()
+        return {
+            camera_id: _CameraConfiguration(
+                source, revision, camera_enabled and (role is None or enabled),
+                role is not None,
+            )
+            for camera_id, source, revision, role, enabled, camera_enabled in rows
+        }
+
+    def _collect_frames(self) -> list[tuple[int, FramePacket, _CameraConfiguration]]:
+        # Reconcile every camera before doing inference on any of their frames.
+        camera_ids = self._camera_ids()
+        configurations = self._read_configurations()
+        included = {
+            camera_id for camera_id in camera_ids
+            if camera_id in configurations and configurations[camera_id].enabled
+        }
+        for camera_id in set(self._configurations) - included:
+            self._reset_camera(camera_id)
+            self._configurations.pop(camera_id, None)
+
+        packets = []
+        for camera_id in camera_ids:
+            if camera_id not in included:
+                continue
+            config = configurations[camera_id]
+            previous = self._configurations.get(camera_id)
+            if previous is not None and previous != config:
+                self._reset_camera(camera_id)
+            self._configurations[camera_id] = config
+            reader = self.manager.get(camera_id)
+            if (reader is None or not reader.is_alive()
+                    or reader.status() is not CameraStatus.ONLINE
+                    or reader.source_revision != config.source_revision):
+                if camera_id in self._streams:
+                    self._reset_camera(camera_id)
+                continue
+            packet = reader.buffer.latest()
+            if packet is None or packet.source_revision != config.source_revision:
+                if camera_id in self._streams:
+                    self._reset_camera(camera_id)
+                continue
+            stream = (packet.stream_id, packet.source_revision)
+            if camera_id in self._streams and self._streams[camera_id] != stream:
+                self._reset_camera(camera_id)
+            self._streams[camera_id] = stream
+            age = time.monotonic() - packet.received_mono
+            if config.attendance and age > settings.attendance_frame_max_age:
+                self._reset_camera(camera_id)
+                continue
+            if packet.seq <= self._last_seq.get(camera_id, 0):
+                if (camera_id in self._last_received
+                        and age > settings.attendance_max_frame_gap):
+                    self._reset_camera(camera_id)
+                    self._streams[camera_id] = stream
+                    self._last_seq[camera_id] = packet.seq
+                continue
+            last_received = self._last_received.get(camera_id)
+            if (last_received is not None
+                    and packet.received_mono - last_received > settings.attendance_max_frame_gap):
+                self._reset_camera(camera_id)
+                self._streams[camera_id] = stream
+            packets.append((camera_id, packet, config))
+        return packets
 
     def _camera_ids(self) -> list[int]:
         ids = set(self.manager.reader_ids())
@@ -204,7 +300,7 @@ def build_enroll_engine() -> Optional[FaceEngine]:
 
 def build_ai_worker(
     manager: ReaderManager, presence: PresenceManager, store: EmbeddingStore,
-    session_factory=None, notifier=None,
+    *, session_factory, notifier=None,
 ) -> Optional[AIWorker]:
     """Собирает полный AI-стек. None — модели недоступны (приложение работает
     только как RTSP-превью, не падая)."""
@@ -267,4 +363,4 @@ def build_ai_worker(
     state = DetectionState()
     logger.info("AI Provider: %s", provider_label(detector.session.get_providers()))
     return AIWorker(manager, service, presence, state,
-                    global_manager=global_manager)
+                    global_manager=global_manager, session_factory=session_factory)

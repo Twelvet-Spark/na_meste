@@ -36,7 +36,7 @@ class ReaderManager:
     def ffprobe(self) -> Optional[str]:
         return self._ffprobe
 
-    def start(self, camera: Camera) -> RTSPReader:
+    def start(self, camera: Camera, *, source_revision: int) -> RTSPReader:
         """Запускает ридер камеры (существующий перезапускается)."""
         with self._lock:
             self._stop_locked(camera.id)
@@ -47,6 +47,7 @@ class ReaderManager:
                     camera.nvr_host, camera.rtsp_port, camera.username,
                     camera.password, camera.channel, camera.stream_type,
                 ),
+                source_revision=source_revision,
                 ffmpeg_path=self._ffmpeg,
                 ffprobe_path=self._ffprobe,
                 frame_buffer_size=settings.frame_buffer_size,
@@ -72,7 +73,10 @@ class ReaderManager:
         with self._lock:
             return list(self._readers.keys())
 
-    def sync(self, camera: Camera, changed_fields: Optional[set[str]] = None) -> None:
+    def sync(
+        self, camera: Camera, changed_fields: Optional[set[str]] = None,
+        *, source_revision: int,
+    ) -> None:
         """Приводит ридер в соответствие с настройками камеры после изменения."""
         with self._lock:
             reader = self._readers.get(camera.id)
@@ -82,9 +86,10 @@ class ReaderManager:
                 self.stop(camera.id)
             return
         if reader is None:
-            self.start(camera)
-        elif changed_fields is None or changed_fields & self.CONNECTION_FIELDS:
-            self.start(camera)  # перезапуск с новым URL
+            self.start(camera, source_revision=source_revision)
+        elif (changed_fields is None or changed_fields & self.CONNECTION_FIELDS
+              or reader.source_revision != source_revision):
+            self.start(camera, source_revision=source_revision)
         else:
             reader.name = camera.name  # переименование — без переподключения
 
