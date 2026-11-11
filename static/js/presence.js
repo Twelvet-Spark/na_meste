@@ -17,7 +17,8 @@ const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принят�
   GALLERY_CHANGED: 'Изменена база лиц', SOURCE_CHANGED: 'Изменён источник', CALIBRATION_CHANGED: 'Изменена калибровка',
   EMPLOYEE_INACTIVE: 'Сотрудник неактивен', LOW_FACE_SCORE: 'Недостаточное сходство', BLURRY_FACE: 'Размытое лицо',
   BAD_ALIGNMENT: 'Лицо не выровнено', FACE_TOO_SMALL: 'Лицо слишком мало', LOW_FACE_DETECTION: 'Низкое качество детекции',
-  UNMONITORED: 'Период до начала наблюдения', RUNNING: 'Предварительно', CONFIRMED: 'Подтверждено' };
+  UNMONITORED: 'Период до начала наблюдения', FUTURE_DATE: 'Будущая дата — наблюдение ещё не завершено',
+  SESSION_REVIEW: 'Спорный рабочий интервал', RUNNING: 'Предварительно', CONFIRMED: 'Подтверждено' };
 const label = (value) => labels[value] || value || '—';
 const reasons = (values) => (values || []).map(label).join('; ') || '—';
 const time = (iso) => iso ? iso.replace('T', ' ') : '—';
@@ -359,15 +360,25 @@ function reportTable(headers, items, render) {
 }
 $('report-filter').onsubmit = async (event) => {
   event.preventDefault();
-  const params = query(event.currentTarget);
+  const form = event.currentTarget;
+  if (form.getAttribute('aria-busy') === 'true') return;
+  const params = query(form);
+  const submit = form.querySelector('[type="submit"]');
+  form.setAttribute('aria-busy', 'true'); submit.disabled = true;
   $('report-csv').hidden = true;
+  $('report-results').replaceChildren(); $('report-warnings').replaceChildren();
+  $('report-summary').textContent = 'Загрузка отчёта за выбранный период…';
+  showError('report-error', null);
   try {
     const data = await api(`/api/attendance/report?${params}`);
     showError('report-error', null);
     $('report-summary').textContent = `${data.from_date} — ${data.to_date} · на ${time(data.as_of)} · ${data.finalizable ? 'Полные завершённые дни, можно использовать итог' : 'Неокончательный отчёт: есть открытые интервалы или неполнота наблюдения'}`;
+    // Earlier unresolved crossings can block this period. Do not hide them
+    // behind a from_date filter when taking the operator directly to review.
+    const reviewUrl = (kind) => `/presence?${new URLSearchParams({ kind, to_date: data.as_of.slice(0, 10) })}#review`;
     $('report-warnings').replaceChildren(
-      link(`Нерешённых проходов: ${data.unresolved_crossings}`, '/presence?kind=event#review'),
-      document.createTextNode(' · '), link(`Потерь наблюдения: ${data.unreviewed_gaps}`, '/presence?kind=gap#review'));
+      link(`Нерешённых проходов: ${data.unresolved_crossings}`, reviewUrl('event')),
+      document.createTextNode(' · '), link(`Потерь наблюдения: ${data.unreviewed_gaps}`, reviewUrl('gap')));
     const results = $('report-results');
     results.replaceChildren(el('h3', 'По дням'));
     results.append(reportTable(
@@ -375,15 +386,18 @@ $('report-filter').onsubmit = async (event) => {
       data.rows, (item) => [item.date, item.employee_name, hms(item.confirmed_ms), hms(item.running_ms),
         hms(item.review_ms), item.visit_count, time(item.first_entry), time(item.last_exit), item.pending_count,
         `${label(item.status)} · ${reasons(item.coverage_reasons)}`]));
-    results.append(el('h3', 'Итоги по сотрудникам'), reportTable(
+    results.append(el('h3', 'Итоги за период по сотрудникам'), reportTable(
       ['Сотрудник', 'Подтверждено', 'Текущее', 'На проверке', 'Нерешено'], data.totals,
       (item) => [item.employee_name, hms(item.confirmed_ms), hms(item.running_ms), hms(item.review_ms), item.pending_count]));
     if (!data.rows.length) results.append(el('p', 'Нет сотрудников или рабочих записей за выбранный период.', 'empty'));
     $('report-csv').href = `/api/attendance/report.csv?${params}`;
     $('report-csv').hidden = false;
   } catch (error) {
-    if (error.status === 404) error.message = 'Сервис отчётов недоступен. Рабочие интервалы и проверка доступны в соседних вкладках.';
+    if (error.status === 404) error.message = 'Сотрудник не найден. Обновите список сотрудников и повторите выбор.';
+    $('report-summary').textContent = 'Отчёт не загружен. Проверьте условия и нажмите «Показать отчёт» повторно.';
     showError('report-error', error);
+  } finally {
+    form.removeAttribute('aria-busy'); submit.disabled = false;
   }
 };
 $('refresh-all').onclick = () => {
@@ -402,6 +416,13 @@ async function start() {
   if (params.get('employee_id')) {
     for (const form of ['events-filter', 'review-filter', 'legacy-filter', 'report-filter']) {
       fields($(form)).employee_id.value = params.get('employee_id');
+    }
+  }
+  for (const name of ['from_date', 'to_date']) {
+    if (params.get(name)) {
+      for (const form of ['events-filter', 'review-filter', 'legacy-filter', 'report-filter']) {
+        fields($(form))[name].value = params.get(name);
+      }
     }
   }
   if (params.get('kind')) fields($('review-filter')).kind.value = params.get('kind');

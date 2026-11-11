@@ -83,6 +83,7 @@
   <section class="panel attendance-tabpanel" id="panel-report" role="tabpanel" aria-labelledby="tab-report" hidden>
     <div class="panel-head"><h2>Отчёт по рабочему времени</h2><span class="muted zone-label">UTC+05:00</span></div>
     <form id="report-filter" class="attendance-filters"><label class="field">С даты<input type="date" name="from_date" required></label><label class="field">По дату включительно<input type="date" name="to_date" required></label><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" data-all="true"></select></label><button class="btn primary" type="submit">Показать отчёт</button><a id="report-csv" class="btn" hidden>Скачать CSV</a></form>
+    <p class="muted">Период — до 366 дней включительно. Итоги за период берутся из серверного расчёта; текущее и спорное время не включены в подтверждённое. Нерешённые проходы из более ранних дат тоже могут влиять на отчёт. Ручные интервалы подтверждают часы, но не полноту наблюдения за весь день.</p>
     <div id="report-error" class="test-result err" role="alert" hidden></div><p id="report-summary" role="status">Выберите период. Подтверждённое, текущее и спорное время показываются отдельно, без округления вверх.</p><p id="report-warnings"></p><div id="report-results"></div>
   </section>
 

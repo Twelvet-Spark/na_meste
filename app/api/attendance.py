@@ -27,6 +27,7 @@ from app.time_utils import attendance_iso, day_bounds, utcnow
 from app.services.attendance_queries import (
     evaluate_session, event_view, gap_view, load_trust_blockers, read_snapshot,
 )
+from app.services.attendance_reports import AttendanceReport, build_report, report_csv
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
 
@@ -362,6 +363,25 @@ def active_sessions(request: Request, employee_id: int | None = None):
         return ActiveView(items=rows, total=len(rows), as_of=attendance_iso(as_of),
                           utc_offset_minutes=settings.attendance_utc_offset_minutes)
     return _read(request, read)
+
+
+def _report(request, from_date, to_date, employee_id):
+    as_of = milliseconds(_service(request)._now())
+    return _read(request, lambda db: build_report(db, from_date, to_date, employee_id, as_of=as_of))
+
+
+@router.get("/report", response_model=AttendanceReport)
+def attendance_report(request: Request, from_date: date, to_date: date, employee_id: int | None = None):
+    return _report(request, from_date, to_date, employee_id)
+
+
+@router.get("/report.csv")
+def attendance_report_csv(request: Request, from_date: date, to_date: date, employee_id: int | None = None):
+    report = _report(request, from_date, to_date, employee_id)
+    return Response(report_csv(report), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="attendance-{from_date}-{to_date}.csv"',
+        "Cache-Control": "no-store",
+    })
 
 
 @router.get("/review", response_model=ReviewPage)
