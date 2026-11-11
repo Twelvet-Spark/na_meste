@@ -330,6 +330,114 @@ def test_lost_and_ambiguous_lifecycle_clear_votes_before_reacquisition():
 
 
 @test
+def test_gallery_refresh_during_third_face_observation_requires_three_new_revision_votes():
+    with database() as engine:
+        service, _people, faces, store = recognition(engine)
+        assert detection(service, 1, 10.).employee_id is None
+        assert detection(service, 2, 10.25).employee_id is None
+        original_detect = faces.detect
+
+        def refresh_then_detect(image, max_num=0):
+            with Session(engine) as db:
+                employee_service.update_employee(
+                    db, db.get(Employee, 1),
+                    employee_service.EmployeeUpdate(name="First revised"),
+                )
+                store.refresh(db)
+            return original_detect(image, max_num=max_num)
+
+        with patch.object(faces, "detect", side_effect=refresh_then_detect):
+            result = detection(service, 3, 10.5)
+        assert result.employee_id is None, "Two old-revision votes cannot confirm a new gallery"
+        assert result.fresh_face_evidence.store_revision == 8
+        assert result.fresh_face_evidence.confirmed_employee_id is None
+        assert result.fresh_face_evidence.supporting_frame_sequences == (3,)
+        assert detection(service, 4, 10.75).employee_id is None
+        result = detection(service, 5, 11.)
+        assert result.employee_id == 1 and result.employee_name == "First revised"
+        assert result.fresh_face_evidence.store_revision == 8
+        assert result.fresh_face_evidence.supporting_frame_sequences == (3, 4, 5)
+
+
+@test
+def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
+    with database() as engine:
+        service, people, faces, store = recognition(engine)
+        people.observations = [
+            (PERSON, .99), (np.array([400., 0., 600., 500.]), .99),
+        ]
+        for seq, mono in ((1, 10.), (2, 10.25), (3, 10.5)):
+            prior = process(service, seq, mono)
+        assert [item.employee_id for item in prior.detections] == [1, 1]
+        original_detect = faces.detect
+        calls = 0
+
+        def refresh_on_second_head(image, max_num=0):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with Session(engine) as db:
+                    employee_service.update_employee(
+                        db, db.get(Employee, 1),
+                        employee_service.EmployeeUpdate(name="First revised"),
+                    )
+                    store.refresh(db)
+            return original_detect(image, max_num=max_num)
+
+        with patch.object(faces, "detect", side_effect=refresh_on_second_head):
+            outcome = process(service, 4, 10.75)
+        assert store.match(vector()).store_revision == 8
+        assert len(outcome.detections) == 2
+        assert all(item.employee_id is None for item in outcome.detections)
+        assert not outcome.new_recognitions
+        old_evidence = outcome.detections[0].fresh_face_evidence
+        assert old_evidence.store_revision == 7
+        assert old_evidence.confirmed_employee_id == 1
+        assert old_evidence.candidate_employee_name == "First"
+        assert old_evidence.supporting_frame_sequences == (2, 3, 4)
+        assert old_evidence.confirmed_at_mono == 10.5
+        assert "GALLERY_CHANGED" in old_evidence.reason_codes
+        new_evidence = outcome.detections[1].fresh_face_evidence
+        assert new_evidence.store_revision == 8
+        assert new_evidence.confirmed_employee_id is None
+        assert new_evidence.supporting_frame_sequences == (4,)
+
+
+@test
+def test_in_frame_refresh_clears_other_tracks_cached_confirmation_without_resampling():
+    with database() as engine:
+        service, people, faces, store = recognition(engine)
+        process(service, 1, 10.)
+        people.observations = [
+            (PERSON, .99), (np.array([400., 0., 600., 500.]), .99),
+        ]
+        for seq, mono in ((2, 10.1), (3, 10.25), (4, 10.36), (5, 10.5), (6, 10.62)):
+            prior = process(service, seq, mono)
+        assert [item.employee_id for item in prior.detections] == [1, 1]
+        original_detect = faces.detect
+        refreshed = False
+
+        def refresh_then_detect(image, max_num=0):
+            nonlocal refreshed
+            if not refreshed:
+                refreshed = True
+                with Session(engine) as db:
+                    employee_service.update_employee(
+                        db, db.get(Employee, 1),
+                        employee_service.EmployeeUpdate(name="First revised"),
+                    )
+                    store.refresh(db)
+            return original_detect(image, max_num=max_num)
+
+        with patch.object(faces, "detect", side_effect=refresh_then_detect):
+            outcome = process(service, 7, 10.75)
+        assert store.match(vector()).store_revision == 8
+        assert len(outcome.detections) == 2
+        assert all(item.employee_id is None for item in outcome.detections)
+        assert not outcome.new_recognitions
+
+
+@test
 def test_gallery_deactivation_invalidates_confirmed_identity_before_next_sampling():
     with database() as engine:
         service, _people, _faces, store = recognition(engine)

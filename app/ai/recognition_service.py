@@ -7,7 +7,7 @@ of a new crossing. Nonattendance cameras retain their configurable match policy.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -79,6 +79,7 @@ class FrameOutcome:
 @dataclass
 class _FaceRun:
     candidate_id: int | None = None
+    store_revision: int | None = None
     votes: list[tuple[int, float, datetime]] = field(default_factory=list)
     last_attempt: float = float("-inf")
     confirmed_at: float | None = None
@@ -137,7 +138,7 @@ class RecognitionService:
                         self._expire_confirmation(camera_id, track, now)
                     if track.state == "tracked" and track.hits >= self.min_hits:
                         outcome.detections.append(self._to_result(track, width, height))
-                return outcome
+                return self._finalize_outcome(camera_id, outcome)
             self._last_frame_seq[camera_id] = frame_seq
             persons = self.detector.detect(frame)
             heads = [self._head_region(bbox, width, height) for bbox, _score in persons]
@@ -167,7 +168,7 @@ class RecognitionService:
                     evidence = self._recognize(track, frame, heads, camera_id, now,
                                                frame_seq, received_at, attendance, run, outcome)
                 outcome.detections.append(self._to_result(track, width, height, evidence))
-            return outcome
+            return self._finalize_outcome(camera_id, outcome)
 
     def reset_camera(self, camera_id: int) -> str:
         """Every worker-owned reset, including same-stream resets, changes UUID."""
@@ -183,10 +184,15 @@ class RecognitionService:
     def _invalidate_gallery(self) -> None:
         revision = self.store.revision
         if revision != self._store_revision:
-            for tracker in self._trackers.values():
+            for camera_id, tracker in self._trackers.items():
                 for track in tracker.tracks:
-                    track.clear_identity()
-            self._face_runs.clear()
+                    run = self._face_runs.get((camera_id, track.track_id))
+                    if run is None:
+                        track.clear_identity()
+                    else:
+                        # Keep this object: model inference may be holding it.
+                        self._clear_run(track, run)
+                        run.store_revision = revision
             self._store_revision = revision
 
     def _expire_confirmation(self, camera_id: int, track: Track, now: float) -> None:
@@ -261,6 +267,14 @@ class RecognitionService:
             # Never attach names from a newly published gallery to old scores.
             candidate_name = runner_name = None
             reasons.append("GALLERY_CHANGED")
+        # A refresh can publish while face inference is running. Invalidate all
+        # tracks now, not just at frame entry, and never combine gallery votes.
+        self._invalidate_gallery()
+        if run.store_revision != match.store_revision:
+            self._clear_run(track, run)
+            run.store_revision = match.store_revision
+        if match.store_revision != self._store_revision:
+            reasons.append("GALLERY_CHANGED")
         previous_employee = track.employee_id
         if reasons:
             self._clear_run(track, run)
@@ -300,6 +314,37 @@ class RecognitionService:
             tuple(vote[2] for vote in run.votes), run.confirmed_at, bbox, jpeg,
             tuple(dict.fromkeys(reasons)),
         )
+
+    def _finalize_outcome(self, camera_id: int, outcome: FrameOutcome) -> FrameOutcome:
+        """Reconcile earlier/cached results after every model call has finished."""
+        self._invalidate_gallery()
+        tracks = {track.track_id: track for track in self._trackers[camera_id].tracks}
+        qualified = set()
+        for result in outcome.detections:
+            evidence = result.fresh_face_evidence
+            stale = evidence is not None and evidence.store_revision != self._store_revision
+            if stale:
+                # Retain captured IDs, names, scores, votes and their revision.
+                # Only qualification changes before this immutable record leaves
+                # the frame; do not erase a captured confirmation to hide it.
+                result.fresh_face_evidence = replace(
+                    evidence,
+                    reason_codes=tuple(dict.fromkeys((*evidence.reason_codes, "GALLERY_CHANGED"))),
+                )
+            track = tracks.get(result.track_id)
+            if result.employee_id is not None and (
+                    stale or track is None or track.employee_id != result.employee_id):
+                result.employee_id = None
+                result.employee_name = None
+                result.confidence = None
+                result.state = "unknown"
+                result.just_confirmed = False
+            if result.employee_id is not None:
+                qualified.add((result.track_id, result.employee_id))
+        outcome.new_recognitions[:] = [
+            item for item in outcome.new_recognitions if item[:2] in qualified
+        ]
+        return outcome
 
     @staticmethod
     def _contains(region, point) -> bool:
