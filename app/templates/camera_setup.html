@@ -1,0 +1,69 @@
+<dialog id="camera-setup" class="modal camera-setup" aria-labelledby="setup-title" data-workplace-offset="{{ workplace_utc_offset_minutes }}">
+  <h2 id="setup-title">Добавить устройство Dahua</h2>
+  <ol class="setup-progress" aria-label="Этапы подключения">
+    <li data-progress="0">Устройство</li><li data-progress="1">Подключение</li><li data-progress="2">Каналы и архив</li>
+  </ol>
+  <form id="camera-form" autocomplete="off">
+    <fieldset id="setup-device" class="plain-fieldset" data-setup-step="0">
+      <legend class="section-subtitle">Что подключаем?</legend>
+      <label class="setup-choice"><input type="radio" name="device_kind" value="camera" checked>Камера Dahua <span class="muted">Один канал, по умолчанию №1.</span></label>
+      <label class="setup-choice"><input type="radio" name="device_kind" value="recorder">Регистратор Dahua <span class="muted">Выберите каналы NVR: обнаружение или ручной ввод.</span></label>
+      <p class="muted">Каждый выбранный канал станет отдельной камерой. Существующие камеры и история не изменятся.</p>
+    </fieldset>
+    <fieldset id="setup-connection" class="plain-fieldset" data-setup-step="1" hidden disabled>
+      <legend class="section-subtitle">Подключение к живому видео</legend>
+      <div class="setup-fields">
+        <label class="field">IP или имя устройства<input name="nvr_host" required maxlength="255" placeholder="192.168.1.100" spellcheck="false" autocomplete="off"></label>
+        <label class="field">RTSP-порт<input name="rtsp_port" type="number" value="554" min="1" max="65535" step="1" required></label>
+        <label class="field">Логин<input name="username" required maxlength="100" autocomplete="off"></label>
+        <label class="field">Пароль<input name="password" type="password" maxlength="255" autocomplete="new-password"></label>
+        <label class="field">Канал для проверки<input name="probe_channel" type="number" value="1" min="1" max="64" step="1" required></label>
+        <label class="field">Поток для проверки<select name="probe_stream"><option value="main">Основной (main)</option><option value="sub">Дополнительный (sub)</option></select></label>
+      </div>
+      <p id="setup-password-help" class="muted field-help">Пароль хранится только на сервере и не возвращается в ответах.</p>
+      <button id="setup-test" class="btn" type="button">Проверить живое видео</button>
+      <p id="setup-live-result" class="form-status" role="status" aria-live="polite">Подключение ещё не проверено.</p>
+      <p class="muted small">Камеру можно сохранить офлайн и проверить позже. Проверка RTSP не подтверждает доступ к архиву и не включает учёт рабочего времени.</p>
+    </fieldset>
+    <fieldset id="setup-channels" class="plain-fieldset" data-setup-step="2" hidden disabled>
+      <legend class="section-subtitle">Каналы и названия</legend>
+      <div id="setup-recorder-tools">
+        <p class="muted field-help">Обнаружение требует отдельного разрешения CGI. Если его нет, добавьте каналы вручную — живое видео продолжит работать.</p>
+        <div class="setup-manual">
+          <label class="field">Номер канала<input id="setup-manual-channel" type="number" value="1" min="1" max="64" step="1"></label>
+          <button id="setup-add-channel" class="btn" type="button">Добавить канал</button>
+          <button id="setup-discover" class="btn" type="button">Обнаружить каналы</button>
+        </div>
+      </div>
+      <p id="setup-discovery-result" class="form-status" role="status" aria-live="polite"></p>
+      <div id="setup-channel-list" class="setup-channel-list"></div>
+      <details id="setup-archive-details">
+        <summary>HTTP и архив регистратора</summary>
+        <p class="muted field-help">HTTP нужен для обнаружения каналов и архива; RTSP-подключение проверяется независимо. HTTPS проверяет сертификат устройства — небезопасного обхода нет.</p>
+        <div class="setup-fields">
+          <label class="field">Протокол<select name="http_scheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+          <label class="field">HTTP-порт<input name="http_port" type="number" value="80" min="1" max="65535" step="1" required></label>
+        </div>
+        <label class="setup-check"><input name="archive_enabled" type="checkbox">Настроить доступ к архиву для выбранных каналов</label>
+        <fieldset id="setup-offset-fields" class="plain-fieldset" disabled>
+          <label class="field">Смещение времени устройства от UTC, минуты<input name="utc_offset_minutes" type="number" min="-720" max="840" step="1" placeholder="Например, 180 для UTC+03:00" required></label>
+          <button id="setup-use-offset" class="btn ghost" type="button">Подставить смещение рабочего места</button>
+          <label class="setup-check"><input name="offset_confirmed" type="checkbox" required>Подтверждаю: это смещение часов регистратора применимо к просматриваемым записям.</label>
+          <p class="muted small">Не предполагаем совпадение часов сервера и устройства. Переход на летнее время автоматически не определяется; часы регистратора не меняются.</p>
+        </fieldset>
+      </details>
+    </fieldset>
+    <p id="setup-message" class="form-status" role="status" aria-live="polite"></p>
+    <div id="setup-conflict" class="request-notice" hidden>
+      <p>Настройки архива изменились в другом окне. Ваши поля сохранены. Загрузите текущую версию, проверьте её и примените свой черновик повторно.</p>
+      <p id="setup-current-archive"></p>
+      <button id="setup-rebase" type="button" class="btn">Загрузить версию, сохранив черновик</button>
+    </div>
+    <div class="form-actions">
+      <button class="btn ghost" type="button" data-dialog-cancel>Отмена</button>
+      <button id="setup-back" class="btn" type="button" hidden>Назад</button>
+      <button id="setup-next" class="btn primary" type="button">Продолжить</button>
+      <button id="setup-save" class="btn primary" type="submit" hidden>Сохранить камеры</button>
+    </div>
+  </form>
+</dialog>

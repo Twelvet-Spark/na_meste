@@ -776,7 +776,8 @@ async def asgi_request(app, method, path, payload=None):
 
     await app({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
                "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
-               "query_string": b"", "headers": [(b"content-type", b"application/json")],
+               "query_string": b"", "headers": [(b"content-type", b"application/json"),
+                                                (b"x-operator-request", b"1")],
                "client": ("127.0.0.1", 12345), "server": ("test", 80), "root_path": ""},
               receive, send)
     start = next(message for message in messages if message["type"] == "http.response.start")

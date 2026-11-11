@@ -4,75 +4,28 @@
 {% block title %}Мониторинг{% endblock %}
 
 {% block topbar_right %}
-  <button id="btn-add" class="btn primary">+ Добавить камеру</button>
+  <button id="btn-add" class="btn primary">Добавить устройство</button>
 {% endblock %}
 
 {% block content %}
-  <main class="container wide">
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Камеры</h2>
-        <span id="summary" class="muted"></span>
+  <main class="container wide camera-workspace">
+    <header class="page-heading">
+      <div><h1>Камеры</h1><p class="muted">Dahua: отдельные камеры и каналы регистратора. Подключение не запускает запись и не заменяет наладку учёта.</p></div>
+    </header>
+    <section class="panel" aria-label="Подключённые камеры">
+      <div class="directory-summary">
+        <p id="summary" class="muted" role="status" aria-live="polite">Загрузка камер…</p>
+        <button id="camera-retry" class="btn" type="button" hidden>Повторить загрузку</button>
       </div>
       <div id="camera-grid" class="camera-grid"></div>
-      <div id="empty" class="empty" hidden>
-        Камер пока нет. Нажмите «Добавить камеру», чтобы создать первую.
-      </div>
+      <div id="empty" class="empty" hidden><p>Добавьте первую камеру Dahua или несколько каналов регистратора.</p><button id="camera-empty-add" class="btn primary" type="button">Добавить устройство</button></div>
     </section>
   </main>
 
-  <!-- Модальное окно добавления / редактирования камеры -->
-  <div id="modal" class="modal-backdrop" hidden>
-    <div class="modal">
-      <h2 id="modal-title">Добавить камеру</h2>
-      <form id="camera-form" autocomplete="off">
-        <label class="field">Название
-          <input name="name" required maxlength="100" placeholder="Касса 1">
-        </label>
-        <div class="row">
-          <label class="field grow">NVR IP
-            <input name="nvr_host" required placeholder="192.168.1.100">
-          </label>
-          <label class="field port">RTSP порт
-            <input name="rtsp_port" type="number" value="554" min="1" max="65535" required>
-          </label>
-        </div>
-        <div class="row">
-          <label class="field grow">Логин
-            <input name="username" required placeholder="admin">
-          </label>
-          <label class="field grow">Пароль
-            <input name="password" type="password" placeholder="пароль NVR">
-          </label>
-        </div>
-        <div class="row">
-          <label class="field">Канал
-            <input name="channel" type="number" value="1" min="1" max="64" required>
-          </label>
-          <label class="field">Поток
-            <select name="stream_type">
-              <option value="main">main — основной</option>
-              <option value="sub">sub — дополнительный</option>
-            </select>
-          </label>
-          <label class="field checkbox-field">
-            <input type="checkbox" name="enabled" checked> Включена
-          </label>
-        </div>
-
-        <div id="test-result" class="test-result" hidden></div>
-
-        <div class="modal-actions">
-          <button type="button" id="btn-test" class="btn">Проверить подключение</button>
-          <span class="spacer"></span>
-          <button type="button" id="btn-cancel" class="btn">Отмена</button>
-          <button type="submit" class="btn primary">Сохранить</button>
-        </div>
-      </form>
-    </div>
-  </div>
+  {% include "camera_setup.html" %}
 {% endblock %}
 
 {% block scripts %}
+  <script src="/static/js/camera_setup.js"></script>
   <script src="/static/js/app.js"></script>
 {% endblock %}

@@ -161,7 +161,7 @@ def initialize_attendance_schema(engine: Engine) -> None:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             recognized = _preflight(connection)
             operator_installed = operator_schema.preflight(connection)
-            if not recognized or not operator_installed:
+            if not recognized or operator_installed != operator_schema.VERSION:
                 if _has_rows(connection):
                     _backup(connection)
                 existing = _catalog(connection)
@@ -173,8 +173,8 @@ def initialize_attendance_schema(engine: Engine) -> None:
                         table.create(connection)
                 if not recognized:
                     connection.exec_driver_sql(_ROLE_TRIGGER)
-                if not operator_installed:
-                    operator_schema.install(connection)
+                if operator_installed != operator_schema.VERSION:
+                    operator_schema.install(connection, operator_installed)
             _seed(connection)
             # A fresh install is validated too, before its version is committed.
             _preflight(connection)

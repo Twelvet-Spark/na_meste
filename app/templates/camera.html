@@ -4,16 +4,22 @@
 {% block title %}Камера{% endblock %}
 
 {% block topbar_right %}
-  <span id="camera-title" class="muted">Камера</span>
+  <button id="camera-edit" class="btn" type="button">Изменить подключение</button>
 {% endblock %}
 
 {% block content %}
-  <main class="container view">
-    <div class="video-panel">
+  <main class="container view camera-workspace">
+    <header class="camera-page-heading">
+      <a class="back-link" href="/">Все камеры</a>
+      <h1 id="camera-title">Камера</h1>
+      <nav class="profile-sections" aria-label="Разделы камеры"><a href="#camera-live">Живое видео</a><a href="#camera-archive">Архив регистратора</a><a href="#calibration-heading">Учёт и разметка</a></nav>
+      <p id="camera-connection" class="muted"></p>
+    </header>
+    <section id="camera-live" class="video-panel" aria-label="Живое видео">
       <img id="stream" src="/api/cameras/{{ camera_id }}/stream" alt="Живой поток камеры">
       <div id="boxes" class="boxes-overlay"></div>
       <div id="video-overlay" class="video-overlay" hidden>Поток недоступен</div>
-    </div>
+    </section>
 
     <aside class="panel">
       <div class="panel-head"><h2>Состояние</h2></div>
@@ -32,6 +38,13 @@
       </dl>
       <p class="muted small">RTSP → FFmpeg → MJPEG + AI (YOLO → трекинг → лица). Статус обновляется каждые 2 сек.</p>
     </aside>
+
+    <section id="camera-archive" class="panel calibration-panel" aria-labelledby="camera-archive-heading">
+      <div class="panel-head"><h2 id="camera-archive-heading">Архив регистратора</h2></div>
+      <p id="camera-archive-state" class="muted" role="status">Загрузка параметров архива…</p>
+      <p class="muted">Живое видео и архив используют разные разрешения устройства. Настроенные HTTP-параметры не подтверждают наличие записей; часы регистратора автоматически не меняются.</p>
+      <button id="camera-edit-archive" class="btn" type="button">Настроить подключение и архив</button>
+    </section>
 
     <section class="panel calibration-panel" aria-labelledby="calibration-heading">
       <div class="panel-head"><h2 id="calibration-heading">Линия входа и выхода</h2></div>
@@ -81,9 +94,11 @@
       <p class="muted small">Назначенную роль нельзя стереть — камеру можно отключить. Разметка не заменяет наладку: автоматический учёт разрешается только после её подтверждения. <a href="/presence">История и ручная проверка</a>.</p>
     </section>
   </main>
+  {% include "camera_setup.html" %}
 {% endblock %}
 
 {% block scripts %}
   <script>window.CAMERA_ID = {{ camera_id }};</script>
+  <script src="/static/js/camera_setup.js"></script>
   <script src="/static/js/camera.js"></script>
 {% endblock %}

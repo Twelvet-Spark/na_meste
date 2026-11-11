@@ -44,6 +44,23 @@ class Camera(Base):
         return f"<Camera id={self.id} name={self.name!r} host={self.nvr_host} ch={self.channel}>"
 
 
+class CameraArchive(Base):
+    __tablename__ = "camera_archives"
+    __table_args__ = (
+        CheckConstraint("http_scheme IN ('http', 'https')"),
+        CheckConstraint("http_port BETWEEN 1 AND 65535"),
+        CheckConstraint("utc_offset_minutes BETWEEN -720 AND 840"),
+        CheckConstraint("revision >= 0"),
+    )
+
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"), primary_key=True)
+    http_scheme: Mapped[str] = mapped_column(String(5))
+    http_port: Mapped[int] = mapped_column(Integer)
+    utc_offset_minutes: Mapped[int] = mapped_column(Integer)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class Employee(Base):
     __tablename__ = "employees"
 

@@ -1,11 +1,11 @@
-"""Frozen additive operator schema v1; attendance's writer owns commit/backup.
+"""Frozen additive operator schemas; attendance's writer owns commit/backup.
 
-Future versions must retain this definition and validate their predecessor before
-adding an explicit migration. No media/archive tables belong to version 1.
+Validate each committed predecessor against its own DDL before upgrading.
+Recording/media tables are not installed by version 2.
 """
 from app.time_utils import utcnow
 
-VERSION = 1
+VERSION = 2
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -62,8 +62,21 @@ V1_TABLES = {
         created_at DATETIME NOT NULL
     )""",
 }
-TABLES = frozenset(V1_TABLES)
-FUTURE_TABLES = frozenset({"camera_archives", "recording_sessions", "recording_segments",
+V2_TABLES = {
+    **V1_TABLES,
+    "camera_archives": """CREATE TABLE camera_archives (
+        camera_id INTEGER NOT NULL PRIMARY KEY,
+        http_scheme VARCHAR(5) NOT NULL CHECK (http_scheme IN ('http', 'https')),
+        http_port INTEGER NOT NULL CHECK (http_port BETWEEN 1 AND 65535),
+        utc_offset_minutes INTEGER NOT NULL CHECK (utc_offset_minutes BETWEEN -720 AND 840),
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES}
+TABLES = frozenset(V2_TABLES)
+FUTURE_TABLES = frozenset({"recording_sessions", "recording_segments",
                            "recording_connections", "recording_gaps"})
 
 
@@ -77,27 +90,29 @@ def preflight(connection):
     catalog = _catalog(connection)
     owned = {name for name, (_kind, _sql, table) in catalog.items()
              if table in TABLES | FUTURE_TABLES or name.startswith("operator_")}
-    installed = bool(owned)
-    if installed:
+    installed = 0
+    if owned:
         if "operator_schema" not in catalog:
             raise _refuse("partial installation without a version")
         try:
             versions = connection.exec_driver_sql("SELECT id, version FROM operator_schema").all()
         except Exception as exc:
             raise _refuse("unreadable version") from exc
-        if versions != [(1, VERSION)]:
+        if len(versions) != 1 or versions[0][0] != 1 or versions[0][1] not in SCHEMAS:
             raise _refuse("unknown or uncommitted version")
-        if owned != TABLES:
+        installed = versions[0][1]
+        expected_tables = SCHEMAS[installed]
+        if owned != set(expected_tables):
             raise _refuse("partial or unexpected operator objects")
-        for name, expected in V1_TABLES.items():
+        for name, expected in expected_tables.items():
             stored = catalog.get(name)
             if stored is None or stored[0] != "table" or _sql_key(stored[1] or "") != _sql_key(expected):
-                raise _refuse(f"table {name} differs from committed version 1")
+                raise _refuse(f"table {name} differs from committed version {installed}")
     employee = catalog.get("employees")
     if employee is None:
         if installed:
             raise _refuse("employees missing from committed installation")
-        return False
+        return 0
     expected = EMPLOYEE_V1_DDL if installed else LEGACY_EMPLOYEE_DDL
     if employee[0] != "table" or _sql_key(employee[1] or "") != _sql_key(expected):
         raise _refuse("employees differs from recognized legacy/operator version")
@@ -114,9 +129,16 @@ def create_legacy_employees(connection):
     connection.exec_driver_sql(EMPLOYEE_INDEX)
 
 
-def install(connection):
-    for addition in EMPLOYEE_ADDITIONS:
-        connection.exec_driver_sql(f"ALTER TABLE employees ADD COLUMN {addition}")
-    for ddl in V1_TABLES.values():
-        connection.exec_driver_sql(ddl)
-    connection.exec_driver_sql("INSERT INTO operator_schema (id,version,updated_at) VALUES (1,1,?)", (utcnow(),))
+def install(connection, installed=0):
+    if installed == 0:
+        for addition in EMPLOYEE_ADDITIONS:
+            connection.exec_driver_sql(f"ALTER TABLE employees ADD COLUMN {addition}")
+        for ddl in V1_TABLES.values():
+            connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql(
+            "INSERT INTO operator_schema (id,version,updated_at) VALUES (1,1,?)", (utcnow(),))
+        installed = 1
+    if installed == 1:
+        connection.exec_driver_sql(V2_TABLES["camera_archives"])
+        connection.exec_driver_sql(
+            "UPDATE operator_schema SET version=2,updated_at=? WHERE id=1", (utcnow(),))

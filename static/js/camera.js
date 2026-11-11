@@ -3,21 +3,27 @@
 const cameraId = window.CAMERA_ID;
 const $ = (id) => document.getElementById(id);
 const boxesEl = $('boxes');
+let refreshSequence = 0;
 
 async function refresh() {
+  const ticket = ++refreshSequence;
   let cam;
   try {
-    const res = await fetch(`/api/cameras/${cameraId}`);
-    if (!res.ok) throw new Error('not found');
-    cam = await res.json();
+    cam = await window.OperatorUI.api(`/api/cameras/${cameraId}`);
+    if (ticket !== refreshSequence) return;
   } catch (e) {
+    if (ticket !== refreshSequence) return;
     $('video-overlay').hidden = false;
-    $('video-overlay').textContent = 'Камера не найдена';
+    $('video-overlay').textContent = 'Не удалось обновить камеру. Проверьте сеть; последние данные сохранены.';
     return;
   }
 
   document.title = `${cam.name}`;
   $('camera-title').textContent = cam.name;
+  $('camera-connection').textContent = `${cam.nvr_host} · канал ${cam.channel} · ${cam.stream_type === 'sub' ? 'дополнительный' : 'основной'} поток`;
+  $('camera-archive-state').textContent = cam.archive
+    ? `Подключение настроено: ${cam.archive.http_scheme.toUpperCase()}, порт ${cam.archive.http_port}, смещение UTC ${cam.archive.utc_offset_minutes >= 0 ? '+' : ''}${cam.archive.utc_offset_minutes} мин. Версия ${cam.archive.revision}. Доступ к записям не проверен.`
+    : 'Архив не настроен. Живое видео работает независимо от архива.';
 
   const status = cam.status || 'OFFLINE';
   const badge = $('status-badge');
@@ -92,6 +98,11 @@ async function refreshBoxes() {
 // Если <img> не смог открыть MJPEG-поток (например, камера удалена)
 $('stream').onerror = () => { $('video-overlay').hidden = false; };
 
+for (const id of ['camera-edit', 'camera-edit-archive']) {
+  const button = $(id);
+  button.addEventListener('click', () => window.CameraSetup.openEdit(cameraId, button));
+}
+window.addEventListener('cameras-changed', refresh);
 refresh();
 refreshBoxes();
 setInterval(refresh, 2000);
@@ -119,27 +130,22 @@ setInterval(refreshBoxes, 500);
     node.hidden = !text;
   }
 
-  async function jsonRequest(url, options) {
-    let response;
+  async function jsonRequest(url, options = {}) {
     try {
-      response = await fetch(url, options);
-    } catch (_) {
-      throw new Error('Сеть недоступна. Изменения не подтверждены; повторите попытку.');
-    }
-    let body;
-    try { body = await response.json(); } catch (_) { body = null; }
-    if (!response.ok) {
-      const error = new Error(response.status === 409
-        ? 'Конфигурация или источник изменились. Зафиксируйте новый кадр, проверьте координаты и сохраните повторно.'
-        : response.status === 503
-          ? 'Камера или база недоступны. Изменения не подтверждены; повторите попытку после восстановления.'
-          : response.status === 404
-            ? 'Камера не найдена. Обновите список камер.'
-            : 'Проверьте роль, координаты и размеры. Линия и внутренняя точка должны быть достаточно разнесены.');
-      error.status = response.status;
+      return await window.OperatorUI.api(url, options);
+    } catch (cause) {
+      const error = new Error(!cause.status
+        ? 'Сеть недоступна. Изменения не подтверждены; повторите попытку.'
+        : cause.status === 409
+          ? 'Конфигурация или источник изменились. Зафиксируйте новый кадр, проверьте координаты и сохраните повторно.'
+          : cause.status === 503
+            ? 'Камера или база недоступны. Изменения не подтверждены; повторите попытку после восстановления.'
+            : cause.status === 404
+              ? 'Камера не найдена. Обновите список камер.'
+              : 'Проверьте роль, координаты и размеры. Линия и внутренняя точка должны быть достаточно разнесены.');
+      error.status = cause.status;
       throw error;
     }
-    return body;
   }
 
   function points() {

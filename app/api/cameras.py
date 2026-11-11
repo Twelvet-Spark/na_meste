@@ -15,6 +15,7 @@
 """
 import logging
 import time
+import threading
 from typing import Optional
 
 import cv2
@@ -22,6 +23,8 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 
 from app.config import settings
 from app.database.database import get_db
@@ -29,10 +32,39 @@ from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, RTSPReader
 from app.services import camera_service as service
 from app.services.camera_service import ConnectionTestRequest
+from app.api.operator_security import require_operator_request
+from app.services.dahua_service import DahuaSetup
 
 logger = logging.getLogger("app.api.cameras")
 
-router = APIRouter(prefix="/api/cameras", tags=["cameras"])
+class _CameraRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def guarded(request):
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                # Model-level validation can include the whole credential-bearing
+                # payload. Never echo request inputs or exception contexts.
+                errors = [{key: item[key] for key in ("loc", "msg", "type") if key in item}
+                          for item in exc.errors()]
+                raise HTTPException(422, errors) from None
+
+        return guarded
+
+
+router = APIRouter(prefix="/api/cameras", tags=["cameras"], route_class=_CameraRoute)
+_setup_lock = threading.Lock()
+
+
+def _setup(request: Request) -> DahuaSetup:
+    with _setup_lock:
+        setup = getattr(request.app.state, "dahua_setup", None)
+        if setup is None:
+            setup = DahuaSetup()
+            request.app.state.dahua_setup = setup
+        return setup
 
 JPEG_QUALITY = 70
 
@@ -53,9 +85,9 @@ def _camera_or_404(db: Session, camera_id: int):
     return camera
 
 
-def _camera_response(camera, manager: ReaderManager, request: Request) -> dict:
+def _camera_response(camera, manager: ReaderManager, request: Request, db: Session) -> dict:
     """Камера без пароля + live-статус + счётчики людей (AI)."""
-    data = service.CameraOut.model_validate(camera).model_dump(mode="json")
+    data = service.camera_out(db, camera)
     data.update(manager.status(camera.id))
     state = _detection_state(request)
     if state is not None:
@@ -70,7 +102,7 @@ def _camera_response(camera, manager: ReaderManager, request: Request) -> dict:
 
 # -------------------------------------------------------------- проверка
 
-@router.post("/test")
+@router.post("/test", dependencies=[Depends(require_operator_request)])
 def api_test_unsaved(
     payload: ConnectionTestRequest,
     db: Session = Depends(get_db),
@@ -100,6 +132,38 @@ def api_test_unsaved(
     )
 
 
+@router.post("/discover", dependencies=[Depends(require_operator_request)])
+def api_discover(
+    payload: service.DiscoveryRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    source = None
+    if payload.camera_id is not None:
+        source = service.camera_snapshot(db, payload.camera_id)
+        if source is None:
+            raise HTTPException(404, "Camera not found")
+    db.rollback()
+    if not payload.password and not source:
+        return {"channels": [], "capabilities": {"channel_titles": False}, "error_code": "DEVICE_AUTH_FAILED"}
+    return _setup(request).discover(payload, source=source)
+
+
+@router.post("/batch", status_code=201, dependencies=[Depends(require_operator_request)])
+def api_create_batch(
+    payload: service.CameraBatch,
+    request: Request,
+    db: Session = Depends(get_db),
+    manager: ReaderManager = Depends(get_manager),
+):
+    result, sources, _replay = service.create_camera_batch(db, payload)
+    for source in sources:
+        _setup(request).source_changed(source)
+        if source.enabled:
+            manager.start(source)
+    return result
+
+
 # ------------------------------------------------------------------- CRUD
 
 @router.get("")
@@ -108,10 +172,10 @@ def api_list_cameras(
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
 ):
-    return [_camera_response(c, manager, request) for c in service.list_cameras(db)]
+    return [_camera_response(c, manager, request, db) for c in service.list_cameras(db)]
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(require_operator_request)])
 def api_create_camera(
     payload: service.CameraCreate,
     request: Request,
@@ -119,9 +183,10 @@ def api_create_camera(
     manager: ReaderManager = Depends(get_manager),
 ):
     camera = service.create_camera(db, payload)
+    _setup(request).source_changed(camera)
     if camera.enabled:
         manager.start(camera)
-    return _camera_response(camera, manager, request)
+    return _camera_response(camera, manager, request, db)
 
 
 @router.get("/{camera_id}")
@@ -132,10 +197,10 @@ def api_get_camera(
     manager: ReaderManager = Depends(get_manager),
 ):
     camera = _camera_or_404(db, camera_id)
-    return _camera_response(camera, manager, request)
+    return _camera_response(camera, manager, request, db)
 
 
-@router.put("/{camera_id}")
+@router.put("/{camera_id}", dependencies=[Depends(require_operator_request)])
 def api_update_camera(
     camera_id: int,
     payload: service.CameraUpdate,
@@ -145,25 +210,29 @@ def api_update_camera(
 ):
     camera = _camera_or_404(db, camera_id)
     camera, changed = service.update_camera(db, camera, payload)
+    _setup(request).source_changed(camera)
     manager.sync(camera, changed)
-    return _camera_response(camera, manager, request)
+    return _camera_response(camera, manager, request, db)
 
 
-@router.delete("/{camera_id}", status_code=204)
+@router.delete("/{camera_id}", status_code=204, dependencies=[Depends(require_operator_request)])
 def api_delete_camera(
     camera_id: int,
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
+    request: Request = None,
 ):
     camera = _camera_or_404(db, camera_id)
     service.delete_camera(db, camera)
+    if request is not None:
+        _setup(request).deleted(camera_id)
     manager.stop(camera_id)
     return None
 
 
 # ---------------------------------------------------------------- статусы
 
-@router.post("/{camera_id}/test")
+@router.post("/{camera_id}/test", dependencies=[Depends(require_operator_request)])
 def api_test_camera(
     camera_id: int,
     db: Session = Depends(get_db),

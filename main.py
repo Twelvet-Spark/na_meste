@@ -149,13 +149,16 @@ app.include_router(attendance_router)
 
 @app.get("/", include_in_schema=False)
 async def index(request: Request):
-    return templates.TemplateResponse(request, "index.html", {})
+    return templates.TemplateResponse(request, "index.html", {
+        "workplace_utc_offset_minutes": settings.attendance_utc_offset_minutes,
+    })
 
 
 @app.get("/cameras/{camera_id}", include_in_schema=False)
 async def camera_page(request: Request, camera_id: int):
     return templates.TemplateResponse(
-        request, "camera.html", {"camera_id": camera_id}
+        request, "camera.html", {"camera_id": camera_id,
+                                  "workplace_utc_offset_minutes": settings.attendance_utc_offset_minutes}
     )
 
 
