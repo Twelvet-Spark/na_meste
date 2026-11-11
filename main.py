@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.providers import provider_label
 from app.ai.worker import build_ai_worker, build_enroll_engine
+from app.api.attendance import router as attendance_router
 from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
 from app.api.global_persons import router as global_persons_router
@@ -115,6 +116,7 @@ app.include_router(cameras_router)
 app.include_router(employees_router)
 app.include_router(presence_router)
 app.include_router(global_persons_router)
+app.include_router(attendance_router)
 
 
 @app.get("/", include_in_schema=False)

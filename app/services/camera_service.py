@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.database.database import immediate_session
-from app.database.models import AttendanceCamera, AttendanceEvent, Camera, PresenceSession
+from app.database.models import AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, PresenceSession
+from app.rtsp.manager import ReaderManager
 from app.rtsp.dahua import build_rtsp_url, mask_url
 from app.rtsp.reader import parse_frame_rate
 
@@ -181,17 +182,35 @@ def create_camera(db: Session, data: CameraCreate) -> Camera:
 
 
 def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Camera, set[str]]:
-    """Обновляет поля камеры. Возвращает (камера, множество изменённых полей)."""
+    """Commit source invalidation before the API can publish a replacement reader."""
+    camera_id = camera.id
+    engine = db.get_bind().engine
+    db.rollback()
     changed: set[str] = set()
-    for field, value in data.model_dump(exclude_unset=True).items():
-        if field == "password" and not value:
-            continue  # пустой пароль = не менять
-        if getattr(camera, field) != value:
-            setattr(camera, field, value)
-            changed.add(field)
-    db.commit()
-    db.refresh(camera)
-    return camera, changed
+    try:
+        with immediate_session(engine) as writer:
+            current = writer.get(Camera, camera_id)
+            if current is None:
+                raise HTTPException(404, "Camera not found")
+            for field, value in data.model_dump(exclude_unset=True).items():
+                if field == "password" and not value:
+                    continue
+                if getattr(current, field) != value:
+                    setattr(current, field, value)
+                    changed.add(field)
+            if changed & ReaderManager.CONNECTION_FIELDS:
+                config = writer.get(AttendanceCamera, camera_id)
+                runtime = writer.get(AttendanceRuntime, 1)
+                if config is None or runtime is None:
+                    raise HTTPException(503, "Attendance configuration unavailable")
+                config.source_revision += 1
+                config.revision += 1
+                config.enabled = False
+                runtime.commission_id = None
+        db.expire_all()
+        return db.get(Camera, camera_id), changed
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Database unavailable; camera was not changed") from exc
 
 
 def delete_camera(db: Session, camera: Camera) -> None:

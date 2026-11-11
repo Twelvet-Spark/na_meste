@@ -32,6 +32,54 @@
       </dl>
       <p class="muted small">RTSP → FFmpeg → MJPEG + AI (YOLO → трекинг → лица). Статус обновляется каждые 2 сек.</p>
     </aside>
+
+    <section class="panel calibration-panel" aria-labelledby="calibration-heading">
+      <div class="panel-head"><h2 id="calibration-heading">Линия входа и выхода</h2></div>
+      <p id="calibration-state" class="muted" aria-live="polite">Загрузка конфигурации учёта…</p>
+      <p class="muted">Внутренняя камера: вход, наружная: выход. Отметьте два конца линии в проёме, затем точку внутри помещения. Пересечение определяется по низу рамки человека, а не по лицу.</p>
+      <div class="calibration-actions">
+        <button id="calibration-freeze" class="btn" type="button">Зафиксировать свежий кадр</button>
+        <button id="calibration-clear" class="btn ghost" type="button" disabled>Разметить заново</button>
+      </div>
+      <p id="calibration-metadata" class="muted small">Для разметки нужен свежий кадр этой камеры. Сохранённая конфигурация доступна и без видео.</p>
+      <div id="calibration-image" class="calibration-image" hidden>
+        <canvas id="calibration-canvas" aria-label="Кадр для разметки линии. Координаты также доступны в полях ниже." aria-describedby="calibration-step"></canvas>
+      </div>
+      <p id="calibration-step" class="muted small">После фиксации: начало линии, конец линии, точка внутри. Координаты можно ввести с клавиатуры.</p>
+      <form id="calibration-form">
+        <div class="calibration-options">
+          <label class="field">Назначение камеры
+            <select id="calibration-role" required>
+              <option value="">Не назначена</option>
+              <option value="ENTRY">Вход — снаружи внутрь</option>
+              <option value="EXIT">Выход — изнутри наружу</option>
+            </select>
+          </label>
+          <label class="checkbox-field"><input id="calibration-enabled" type="checkbox">Включить учёт по этой камере</label>
+        </div>
+        <div class="calibration-coordinates">
+          <fieldset><legend>Начало линии</legend>
+            <label class="field">X (0–1)<input id="gate-start-x" type="number" min="0" max="1" step="0.001" required></label>
+            <label class="field">Y (0–1)<input id="gate-start-y" type="number" min="0" max="1" step="0.001" required></label>
+          </fieldset>
+          <fieldset><legend>Конец линии</legend>
+            <label class="field">X (0–1)<input id="gate-end-x" type="number" min="0" max="1" step="0.001" required></label>
+            <label class="field">Y (0–1)<input id="gate-end-y" type="number" min="0" max="1" step="0.001" required></label>
+          </fieldset>
+          <fieldset><legend>Точка внутри</legend>
+            <label class="field">X (0–1)<input id="gate-inside-x" type="number" min="0" max="1" step="0.001" required></label>
+            <label class="field">Y (0–1)<input id="gate-inside-y" type="number" min="0" max="1" step="0.001" required></label>
+          </fieldset>
+        </div>
+        <p class="muted small">Линия и расстояние от неё до внутренней точки — не меньше 0,05. Ноги должны быть видны по обе стороны. Если камеру передвинули, выполните разметку и наладку заново.</p>
+        <div class="calibration-actions">
+          <button id="calibration-save" class="btn primary" type="submit" disabled>Сохранить разметку</button>
+          <button id="calibration-disable" class="btn danger" type="button" disabled>Отключить учёт</button>
+        </div>
+      </form>
+      <p id="calibration-message" class="test-result" role="status" aria-live="polite" hidden></p>
+      <p class="muted small">Назначенную роль нельзя стереть — камеру можно отключить. Разметка не заменяет наладку: автоматический учёт разрешается только после её подтверждения. <a href="/presence">История и ручная проверка</a>.</p>
+    </section>
   </main>
 {% endblock %}
 
