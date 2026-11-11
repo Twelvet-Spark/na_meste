@@ -82,6 +82,7 @@ class CameraUpdate(HostInput):
     stream_type: Literal["main", "sub"] | None = None
     enabled: StrictBool | None = None
     archive: ArchiveCreate | None = None
+    # Explicit null observes absence; integers observe an existing row, including revision 0.
     expected_archive_revision: StrictInt | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -89,7 +90,7 @@ class CameraUpdate(HostInput):
         for name in self.model_fields_set - {"password", "archive", "expected_archive_revision"}:
             if getattr(self, name) is None:
                 raise ValueError(f"{name} не может быть null")
-        if "archive" in self.model_fields_set and self.expected_archive_revision is None:
+        if "archive" in self.model_fields_set and "expected_archive_revision" not in self.model_fields_set:
             raise ValueError("Для изменения архива требуется expected_archive_revision")
         if "archive" in self.model_fields_set and self.archive is None:
             raise ValueError("Укажите протокол, порт и смещение архива")
@@ -375,7 +376,7 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
                 config.enabled = False
                 runtime.commission_id = None
             if "archive" in data.model_fields_set:
-                actual_revision = archive.revision if archive else 0
+                actual_revision = archive.revision if archive is not None else None
                 if data.expected_archive_revision != actual_revision:
                     raise HTTPException(409, "Настройки архива изменились. Обновите версию, сохранив свой черновик.")
                 if archive is None:

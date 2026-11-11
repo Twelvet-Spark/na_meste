@@ -360,7 +360,14 @@ curl -X POST http://localhost:8000/api/cameras/batch \
   -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
   -d '{"request_id":"3812999c-6f14-4567-ad17-6bdc4078f3b1","nvr_host":"192.168.1.100","rtsp_port":554,"username":"admin","password":"CHANGE_ME","archive":{"http_scheme":"http","http_port":80,"utc_offset_minutes":180},"channels":[{"channel":1,"name":"Вход","stream_type":"main","enabled":false},{"channel":2,"name":"Склад","stream_type":"sub","enabled":false}]}'
 
-# Версия архивных настроек — из GET /api/cameras/1; пустой пароль не меняет секрет.
+# Первичная настройка только если последний GET /api/cameras/1 вернул archive:null.
+# Явный null означает отсутствие настроек; успешное создание даёт ревизию 0.
+curl -X PUT http://localhost:8000/api/cameras/1 \
+  -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
+  -d '{"password":"","expected_archive_revision":null,"archive":{"http_scheme":"http","http_port":80,"utc_offset_minutes":180}}'
+
+# Изменение существующих настроек, если последний GET вернул archive.revision:0.
+# Пустой пароль не меняет секрет; 0 не заменяет null при отсутствии настроек.
 curl -X PUT http://localhost:8000/api/cameras/1 \
   -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
   -d '{"password":"","expected_archive_revision":0,"archive":{"http_scheme":"https","http_port":443,"utc_offset_minutes":180}}'
@@ -438,8 +445,13 @@ JPEG/PNG должны быть неподвижными: максимум 15 М�
 неподдерживаемый CGI не подменяются успешным пустым результатом. Для проверки
 сохранённого пароля можно передать `camera_id` вместо нового пароля,
 сохранив остальные поля подключения.
-Изменение `archive` требует `expected_archive_revision` из последнего GET;
-при 409 загрузите текущую версию и повторно примените проверенный черновик.
+При изменении `archive` поле `expected_archive_revision` обязательно:
+если последний GET вернул `archive:null`, передайте явный `null`;
+иначе — целое `archive.revision`, включая 0. Отсутствие поля — 422.
+Новые настройки получают ревизию 0. Несовпадение состояния/ревизии — 409
+без сохранения любых полей камеры, включая одновременно изменённое RTSP-подключение.
+Загрузите текущую версию и повторно примените проверенный черновик.
+Первичная настройка внутри `POST /api/cameras` или `/batch` не требует этого токена.
 
 ## Безопасность
 

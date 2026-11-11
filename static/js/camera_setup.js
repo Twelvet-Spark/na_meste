@@ -229,7 +229,7 @@
     if (editing) {
       payload = { ...sharedConnection(), ...channels[0] };
       if (JSON.stringify(configuration) !== JSON.stringify(savedArchive(editing))) {
-        payload.archive = configuration; payload.expected_archive_revision = editing.archive?.revision ?? 0;
+        payload.archive = configuration; payload.expected_archive_revision = editing.archive?.revision ?? null;
       }
     } else {
       payload = { ...sharedConnection(), archive: configuration, channels };

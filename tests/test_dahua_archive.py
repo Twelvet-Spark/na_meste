@@ -580,6 +580,101 @@ def test_archive_sql_enforces_scheme_port_offset_revision_and_restrict_camera_fk
 
 
 @test
+def test_two_absent_archive_drafts_use_null_and_stale_save_rolls_back_live_changes():
+    with api() as (client, engine, manager, _root):
+        saved = create(client)
+        path = f"/api/cameras/{saved['id']}"
+        first_draft = client.json("GET", path)
+        second_draft = client.json("GET", path)
+        assert first_draft["archive"] is None and second_draft["archive"] is None
+        with immediate_session(engine) as db:
+            config = db.get(AttendanceCamera, saved["id"])
+            config.role, config.enabled = "ENTRY", True
+            config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
+            config.reference_width, config.reference_height = 1920, 1080
+            commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Verified",
+                                             configuration_fingerprint={"version": 1}, acceptance_record={})
+            db.add(commission)
+            db.flush()
+            commission_id = commission.id
+            db.get(AttendanceRuntime, 1).commission_id = commission_id
+        first = client.json("PUT", path, {
+            "archive": archive(), "expected_archive_revision": None})
+        assert (first["archive"]["http_scheme"], first["archive"]["http_port"],
+                first["archive"]["utc_offset_minutes"], first["archive"]["revision"]) == ("http", 80, 180, 0)
+        with Session(engine) as db:
+            config = db.get(AttendanceCamera, saved["id"])
+            assert (config.source_revision, config.revision, config.enabled) == (1, 0, True)
+            assert db.get(AttendanceRuntime, 1).commission_id == commission_id
+        before = dump(engine)
+        publications = (list(manager.started), list(manager.synced), list(manager.stopped))
+        client.json("PUT", path, {
+            "name": "Stale draft", "password": "stale-secret", "channel": 2,
+            "archive": archive(http_scheme="https", http_port=443, utc_offset_minutes=240),
+            "expected_archive_revision": None}, status=409)
+        assert dump(engine) == before, "Stale absence must roll back camera, source, calibration and commission"
+        assert (manager.started, manager.synced, manager.stopped) == publications
+        assert client.json("GET", path) == first, "The first archive configuration must survive the stale draft"
+
+
+@test
+def test_absent_archive_rejects_integer_zero_token_without_creating_configuration():
+    with api() as (client, engine, manager, _root):
+        saved = create(client)
+        path = f"/api/cameras/{saved['id']}"
+        assert client.json("GET", path)["archive"] is None
+        before = dump(engine)
+        client.json("PUT", path, {
+            "password": "stale-secret", "channel": 2,
+            "archive": archive(), "expected_archive_revision": 0}, status=409)
+        assert dump(engine) == before, "Revision zero must refer to an existing row, never absence"
+        assert manager.synced == []
+        assert client.json("GET", path)["archive"] is None
+
+
+@test
+def test_archive_edit_requires_explicit_token_for_both_absent_and_existing_rows():
+    for configured in (False, True):
+        with api() as (client, engine, manager, _root):
+            saved = create(client, **({"archive": archive()} if configured else {}))
+            before = dump(engine)
+            client.json("PUT", f"/api/cameras/{saved['id']}", {
+                "password": "stale-secret", "channel": 2,
+                "archive": archive(utc_offset_minutes=240)}, status=422)
+            assert dump(engine) == before, "An omitted token is not an explicit null absence observation"
+            assert manager.synced == []
+
+
+@test
+def test_existing_archive_revision_zero_rejects_null_without_mutation():
+    with api() as (client, engine, manager, _root):
+        saved = create(client, archive=archive())
+        assert saved["archive"]["revision"] == 0
+        before = dump(engine)
+        client.json("PUT", f"/api/cameras/{saved['id']}", {
+            "password": "stale-secret", "channel": 2,
+            "archive": archive(utc_offset_minutes=240), "expected_archive_revision": None}, status=409)
+        assert dump(engine) == before
+        assert manager.synced == []
+
+
+@test
+def test_existing_archive_revision_zero_accepts_zero_and_advances_to_one():
+    with api() as (client, engine, _manager, _root):
+        saved = create(client, archive=archive())
+        assert saved["archive"]["revision"] == 0
+        path = f"/api/cameras/{saved['id']}"
+        changed = client.json("PUT", path, {
+            "archive": archive(utc_offset_minutes=240), "expected_archive_revision": 0})
+        assert (changed["archive"]["http_scheme"], changed["archive"]["http_port"],
+                changed["archive"]["utc_offset_minutes"], changed["archive"]["revision"]) == ("http", 80, 240, 1)
+        assert client.json("GET", path)["archive"] == changed["archive"]
+        with Session(engine) as db:
+            config = db.get(AttendanceCamera, saved["id"])
+            assert (config.source_revision, config.revision) == (1, 0)
+
+
+@test
 def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidation():
     with api() as (client, engine, manager, _root):
         saved = create(client, archive=archive())
