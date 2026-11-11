@@ -3,6 +3,7 @@ import json
 import logging
 import subprocess
 from datetime import datetime
+from itertools import count
 from typing import Optional
 
 from fastapi import HTTPException
@@ -12,11 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.database.database import immediate_session
 from app.database.models import AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, PresenceSession
-from app.rtsp.manager import ReaderManager
+from app.rtsp.source import CONNECTION_FIELDS, CameraSource
 from app.rtsp.dahua import build_rtsp_url, mask_url
 from app.rtsp.reader import parse_frame_rate
 
 logger = logging.getLogger("app.services.cameras")
+
+# Captured under the DB write lock, so delayed publications retain commit order.
+_publication_sequences = count(1)
 
 
 # ------------------------------------------------------------------- схемы
@@ -169,20 +173,23 @@ def list_cameras(db: Session) -> list[Camera]:
     return db.query(Camera).order_by(Camera.channel, Camera.id).all()
 
 
-def create_camera(db: Session, data: CameraCreate) -> Camera:
+def create_camera(db: Session, data: CameraCreate) -> CameraSource:
     camera = Camera(**data.model_dump())
     db.add(camera)
     db.flush()
-    db.add(AttendanceCamera(camera_id=camera.id))
+    config = AttendanceCamera(camera_id=camera.id)
+    db.add(config)
+    db.flush()
+    snapshot = CameraSource.from_camera(
+        camera, source_revision=config.source_revision, publication_sequence=next(_publication_sequences))
     db.commit()
-    db.refresh(camera)
-    logger.info("Создана камера #%d «%s» (%s ch%d)", camera.id, camera.name,
-                camera.nvr_host, camera.channel)
-    return camera
+    logger.info("Создана камера #%d «%s» (%s ch%d)", snapshot.id, snapshot.name,
+                snapshot.nvr_host, snapshot.channel)
+    return snapshot
 
 
-def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Camera, set[str]]:
-    """Commit source invalidation before the API can publish a replacement reader."""
+def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[CameraSource, set[str]]:
+    """Capture the source/revision pair under the write lock, then commit it."""
     camera_id = camera.id
     engine = db.get_bind().engine
     db.rollback()
@@ -192,28 +199,33 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
             current = writer.get(Camera, camera_id)
             if current is None:
                 raise HTTPException(404, "Camera not found")
+            config = writer.get(AttendanceCamera, camera_id)
+            if config is None:
+                raise HTTPException(503, "Attendance configuration unavailable")
             for field, value in data.model_dump(exclude_unset=True).items():
                 if field == "password" and not value:
                     continue
                 if getattr(current, field) != value:
                     setattr(current, field, value)
                     changed.add(field)
-            if changed & ReaderManager.CONNECTION_FIELDS:
-                config = writer.get(AttendanceCamera, camera_id)
+            if changed & CONNECTION_FIELDS:
                 runtime = writer.get(AttendanceRuntime, 1)
-                if config is None or runtime is None:
+                if runtime is None:
                     raise HTTPException(503, "Attendance configuration unavailable")
                 config.source_revision += 1
                 config.revision += 1
                 config.enabled = False
                 runtime.commission_id = None
+            writer.flush()
+            snapshot = CameraSource.from_camera(
+                current, source_revision=config.source_revision, publication_sequence=next(_publication_sequences))
         db.expire_all()
-        return db.get(Camera, camera_id), changed
+        return snapshot, changed
     except SQLAlchemyError as exc:
         raise HTTPException(503, "Database unavailable; camera was not changed") from exc
 
 
-def delete_camera(db: Session, camera: Camera) -> None:
+def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
     """Retain every historical/ever-assigned camera, even when disabled."""
     camera_id, name = camera.id, camera.name
     bind = db.get_bind().engine

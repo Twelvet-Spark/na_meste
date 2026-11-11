@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import sys
+import threading
 import tempfile
 import traceback
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -35,6 +37,7 @@ from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import get_db
 from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime
+from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
 from app.services import camera_service
 
@@ -453,6 +456,36 @@ def test_completed_unknown_crossing_survives_temporary_lost_until_window_deadlin
     assert crossing.direction == "ENTRY"
 
 
+def lost_pending_with_late_confirmation(*, idle_expiry):
+    path = Trajectory()
+    for y, seconds in ((.25, 0.), (.3, .25), (.45, .5), (.55, .75), (.7, .8)):
+        path.send(y, seconds=seconds, observation=None)
+    assert path.events == []
+    path.send(None, seconds=.9, observation=None,
+              lifecycle=[TrackLifecycle(1, "LOST", MONO + .8, "TRACK_LOST")])
+    if idle_expiry:
+        path.events.extend(path.detector.expire(MONO + 1.551))
+    # New supporting observations are real distinct frames after reacquisition.
+    # Their final confirmation is still within +1.5s of crossing at .625.
+    path.send(.75, seconds=1.56, observation=face(7, 1.56, confirmed=None))
+    path.send(.78, seconds=1.81, observation=face(8, 1.81, confirmed=None))
+    path.send(.8, seconds=2.06, observation=face(
+        9, 2.06, samples=((7, 8, 9), (1.56, 1.81, 2.06))))
+    return path
+
+
+@test
+def test_completed_unknown_lost_gap_cannot_gain_late_face_eligibility():
+    crossing = single_crossing(lost_pending_with_late_confirmation(idle_expiry=False), eligible=False)
+    assert "FRAME_GAP" in crossing.disqualifying_reasons
+
+
+@test
+def test_idle_expiry_latches_pending_gap_after_lost_clears_geometric_predecessor():
+    crossing = single_crossing(lost_pending_with_late_confirmation(idle_expiry=True), eligible=False)
+    assert "FRAME_GAP" in crossing.disqualifying_reasons
+
+
 @test
 def test_expired_or_disabled_track_flushes_known_completed_direction_without_guessing_face():
     for reason in ("EXPIRED", "DISABLED"):
@@ -709,10 +742,10 @@ class SnapshotManager:
         reader = self.get(camera_id)
         return {"status": reader.status().value if reader else "OFFLINE"}
 
-    def sync(self, camera, changed_fields=None, *, source_revision):
+    def sync(self, camera, changed_fields=None):
         with Session(self.engine) as db:
             config = db.get(AttendanceCamera, camera.id)
-            self.published.append((source_revision, config.source_revision, config.revision,
+            self.published.append((camera.source_revision, config.source_revision, config.revision,
                                    config.enabled, db.get(AttendanceRuntime, 1).commission_id))
 
     def snapshot(self, camera_id=1, *, revision=1, stream="snapshot-stream", seq=9):
@@ -989,6 +1022,121 @@ def test_source_invalidation_failure_rolls_back_camera_and_attendance_together()
             config = db.get(AttendanceCamera, 1)
             assert (config.source_revision, config.revision, config.enabled) == (1, 1, True)
             assert db.get(AttendanceRuntime, 1).commission_id == approved
+
+
+@test
+def test_committed_camera_source_publication_is_an_immutable_transaction_snapshot():
+    with calibration_app() as fixture:
+        with Session(fixture.engine) as db:
+            camera = camera_service.get_camera(db, 1)
+            snapshot, changed = camera_service.update_camera(
+                db, camera, camera_service.CameraUpdate(
+                    name="Door A", nvr_host="source-a", rtsp_port=8554, username="operator-a",
+                    password="secret-a", channel=7, stream_type="sub"))
+            assert snapshot.nvr_host == "source-a"
+            assert changed == {"name", "nvr_host", "rtsp_port", "username", "password", "channel", "stream_type"}
+            try:
+                snapshot.nvr_host = "not-the-committed-source"
+            except (FrozenInstanceError, AttributeError):
+                pass
+            else:
+                raise AssertionError("Committed camera/source publication must be immutable")
+        with Session(fixture.engine) as db:
+            newer, _changed = camera_service.update_camera(
+                db, camera_service.get_camera(db, 1),
+                camera_service.CameraUpdate(
+                    name="Door B", nvr_host="source-b", rtsp_port=9554, username="operator-b",
+                    password="secret-b", channel=8, stream_type="main"))
+        assert (snapshot.id, snapshot.name, snapshot.nvr_host, snapshot.rtsp_port, snapshot.username,
+                snapshot.password, snapshot.channel, snapshot.stream_type, snapshot.enabled,
+                snapshot.source_revision, snapshot.has_password) == (
+                    1, "Door A", "source-a", 8554, "operator-a", "secret-a", 7, "sub", True, 2, True)
+        assert snapshot.created_at is not None and snapshot.updated_at is not None
+        assert (newer.nvr_host, newer.rtsp_port, newer.username, newer.password, newer.channel,
+                newer.stream_type, newer.source_revision) == (
+                    "source-b", 9554, "operator-b", "secret-b", 8, "main", 3)
+
+
+@test
+def test_concurrent_updates_publish_matching_sources_and_cannot_roll_reader_back():
+    with calibration_app() as fixture:
+        with patch("app.rtsp.manager.resolve_ffmpeg", return_value=("unused", "unused")):
+            manager = ReaderManager()
+        fixture.app.state.manager = manager
+        first_captured, release_first = threading.Event(), threading.Event()
+        original_update = camera_service.update_camera
+        published, outcomes, errors = [], {}, []
+
+        def capture_reader_start(reader):
+            published.append((urlsplit(reader.rtsp_url).hostname, reader.source_revision))
+
+        def delay_first_publication(db, camera, payload):
+            result = original_update(db, camera, payload)
+            if payload.nvr_host == "source-a":
+                first_captured.set()
+                if not release_first.wait(10):
+                    raise AssertionError("Concurrent update coordination did not release source A")
+            return result
+
+        def first_request():
+            try:
+                outcomes["a"] = request(fixture, "PUT", "/api/cameras/1", {"nvr_host": "source-a"})
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(camera_service, "update_camera", side_effect=delay_first_publication), \
+                patch.object(RTSPReader, "start", autospec=True, side_effect=capture_reader_start):
+            first = threading.Thread(target=first_request, name="source-update-a", daemon=True)
+            first.start()
+            try:
+                assert first_captured.wait(10), "Source A did not finish its write before source B"
+                outcomes["b"] = request(fixture, "PUT", "/api/cameras/1", {"nvr_host": "source-b"})
+            finally:
+                release_first.set()
+                first.join(10)
+            try:
+                assert not first.is_alive() and not errors, errors
+                assert outcomes["a"][0] == outcomes["b"][0] == 200, outcomes
+                with Session(fixture.engine) as db:
+                    assert camera_service.get_camera(db, 1).nvr_host == "source-b"
+                    assert db.get(AttendanceCamera, 1).source_revision == 3
+                assert published and all(item in (("source-a", 2), ("source-b", 3))
+                                         for item in published), published
+                reader = manager.get(1)
+                assert (urlsplit(reader.rtsp_url).hostname, reader.source_revision) == ("source-b", 3), (
+                    "A superseded publication must not replace the latest committed source", published)
+            finally:
+                manager.stop_all()
+
+
+@test
+def test_superseded_start_and_sync_cannot_restart_a_newer_disabled_source():
+    for replace_connection in (False, True):
+        with calibration_app() as fixture:
+            with Session(fixture.engine) as db:
+                old, _changed = camera_service.update_camera(
+                    db, camera_service.get_camera(db, 1),
+                    camera_service.CameraUpdate(nvr_host="source-a"))
+                updates = {"enabled": False}
+                if replace_connection:
+                    updates["nvr_host"] = "source-b"
+                retired, changed = camera_service.update_camera(
+                    db, camera_service.get_camera(db, 1), camera_service.CameraUpdate(**updates))
+            with patch("app.rtsp.manager.resolve_ffmpeg", return_value=("unused", "unused")):
+                manager = ReaderManager()
+            published = []
+            with patch.object(RTSPReader, "start", autospec=True, side_effect=lambda reader:
+                              published.append((urlsplit(reader.rtsp_url).hostname, reader.source_revision))):
+                try:
+                    manager.start(old)
+                    manager.sync(retired, changed)
+                    assert manager.get(1) is None
+                    assert manager.start(old) is None
+                    manager.sync(old, {"nvr_host"})
+                    assert manager.get(1) is None
+                    assert published == [("source-a", 2)]
+                finally:
+                    manager.stop_all()
 
 
 @test

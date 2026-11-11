@@ -25,7 +25,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database.database import get_db
-from app.database.models import AttendanceCamera
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, RTSPReader
 from app.services import camera_service as service
@@ -52,13 +51,6 @@ def _camera_or_404(db: Session, camera_id: int):
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found")
     return camera
-
-
-def _source_revision(db: Session, camera_id: int) -> int:
-    config = db.get(AttendanceCamera, camera_id)
-    if config is None:
-        raise HTTPException(503, "Attendance camera configuration unavailable")
-    return config.source_revision
 
 
 def _camera_response(camera, manager: ReaderManager, request: Request) -> dict:
@@ -128,7 +120,7 @@ def api_create_camera(
 ):
     camera = service.create_camera(db, payload)
     if camera.enabled:
-        manager.start(camera, source_revision=_source_revision(db, camera.id))
+        manager.start(camera)
     return _camera_response(camera, manager, request)
 
 
@@ -153,7 +145,7 @@ def api_update_camera(
 ):
     camera = _camera_or_404(db, camera_id)
     camera, changed = service.update_camera(db, camera, payload)
-    manager.sync(camera, changed, source_revision=_source_revision(db, camera.id))
+    manager.sync(camera, changed)
     return _camera_response(camera, manager, request)
 
 

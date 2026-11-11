@@ -278,7 +278,8 @@ class DoorwayDetector:
             if track is None:
                 track = _Trajectory(key, calibration)
                 camera.tracks[detection.track_id] = track
-            if track.previous is not None and packet.received_mono - track.last_seen > settings.attendance_max_frame_gap:
+            if ((track.previous is not None or track.pending)
+                    and packet.received_mono - track.last_seen > settings.attendance_max_frame_gap):
                 events.extend(self._interrupt(track, "FRAME_GAP"))
             track.last_seen = packet.received_mono
             observation = detection.fresh_face_evidence
@@ -360,7 +361,8 @@ class DoorwayDetector:
         events = []
         for camera in self._cameras.values():
             for track in camera.tracks.values():
-                if track.previous is not None and now_mono - track.last_seen > settings.attendance_max_frame_gap:
+                if ((track.previous is not None or track.pending)
+                        and now_mono - track.last_seen > settings.attendance_max_frame_gap):
                     events.extend(self._interrupt(track, "FRAME_GAP"))
                 events.extend(self._ready_pending(track, now_mono))
         return events

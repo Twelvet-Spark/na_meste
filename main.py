@@ -26,6 +26,7 @@ from app.config import BASE_DIR, settings
 from app.database.database import SessionLocal, init_db
 from app.database.models import AttendanceCamera, Camera
 from app.rtsp.manager import ReaderManager
+from app.rtsp.source import CameraSource
 from app.services.presence_service import PresenceManager
 from app.services.telegram_service import TelegramNotifier
 
@@ -88,11 +89,14 @@ async def lifespan(app: FastAPI):
         logger.info("AI отключён (AI_ENABLED=false)")
 
     with SessionLocal() as session:
-        saved_cameras = session.query(Camera, AttendanceCamera.source_revision).join(
-            AttendanceCamera, AttendanceCamera.camera_id == Camera.id,
-        ).filter(Camera.enabled.is_(True)).all()
-    for camera, source_revision in saved_cameras:
-        app.state.manager.start(camera, source_revision=source_revision)
+        saved_sources = [
+            CameraSource.from_camera(camera, source_revision=source_revision)
+            for camera, source_revision in session.query(Camera, AttendanceCamera.source_revision).join(
+                AttendanceCamera, AttendanceCamera.camera_id == Camera.id,
+            ).filter(Camera.enabled.is_(True)).all()
+        ]
+    for camera in saved_sources:
+        app.state.manager.start(camera)
 
     logger.info(
         "Приложение запущено: http://localhost:%d (API docs: /docs)", settings.app_port
