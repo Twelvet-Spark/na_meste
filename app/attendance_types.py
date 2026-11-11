@@ -134,3 +134,69 @@ class SessionPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class CommissionAcceptance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entry_trials: int = Field(ge=0)
+    exit_trials: int = Field(ge=0)
+    employee_count: int = Field(ge=0)
+    visitor_trials: int = Field(ge=0)
+    retreat_trials: int = Field(ge=0)
+    wrong_employee: int = Field(ge=0)
+    duplicate_trips: int = Field(ge=0)
+    missed_unflagged: int = Field(ge=0)
+    frontal_trials: int = Field(ge=0)
+    frontal_eligible: int = Field(ge=0)
+    performance_minutes: int = Field(ge=0)
+    site_confirmed: bool
+
+
+class CommissionInput(HumanInput):
+    expected_entry_revision: int = Field(ge=0)
+    expected_exit_revision: int = Field(ge=0)
+    acceptance_record: CommissionAcceptance
+
+
+class DecisionView(BaseModel):
+    id: int
+    request_id: str
+    revision: int
+    actor: str
+    reason: str
+    before: dict
+    after: dict
+    created_at: str
+
+
+class EventDetail(EventView):
+    raw: dict
+    decisions: list[DecisionView]
+
+
+class ActiveView(BaseModel):
+    items: list[SessionView]
+    total: int
+    as_of: str
+    utc_offset_minutes: int
+
+
+class ReviewEvent(BaseModel):
+    kind: Literal["event"] = "event"
+    event: EventView
+
+
+class ReviewGap(BaseModel):
+    kind: Literal["gap"] = "gap"
+    gap: GapView
+
+
+class ReviewPage(BaseModel):
+    items: list[ReviewEvent | ReviewGap]
+    total: int
+    limit: int
+    offset: int
+
+
+class GapDetail(GapView):
+    decisions: list[DecisionView]

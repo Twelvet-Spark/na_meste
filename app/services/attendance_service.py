@@ -23,7 +23,7 @@ from app.database.database import immediate_session
 from app.database.models import (
     AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
     AttendanceEmployeeReference, AttendanceEvent, AttendanceEvidence, AttendanceRequest,
-    AttendanceRuntime, Camera, Employee, WorkSession,
+    AttendanceRuntime, Camera, Employee, EmployeeFace, WorkSession,
 )
 from app.services.attendance_evidence import evidence_expires_at, purge_evidence
 from app.services.attendance_health import AttendanceHealth
@@ -62,7 +62,7 @@ class AttendanceService:
         self.engine, self.notifier, self._now = engine, notifier, now
         self.health = AttendanceHealth(now=now)
 
-    def configuration_fingerprint(self, db):
+    def configuration_fingerprint(self, db, *, providers=None):
         cameras = []
         for row in db.query(AttendanceCamera).filter_by(enabled=True).order_by(AttendanceCamera.camera_id):
             cameras.append({key: getattr(row, key) for key in (
@@ -72,7 +72,7 @@ class AttendanceService:
                  "face_confirmations", "face_window", "face_interval", "face_min_size",
                  "face_det_score", "face_blur_min")
         thresholds = {name: getattr(settings, f"attendance_{name}") for name in names}
-        providers = self.health.snapshot()["providers"]
+        providers = self.health.snapshot()["providers"] if providers is None else providers
         face_root = Path(settings.insightface_root) / "models" / settings.insightface_model
         paths = [BASE_DIR / settings.yolo_model]
         face_root = face_root if face_root.is_absolute() else BASE_DIR / face_root
@@ -89,12 +89,12 @@ class AttendanceService:
         return dict(version=1, cameras=cameras, thresholds=thresholds, models=models,
                     face_model=str(face_root.resolve()), providers=providers)
 
-    def _commission_valid(self, db):
+    def _commission_valid(self, db, *, invalidate=True, providers=None):
         runtime = db.get(AttendanceRuntime, 1)
         if runtime.commission_id is None:
             return False
         commission = db.get(AttendanceCommission, runtime.commission_id)
-        fingerprint = self.configuration_fingerprint(db)
+        fingerprint = self.configuration_fingerprint(db, providers=providers)
         providers = fingerprint["providers"]
         cuda = all("CUDAExecutionProvider" in providers[key] for key in (
             "yolo", "live_face_detection", "live_face_recognition",
@@ -102,7 +102,7 @@ class AttendanceService:
         roles = {row["role"] for row in fingerprint["cameras"]}
         valid = (commission is not None and cuda and roles == {"ENTRY", "EXIT"}
                  and commission.configuration_fingerprint == fingerprint)
-        if not valid:
+        if not valid and invalidate:
             runtime.commission_id = None
         return valid
 
@@ -295,6 +295,66 @@ class AttendanceService:
         db.add(AttendanceDecision(request_id=request.id, event_id=row.id, revision=row.revision,
                                    actor=payload.actor, reason=payload.reason, before=before,
                                    after=_effective(row), created_at=self._now()))
+
+    def commission(self, payload):
+        """Approve the measured site setup, never infer trial results from AI."""
+        try:
+            with immediate_session(self.engine) as db:
+                request, replay = self._request(db, "commission", payload)
+                if replay:
+                    return request.result
+                configs = {row.role: row for row in db.query(AttendanceCamera).filter_by(enabled=True)}
+                if set(configs) != {"ENTRY", "EXIT"}:
+                    raise HTTPException(422, "Both attendance roles must be configured")
+                if (configs["ENTRY"].revision != payload.expected_entry_revision
+                        or configs["EXIT"].revision != payload.expected_exit_revision):
+                    raise HTTPException(409, "Attendance configuration changed; refresh before commissioning")
+                if any(not db.get(Camera, row.camera_id).enabled for row in configs.values()):
+                    raise HTTPException(422, "Both attendance cameras must be enabled")
+                enrolled = db.query(func.count(func.distinct(Employee.id))).join(
+                    EmployeeFace, EmployeeFace.employee_id == Employee.id).filter(Employee.active.is_(True)).scalar()
+                record = payload.acceptance_record
+                if (not enrolled or record.employee_count < min(5, enrolled)
+                        or record.entry_trials < 30 or record.exit_trials < 30
+                        or record.visitor_trials < 20 or record.retreat_trials < 10
+                        or record.wrong_employee or record.duplicate_trips or record.missed_unflagged
+                        or record.frontal_trials <= 0 or record.frontal_eligible > record.frontal_trials
+                        or record.frontal_eligible * 100 < record.frontal_trials * 95
+                        or record.performance_minutes < 15 or not record.site_confirmed):
+                    raise HTTPException(422, "Site acceptance trials do not satisfy commissioning requirements")
+                snapshot = self.health.snapshot()
+                providers = snapshot["providers"]
+                cuda = all("CUDAExecutionProvider" in providers[key] for key in (
+                    "yolo", "live_face_detection", "live_face_recognition",
+                    "enroll_face_detection", "enroll_face_recognition"))
+                role_matches = all(
+                    snapshot["roles"].get(role, {}).get("camera_id") == config.camera_id
+                    and snapshot["roles"].get(role, {}).get("source_revision") == config.source_revision
+                    for role, config in configs.items())
+                pending_technical = any(
+                    any(reason != "COMMISSIONING_REQUIRED" for reason in fault.reason_codes)
+                    for fault in self.health.pending_faults())
+                if (not cuda or not snapshot["technical_ready"] or not role_matches
+                        or snapshot["technically_healthy_seconds"] < 10 or pending_technical):
+                    raise HTTPException(422, "Live CUDA models and ten technically healthy seconds are required")
+                row = AttendanceCommission(
+                    request_id=str(payload.request_id), actor=payload.actor, reason=payload.reason,
+                    created_at=self._now(),
+                    configuration_fingerprint=self.configuration_fingerprint(db, providers=providers),
+                    acceptance_record={**record.model_dump(mode="json"), "metrics": snapshot},
+                )
+                db.add(row)
+                db.flush()
+                db.get(AttendanceRuntime, 1).commission_id = row.id
+                result = dict(commission_id=row.id, created_at=attendance_iso(row.created_at),
+                              configuration_fingerprint=row.configuration_fingerprint,
+                              acceptance_record=row.acceptance_record, actor=row.actor, reason=row.reason)
+                request.result = _canonical(result)
+                clock_blocked = self._clock_blocked(db)
+            self.health.set_admission(commission_valid=True, clock_blocked=clock_blocked)
+            return result
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Attendance storage unavailable") from exc
 
     def create_manual_event(self, payload):
         try:

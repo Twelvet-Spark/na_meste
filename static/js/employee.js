@@ -1,4 +1,4 @@
-// карточка сотрудника: данные, загрузка фото лиц, история присутствия.
+// Employee profile, enrollment, work intervals and separate legacy observations.
 
 const employeeId = window.EMPLOYEE_ID;
 const $ = (id) => document.getElementById(id);
@@ -80,7 +80,7 @@ async function uploadFiles(fileList) {
       }
       let text = '✓ Лицо найдено · Эмбеддинг создан · Сохранено';
       if (r.warnings && r.warnings.length) {
-        text += ` <div class="warn">⚠ ${r.warnings.join('; ')}</div>`;
+        text += ` Предупреждения: ${r.warnings.join('; ')}`;
       }
       setStep(li, 'ok', text);
     } catch (e) {
@@ -95,15 +95,19 @@ async function uploadFiles(fileList) {
 function addStatusItem(filename) {
   const li = document.createElement('li');
   li.className = 'upload-item';
-  li.innerHTML = `<span class="upload-name"></span><span class="upload-step"></span>`;
+  for (const name of ['upload-name', 'upload-step']) {
+    const span = document.createElement('span');
+    span.className = name;
+    li.append(span);
+  }
   li.querySelector('.upload-name').textContent = filename;
   $('upload-status').prepend(li);
   return li;
 }
 
-function setStep(li, kind, html) {
+function setStep(li, kind, text) {
   li.className = `upload-item ${kind}`;
-  li.querySelector('.upload-step').innerHTML = html;
+  li.querySelector('.upload-step').textContent = text;
 }
 
 // ---------- список лиц ----------
@@ -114,7 +118,7 @@ async function loadFaces() {
     emp = await api(`/api/employees/${employeeId}?faces=1`);
   } catch (e) { return; }
   const grid = $('faces-grid');
-  grid.innerHTML = '';
+  grid.replaceChildren();
   const faces = emp.faces || [];
   $('faces-count').textContent = faces.length ? `· ${faces.length}` : '';
   for (const face of faces) {
@@ -140,35 +144,63 @@ async function loadFaces() {
   }
 }
 
-// ---------- история присутствия ----------
-
-function fmtTime(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// Work views use the server's explicit workplace offset, never browser-local time.
+const workOffsets = { work: 0, presence: 0 };
+function fmtTime(iso) { return iso ? iso.replace('T', ' ') : '—'; }
+function workDuration(ms) {
+  const seconds = Math.floor(Math.max(0, ms || 0) / 1000);
+  return `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
-
-async function loadPresence() {
-  let rows;
+function historyPager(name, page) {
+  const target = $(`${name}-pager`);
+  target.replaceChildren();
+  for (const [title, value, disabled] of [
+    ['Назад', Math.max(0, page.offset - page.limit), page.offset === 0],
+    ['Далее', page.offset + page.limit, page.offset + page.items.length >= page.total],
+  ]) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'btn'; button.textContent = title;
+    button.disabled = disabled;
+    button.onclick = () => { workOffsets[name] = value; loadHistory(name); };
+    target.append(button);
+  }
+  const count = document.createElement('span');
+  count.textContent = `Всего: ${page.total}`;
+  target.append(count);
+}
+async function loadHistory(name) {
   try {
-    rows = await api(`/api/presence/employee/${employeeId}`);
-  } catch (e) { return; }
-
-  const tbody = $('presence-table').querySelector('tbody');
-  tbody.innerHTML = '';
-  $('presence-empty').hidden = rows.length > 0;
-  for (const r of rows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${r.camera_name || '—'}</td>
-      <td>${fmtTime(r.started_at)}</td>
-      <td>${fmtTime(r.last_seen_at)}</td>
-      <td>${r.ended_at ? fmtTime(r.ended_at) : '<span class="status online">открыта</span>'}</td>
-      <td>${r.confidence != null ? r.confidence.toFixed(2) : '—'}</td>`;
-    tbody.appendChild(tr);
+    const path = name === 'work' ? '/api/attendance/sessions' : '/api/presence/legacy';
+    const page = await api(`${path}?employee_id=${employeeId}&limit=50&offset=${workOffsets[name]}`);
+    const target = $(`${name}-table`).querySelector('tbody');
+    target.replaceChildren();
+    $(`${name}-empty`).hidden = page.items.length > 0;
+    $(`${name}-error`).hidden = true;
+    for (const item of page.items) {
+      const values = name === 'work'
+        ? [fmtTime(item.started_at), item.ended_at ? fmtTime(item.ended_at) : 'Нет подтверждённого выхода',
+           workDuration(item.confirmed_ms), workDuration(item.running_ms), workDuration(item.review_ms),
+           `${{ OPEN: 'Открыт — предварительно', CLOSED: 'Закрыт', REVIEW: 'На проверке' }[item.status] || item.status}: ${item.reason_codes.join('; ') || 'без конфликтов'}`]
+        : [item.camera_name || '—', fmtTime(item.started_at), fmtTime(item.last_seen_at),
+           item.ended_at ? fmtTime(item.ended_at) : 'Историческое незакрытое наблюдение',
+           item.confidence != null ? item.confidence.toFixed(3) : '—'];
+      const tr = document.createElement('tr');
+      for (const value of values) { const td = document.createElement('td'); td.textContent = value; tr.append(td); }
+      target.append(tr);
+    }
+    historyPager(name, page);
+  } catch (error) {
+    const message = $(`${name}-error`);
+    message.textContent = `Не удалось загрузить историю. Повторите: ${error.message}`;
+    message.hidden = false;
+    const retry = document.createElement('button');
+    retry.type = 'button'; retry.className = 'btn'; retry.textContent = 'Повторить';
+    retry.onclick = () => loadHistory(name); message.append(retry);
   }
 }
-
+$('employee-report').href = `/presence?employee_id=${employeeId}#report`;
+$('employee-events').href = `/presence?employee_id=${employeeId}#events`;
 loadEmployee();
 loadFaces();
-loadPresence();
+loadHistory('work');
+loadHistory('presence');

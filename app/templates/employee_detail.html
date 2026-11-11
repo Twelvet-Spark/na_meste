@@ -42,24 +42,28 @@
       </p>
       <div class="upload-row">
         <input type="file" id="file-input" accept="image/*" multiple hidden>
-        <button id="btn-upload" class="btn primary">Upload photo</button>
+        <button id="btn-upload" class="btn primary">Загрузить фото</button>
       </div>
       <ul id="upload-status" class="upload-status"></ul>
       <div id="faces-grid" class="faces-grid"></div>
     </section>
 
-    <!-- История присутствия -->
     <section class="panel">
-      <div class="panel-head"><h2>Присутствие</h2></div>
-      <div class="table-wrap">
-        <table class="table" id="presence-table">
-          <thead>
-            <tr><th>Камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Уверенность</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div id="presence-empty" class="empty">Сотрудника ещё не видели на камерах.</div>
+      <div class="panel-head"><h2>Рабочие интервалы</h2><a id="employee-report" class="btn" href="/presence#report">Отчёт по сотруднику</a></div>
+      <p class="muted">Время входа и выхода в UTC+05:00. Открытое время предварительное; спорные интервалы не считаются подтверждёнными часами.</p>
+      <div id="work-error" class="test-result err" role="alert" hidden></div>
+      <div class="table-wrap"><table class="table" id="work-table"><thead><tr><th>Вход</th><th>Выход</th><th>Подтверждено</th><th>Текущее</th><th>На проверке</th><th>Состояние / причины</th></tr></thead><tbody></tbody></table></div>
+      <p id="work-empty" class="empty" hidden>Рабочих интервалов пока нет. Камерные наблюдения сами по себе не создают рабочее время.</p>
+      <div id="work-pager" class="attendance-actions"></div>
+      <a id="employee-events" href="/presence#events">Входы, выходы и исправления</a>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Архив наблюдений — не рабочее время</h2></div>
+      <p class="muted">Старая история видимости на камерах сохранена только для чтения и не включается в отчёты о часах.</p>
+      <div id="presence-error" class="test-result err" role="alert" hidden></div>
+      <div class="table-wrap"><table class="table" id="presence-table"><thead><tr><th>Камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Сходство</th></tr></thead><tbody></tbody></table></div>
+      <div id="presence-empty" class="empty" hidden>Архивных наблюдений нет.</div>
+      <div id="presence-pager" class="attendance-actions"></div>
     </section>
   </main>
 {% endblock %}

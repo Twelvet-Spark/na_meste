@@ -1,23 +1,32 @@
-"""Transactional attendance calibration and metadata-bound receipt snapshots."""
+"""Attendance calibration, consistent work views and audited human corrections."""
 import base64
 import time
+from datetime import date, datetime
 from typing import Literal
 
 import cv2
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.ai.doorway import DoorwayCalibration
+from app.attendance_types import (
+    ActiveView, CommissionInput, EventDecisionInput, EventDetail, EventPage, EventView,
+    GapDecisionInput, GapDetail, GapView, ManualEventInput, ReviewPage, SessionPage, VisitorBatchInput, milliseconds,
+)
 from app.config import settings
 from app.database.database import get_db, immediate_session
 from app.database.models import (
-    AttendanceCamera, AttendanceCoverageGap, AttendanceEvent, AttendanceRuntime, Camera, WorkSession,
+    AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
+    AttendanceEvent, AttendanceEvidence, AttendanceRuntime, Camera, Employee, WorkSession,
 )
 from app.rtsp.reader import CameraStatus
-from app.time_utils import attendance_iso, utcnow
-from app.services.attendance_queries import read_snapshot
+from app.time_utils import attendance_iso, day_bounds, utcnow
+from app.services.attendance_queries import (
+    evaluate_session, event_view, gap_view, load_trust_blockers, read_snapshot,
+)
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
 
@@ -32,8 +41,17 @@ def attendance_status(request: Request):
     def read(db):
         runtime = db.get(AttendanceRuntime, 1)
         configurations = [_view(row) for row in db.query(AttendanceCamera).order_by(AttendanceCamera.camera_id)]
+        valid = service._commission_valid(db, invalidate=False, providers=snapshot["providers"])
+        blocked = service._clock_blocked(db)
+        commission = db.get(AttendanceCommission, runtime.commission_id) if runtime.commission_id else None
         return dict(configuration=configurations, commission_id=runtime.commission_id,
+                    commissioning_required=not valid, clock_blocked=blocked,
+                    commission=None if commission is None else dict(
+                        id=commission.id, actor=commission.actor, reason=commission.reason,
+                        created_at=attendance_iso(commission.created_at),
+                        acceptance_record=commission.acceptance_record),
                     monitoring_started_at=attendance_iso(runtime.monitoring_started_at),
+                    as_of=attendance_iso(milliseconds(service._now())),
                     heartbeat_at=attendance_iso(runtime.heartbeat_at), stopped_at=attendance_iso(runtime.stopped_at),
                     unresolved_crossings=db.query(AttendanceEvent).filter_by(status="REVIEW").count(),
                     projection_conflicts=db.query(AttendanceEvent).filter(AttendanceEvent.projection_reasons != []).count(),
@@ -45,7 +63,15 @@ def attendance_status(request: Request):
     except SQLAlchemyError as exc:
         raise HTTPException(503, "Attendance status unavailable") from exc
     snapshot.update(persisted)
-    snapshot["automatic_ready"] = snapshot["automatic_ready"] and persisted["commission_id"] is not None
+    snapshot["automatic_ready"] = (snapshot["technical_ready"] and not persisted["commissioning_required"]
+                                   and not persisted["clock_blocked"]
+                                   and not snapshot["pending_fault_count"] and not snapshot["pending_write_count"])
+    reasons = set(snapshot["reasons"]) - {"COMMISSIONING_REQUIRED", "CLOCK_DISCONTINUITY"}
+    if persisted["commissioning_required"]:
+        reasons.add("COMMISSIONING_REQUIRED")
+    if persisted["clock_blocked"]:
+        reasons.add("CLOCK_DISCONTINUITY")
+    snapshot["reasons"] = sorted(reasons)
     return snapshot
 
 
@@ -208,3 +234,198 @@ def get_camera_calibration_snapshot(camera_id: int, request: Request, db: Sessio
             "source_revision": packet.source_revision, "stream_id": packet.stream_id,
             "seq": packet.seq, "received_at": attendance_iso(packet.received_at),
             "width": width, "height": height}
+
+
+def _service(request: Request):
+    service = getattr(request.app.state, "attendance", None)
+    if service is None:
+        raise HTTPException(503, "Attendance service unavailable")
+    return service
+
+
+def _read(request, reader):
+    try:
+        return read_snapshot(_service(request).engine, reader)
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Attendance storage unavailable; retry the request") from exc
+
+
+def _validate_filters(db, employee_id, from_date, to_date):
+    if from_date is not None and to_date is not None and to_date < from_date:
+        raise HTTPException(422, "End date precedes start date")
+    if employee_id is not None and db.get(Employee, employee_id) is None:
+        raise HTTPException(404, "Employee not found")
+
+
+def _dates(query, column, from_date, to_date):
+    if from_date is not None:
+        query = query.filter(column >= day_bounds(from_date)[0])
+    if to_date is not None:
+        query = query.filter(column < day_bounds(to_date)[1])
+    return query
+
+
+def _event_query(db, employee_id, from_date, to_date, status=None):
+    query = db.query(AttendanceEvent)
+    if employee_id is not None:
+        query = query.filter(AttendanceEvent.employee_id == employee_id)
+    if status is not None:
+        query = query.filter(AttendanceEvent.status == status)
+    return _dates(query, AttendanceEvent.occurred_at, from_date, to_date)
+
+
+@router.get("/events", response_model=EventPage)
+def list_events(request: Request, employee_id: int | None = None,
+                from_date: date | None = None, to_date: date | None = None,
+                status: Literal["ACCEPTED", "REVIEW", "VISITOR", "VOID"] | None = None,
+                limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    def read(db):
+        _validate_filters(db, employee_id, from_date, to_date)
+        query = _event_query(db, employee_id, from_date, to_date, status)
+        total = query.count()
+        rows = query.order_by(AttendanceEvent.occurred_at.desc(), AttendanceEvent.id.desc()).offset(offset).limit(limit)
+        return EventPage(items=[event_view(db, row) for row in rows], total=total, limit=limit, offset=offset)
+    return _read(request, read)
+
+
+def _public_effective(snapshot):
+    result = dict(snapshot)
+    if result.get("occurred_at") is not None:
+        result["occurred_at"] = attendance_iso(datetime.fromisoformat(result["occurred_at"]))
+    return result
+
+
+@router.get("/events/{event_id}", response_model=EventDetail)
+def event_detail(event_id: str, request: Request):
+    def read(db):
+        row = db.get(AttendanceEvent, event_id)
+        if row is None:
+            raise HTTPException(404, "Event not found")
+        decisions = [dict(
+            id=item.id, request_id=item.request_id, revision=item.revision, actor=item.actor,
+            reason=item.reason, before=_public_effective(item.before), after=_public_effective(item.after),
+            created_at=attendance_iso(item.created_at),
+        ) for item in db.query(AttendanceDecision).filter_by(event_id=event_id).order_by(
+            AttendanceDecision.revision, AttendanceDecision.id)]
+        return EventDetail(**event_view(db, row).model_dump(), raw=row.raw, decisions=decisions)
+    return _read(request, read)
+
+
+@router.get("/events/{event_id}/evidence/{kind}")
+def event_evidence(event_id: str, kind: Literal["before", "after", "face"], request: Request):
+    def read(db):
+        if db.get(AttendanceEvent, event_id) is None:
+            raise HTTPException(404, "Event not found")
+        row = db.get(AttendanceEvidence, event_id)
+        if row is not None and row.purged_at is not None:
+            raise HTTPException(410, "Evidence retention period expired")
+        image = getattr(row, f"{kind}_jpeg") if row is not None else None
+        if not image:
+            raise HTTPException(404, "This evidence image is absent")
+        return image
+    return Response(_read(request, read), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def _sessions(db, employee_id, from_date, to_date, status, as_of, *, active=False):
+    _validate_filters(db, employee_id, from_date, to_date)
+    query = db.query(WorkSession)
+    if employee_id is not None:
+        query = query.filter(WorkSession.employee_id == employee_id)
+    if active:
+        query = query.filter(WorkSession.ended_at.is_(None))
+    query = _dates(query, WorkSession.started_at, from_date, to_date)
+    blockers = load_trust_blockers(db, as_of=as_of)
+    rows = [evaluate_session(row, blockers, as_of=as_of) for row in query.order_by(
+        WorkSession.started_at.desc(), WorkSession.entry_event_id.desc())]
+    return [row for row in rows if status is None or row.status == status]
+
+
+@router.get("/sessions", response_model=SessionPage)
+def list_sessions(request: Request, employee_id: int | None = None,
+                  from_date: date | None = None, to_date: date | None = None,
+                  status: Literal["OPEN", "CLOSED", "REVIEW"] | None = None,
+                  limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    as_of = milliseconds(_service(request)._now())
+    def read(db):
+        rows = _sessions(db, employee_id, from_date, to_date, status, as_of)
+        return SessionPage(items=rows[offset:offset + limit], total=len(rows), limit=limit, offset=offset)
+    return _read(request, read)
+
+
+@router.get("/active", response_model=ActiveView)
+def active_sessions(request: Request, employee_id: int | None = None):
+    as_of = milliseconds(_service(request)._now())
+    def read(db):
+        rows = _sessions(db, employee_id, None, None, None, as_of, active=True)
+        return ActiveView(items=rows, total=len(rows), as_of=attendance_iso(as_of),
+                          utc_offset_minutes=settings.attendance_utc_offset_minutes)
+    return _read(request, read)
+
+
+@router.get("/review", response_model=ReviewPage)
+def list_review(request: Request, employee_id: int | None = None,
+                from_date: date | None = None, to_date: date | None = None,
+                kind: Literal["event", "gap"] | None = None,
+                limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    def read(db):
+        _validate_filters(db, employee_id, from_date, to_date)
+        ordered = []
+        if kind != "gap":
+            events = _event_query(db, employee_id, from_date, to_date).filter(
+                (AttendanceEvent.status == "REVIEW") | (AttendanceEvent.projection_reasons != []))
+            ordered.extend((row.occurred_at, f"event:{row.id}", "event", row) for row in events)
+        if kind != "event":
+            gaps = db.query(AttendanceCoverageGap).filter_by(reviewed=False)
+            if from_date is not None:
+                lower = day_bounds(from_date)[0]
+                gaps = gaps.filter((AttendanceCoverageGap.ended_at.is_(None)) |
+                                   (AttendanceCoverageGap.ended_at > lower) |
+                                   (AttendanceCoverageGap.started_at >= lower))
+            if to_date is not None:
+                gaps = gaps.filter(AttendanceCoverageGap.started_at < day_bounds(to_date)[1])
+            ordered.extend((row.started_at, f"gap:{row.id}", "gap", row) for row in gaps)
+        ordered.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        items = [dict(kind=kind, **{kind: event_view(db, row) if kind == "event" else gap_view(row)})
+                 for _stamp, _key, kind, row in ordered[offset:offset + limit]]
+        return ReviewPage(items=items, total=len(ordered), limit=limit, offset=offset)
+    return _read(request, read)
+
+
+@router.post("/events/{event_id}/decision", response_model=EventView)
+def decide_event(event_id: str, payload: EventDecisionInput, request: Request):
+    return _service(request).decide_event(event_id, payload)
+
+
+@router.post("/visitors", response_model=list[EventView])
+def mark_visitors(payload: VisitorBatchInput, request: Request):
+    return _service(request).mark_visitors(payload)
+
+
+@router.post("/manual", response_model=EventView)
+def create_manual_event(payload: ManualEventInput, request: Request):
+    return _service(request).create_manual_event(payload)
+
+
+@router.post("/gaps/{gap_id}/review", response_model=GapView)
+def review_gap(gap_id: int, payload: GapDecisionInput, request: Request):
+    return _service(request).review_gap(gap_id, payload)
+
+
+@router.post("/commission")
+def commission(payload: CommissionInput, request: Request):
+    return _service(request).commission(payload)
+
+
+@router.get("/gaps/{gap_id}", response_model=GapDetail)
+def gap_detail(gap_id: int, request: Request):
+    def read(db):
+        row = db.get(AttendanceCoverageGap, gap_id)
+        if row is None:
+            raise HTTPException(404, "Coverage gap not found")
+        decisions = [dict(
+            id=item.id, request_id=item.request_id, revision=item.revision, actor=item.actor,
+            reason=item.reason, before=item.before, after=item.after, created_at=attendance_iso(item.created_at),
+        ) for item in db.query(AttendanceDecision).filter_by(gap_id=gap_id).order_by(
+            AttendanceDecision.revision, AttendanceDecision.id)]
+        return GapDetail(**gap_view(row).model_dump(), decisions=decisions)
+    return _read(request, read)

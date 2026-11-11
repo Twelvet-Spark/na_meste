@@ -1,41 +1,115 @@
 {% extends "base.html" %}
 {% set active_page = 'presence' %}
-
-{% block title %}Присутствие{% endblock %}
-
+{% block title %}Рабочее время{% endblock %}
 {% block content %}
-  <main class="container">
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Сейчас на камерах</h2>
-        <span id="active-summary" class="muted"></span>
-      </div>
-      <div class="table-wrap">
-        <table class="table" id="active-table">
-          <thead>
-            <tr><th>Сотрудник</th><th>Камера</th><th>С</th><th>Последнее наблюдение</th><th>Уверенность</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div id="active-empty" class="empty">Сейчас никого не обнаружено.</div>
-    </section>
+<main class="container wide attendance-workspace">
+  <section class="panel" aria-labelledby="attendance-title">
+    <div class="panel-head"><h1 id="attendance-title">Рабочее время</h1><span class="muted" id="workplace-zone">UTC+05:00</span></div>
+    <p class="muted">Учитываются только подтверждённые входы и выходы. Обед и каждый выход останавливают рабочее время. Открытый интервал — предварительный, а не подтверждённые часы.</p>
+    <div class="attendance-actions"><span id="technical-state" class="status offline">Проверка технической готовности…</span><span id="automatic-state" class="status offline">Автоматический учёт не готов</span><button type="button" class="btn ghost" id="refresh-all">Обновить данные</button></div>
+    <p id="readiness-reasons" class="muted" aria-live="polite"></p>
+    <div id="status-error" class="test-result err" role="alert" hidden></div>
+    <p id="attendance-alerts" class="muted"></p>
+    <details id="readiness-details">
+      <summary>Камеры, производительность и ввод в эксплуатацию</summary>
+      <p id="configuration-state" class="muted"></p>
+      <a href="/">Настроить камеры и калибровку прохода</a>
+      <div class="table-wrap"><table class="table"><caption>Обработанные кадры; возраст — от получения сервером</caption><thead><tr><th>Роль / камера</th><th>Кадров/с</th><th>Возраст кадра, с</th><th>p95 до начала / завершения, с</th><th>Состояние</th></tr></thead><tbody id="role-metrics"></tbody></table></div>
+      <h3>Фактически загруженные ONNX-провайдеры</h3><dl id="provider-list" class="attendance-facts"></dl>
+      <p id="commission-state" class="muted"></p>
+      <details id="commission-details">
+        <summary>Подтвердить испытания на месте</summary>
+        <p class="muted">Это заявление оператора, а не автоматическая проверка точности. Нужны реальные CUDA-сессии, 10 технически здоровых секунд, 15 минут измерений на целевом оборудовании, видимые стопы при пересечении и проверенные часы/задержка источников. При неудаче доступны ручные события и проверка.</p>
+        <form id="commission-form" class="attendance-form">
+          <input type="hidden" name="expected_entry_revision"><input type="hidden" name="expected_exit_revision">
+          <div class="attendance-fields">
+            <label class="field">Входов (не менее 30)<input type="number" name="entry_trials" min="30" step="1" required></label>
+            <label class="field">Выходов (не менее 30)<input type="number" name="exit_trials" min="30" step="1" required></label>
+            <label class="field">Сотрудников в испытаниях<input type="number" name="employee_count" min="1" step="1" required></label>
+            <label class="field">Проходов посетителей (от 20)<input type="number" name="visitor_trials" min="20" step="1" required></label>
+            <label class="field">Подходов с отступлением (от 10)<input type="number" name="retreat_trials" min="10" step="1" required></label>
+            <label class="field">Ошибочных сотрудников (0)<input type="number" name="wrong_employee" min="0" max="0" step="1" required></label>
+            <label class="field">Повторно учтённых проходов (0)<input type="number" name="duplicate_trips" min="0" max="0" step="1" required></label>
+            <label class="field">Незамеченных пропусков (0)<input type="number" name="missed_unflagged" min="0" max="0" step="1" required></label>
+            <label class="field">Фронтальных испытаний<input type="number" name="frontal_trials" min="1" step="1" required></label>
+            <label class="field">Пригодных фронтальных (не менее 95%)<input type="number" name="frontal_eligible" min="1" step="1" required></label>
+            <label class="field">Минут проверки производительности<input type="number" name="performance_minutes" min="15" step="1" required></label>
+          </div>
+          <label class="field checkbox-field attendance-check"><input type="checkbox" name="site_confirmed" required>Подтверждаю испытания, синхронизацию времени, задержку видео и согласованные условия съёмки на месте</label>
+          <div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Основание и сведения об испытаниях<textarea name="reason" maxlength="1000" required rows="3"></textarea></label></div>
+          <div id="commission-error" class="test-result err" role="alert" hidden></div><p id="commission-result" role="status"></p>
+          <div class="attendance-actions"><button class="btn primary" type="submit">Подтвердить ввод в эксплуатацию</button><button class="btn" type="button" id="commission-rebase" hidden>Обновить версии, сохранить поля</button></div>
+        </form>
+      </details>
+    </details>
+  </section>
 
-    <section class="panel">
-      <div class="panel-head"><h2>История</h2></div>
-      <div class="table-wrap">
-        <table class="table" id="history-table">
-          <thead>
-            <tr><th>Сотрудник</th><th>Камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Уверенность</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div id="history-empty" class="empty">Истории пока нет.</div>
-    </section>
-  </main>
-{% endblock %}
+  <nav class="attendance-tabs" role="tablist" aria-label="Рабочее время">
+    <button class="btn" id="tab-active" role="tab" aria-selected="true" aria-controls="panel-active" data-tab="active">На работе</button>
+    <button class="btn" id="tab-events" role="tab" aria-selected="false" aria-controls="panel-events" data-tab="events" tabindex="-1">События</button>
+    <button class="btn" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review" tabindex="-1">На проверке</button>
+    <button class="btn" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report" data-tab="report" tabindex="-1">Отчёт</button>
+    <button class="btn" id="tab-legacy" role="tab" aria-selected="false" aria-controls="panel-legacy" data-tab="legacy" tabindex="-1">Архив наблюдений</button>
+  </nav>
 
-{% block scripts %}
-  <script src="/static/js/presence.js"></script>
+  <section class="panel attendance-tabpanel" id="panel-active" role="tabpanel" aria-labelledby="tab-active">
+    <div class="panel-head"><h2>На работе</h2><span id="active-summary" class="muted"></span></div>
+    <div id="active-error" class="test-result err" role="alert" hidden></div>
+    <div class="table-wrap"><table class="table"><thead><tr><th>Сотрудник</th><th>Дата и время входа</th><th>Предварительно</th><th>На проверке</th><th>Состояние / причины</th></tr></thead><tbody id="active-rows"></tbody></table></div>
+    <p id="active-empty" class="empty" hidden>Нет незакрытых рабочих интервалов. Нахождение в кадре не означает нахождение на работе. Если сотрудник уже был внутри при запуске, добавьте проверенный ручной вход.</p>
+    <details id="manual-details"><summary>Добавить ручной вход или выход</summary>
+      <form id="manual-form" class="attendance-form">
+        <p class="muted">Добавляйте только установленный факт. Ручное событие не подтверждает полноту наблюдения за весь день.</p>
+        <div class="attendance-fields"><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" required></select></label><label class="field">Направление<select name="direction" required><option value="ENTRY">Вход</option><option value="EXIT">Выход</option></select></label><label class="field">Дата и время <span class="zone-label">UTC+05:00</span><input type="datetime-local" name="occurred_at" step="0.001" required></label></div>
+        <div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Основание<textarea name="reason" maxlength="1000" required rows="2"></textarea></label></div>
+        <div id="manual-error" class="test-result err" role="alert" hidden></div><p id="manual-result" role="status"></p><button class="btn primary" type="submit">Записать событие</button>
+      </form>
+    </details>
+  </section>
+
+  <section class="panel attendance-tabpanel" id="panel-events" role="tabpanel" aria-labelledby="tab-events" hidden>
+    <div class="panel-head"><h2>Входы и выходы</h2></div>
+    <form id="events-filter" class="attendance-filters"><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" data-all="true"></select></label><label class="field">С даты<input type="date" name="from_date"></label><label class="field">По дату включительно<input type="date" name="to_date"></label><label class="field">Состояние<select name="status"><option value="">Все</option><option value="ACCEPTED">Принято</option><option value="REVIEW">На проверке</option><option value="VISITOR">Посетитель</option><option value="VOID">Аннулировано</option></select></label><button class="btn" type="submit">Применить</button></form>
+    <div id="events-error" class="test-result err" role="alert" hidden></div><div class="table-wrap"><table class="table"><thead><tr><th>Время</th><th>Сотрудник</th><th>Направление</th><th>Источник</th><th>Состояние / причины</th><th>Действие</th></tr></thead><tbody id="events-rows"></tbody></table></div><p id="events-empty" class="empty" hidden>Событий по выбранным условиям нет.</p><div id="events-pager" class="attendance-actions"></div>
+  </section>
+
+  <section class="panel attendance-tabpanel" id="panel-review" role="tabpanel" aria-labelledby="tab-review" hidden>
+    <div class="panel-head"><h2>На проверке</h2></div><p class="muted">Неопознанный проход ставит под сомнение пересекающиеся интервалы всех сотрудников. Посетитель не добавляет рабочее время. Период потери наблюдения отмечайте проверенным только после сверки всех возможных проходов.</p>
+    <form id="review-filter" class="attendance-filters"><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" data-all="true"></select></label><label class="field">С даты<input type="date" name="from_date"></label><label class="field">По дату включительно<input type="date" name="to_date"></label><label class="field">Тип<select name="kind"><option value="">Все</option><option value="event">Проходы</option><option value="gap">Потери наблюдения</option></select></label><button class="btn" type="submit">Применить</button></form>
+    <div id="review-error" class="test-result err" role="alert" hidden></div><div class="table-wrap"><table class="table"><thead><tr><th>Выбор посетителя</th><th>Время / период</th><th>Тип / сотрудник</th><th>Причины</th><th>Действие</th></tr></thead><tbody id="review-rows"></tbody></table></div><p id="review-empty" class="empty" hidden>Нет нерешённых событий или периодов по выбранным условиям.</p><div id="review-pager" class="attendance-actions"></div>
+    <details id="bulk-details"><summary>Отметить выбранные проходы посетителями</summary><form id="bulk-form" class="attendance-form"><p id="bulk-count">Выбрано: 0</p><div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Основание<textarea name="reason" maxlength="1000" required rows="2"></textarea></label></div><div id="bulk-error" class="test-result err" role="alert" hidden></div><button class="btn primary" type="submit">Подтвердить выбранных посетителей</button><button type="button" class="btn" id="bulk-rebase" hidden>Обновить список для повторного выбора</button></form></details>
+  </section>
+
+  <section class="panel attendance-tabpanel" id="panel-report" role="tabpanel" aria-labelledby="tab-report" hidden>
+    <div class="panel-head"><h2>Отчёт по рабочему времени</h2><span class="muted zone-label">UTC+05:00</span></div>
+    <form id="report-filter" class="attendance-filters"><label class="field">С даты<input type="date" name="from_date" required></label><label class="field">По дату включительно<input type="date" name="to_date" required></label><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" data-all="true"></select></label><button class="btn primary" type="submit">Показать отчёт</button><a id="report-csv" class="btn" hidden>Скачать CSV</a></form>
+    <div id="report-error" class="test-result err" role="alert" hidden></div><p id="report-summary" role="status">Выберите период. Подтверждённое, текущее и спорное время показываются отдельно, без округления вверх.</p><p id="report-warnings"></p><div id="report-results"></div>
+  </section>
+
+  <section class="panel attendance-tabpanel" id="panel-legacy" role="tabpanel" aria-labelledby="tab-legacy" hidden>
+    <div class="panel-head"><h2>Архив наблюдений</h2></div><p class="muted">Старая история видимости на камерах. Не является рабочими интервалами, не включается в часы и не изменяется. Незакрытая запись означает лишь незакрытое историческое наблюдение.</p>
+    <form id="legacy-filter" class="attendance-filters"><label class="field">Сотрудник<select name="employee_id" class="attendance-employees" data-all="true"></select></label><label class="field">С даты<input type="date" name="from_date"></label><label class="field">По дату включительно<input type="date" name="to_date"></label><button class="btn" type="submit">Применить</button></form><div id="legacy-error" class="test-result err" role="alert" hidden></div><div class="table-wrap"><table class="table"><thead><tr><th>Сотрудник / камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Сходство</th></tr></thead><tbody id="legacy-rows"></tbody></table></div><p id="legacy-empty" class="empty" hidden>Архивных наблюдений по выбранным условиям нет.</p><div id="legacy-pager" class="attendance-actions"></div>
+  </section>
+
+  <section class="panel attendance-editor" id="event-editor" aria-labelledby="event-title" hidden>
+    <div class="panel-head"><h2 id="event-title" tabindex="-1">Проверка события</h2><button class="btn ghost" type="button" id="event-close">Закрыть</button></div><p id="event-effective"></p><div id="event-images" class="attendance-evidence"></div><div id="event-candidates"></div>
+    <details><summary>Исходные неизменяемые данные</summary><p class="muted">Время в исходной записи — UTC получения сервером, не время экспозиции камеры. Сходство не является вероятностью.</p><pre id="event-raw"></pre></details>
+    <form id="decision-form" class="attendance-form"><input name="expected_revision" type="hidden"><div class="attendance-fields"><label class="field">Решение<select name="action"><option value="ACCEPT">Принять / исправить</option><option value="VISITOR">Посетитель — без рабочего времени</option><option value="VOID">Аннулировать ошибочное событие</option></select></label><label class="field">Сотрудник<select name="employee_id" class="attendance-employees"></select></label><label class="field">Направление<select name="direction"><option value="">Не установлено</option><option value="ENTRY">Вход</option><option value="EXIT">Выход</option></select></label><label class="field">Исправленное время <span class="zone-label">UTC+05:00</span><input type="datetime-local" name="occurred_at" step="0.001"></label></div><div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Основание<textarea name="reason" maxlength="1000" required rows="3"></textarea></label></div><div id="decision-error" class="test-result err" role="alert" hidden></div><p id="decision-result" role="status"></p><div class="attendance-actions"><button class="btn primary" type="submit">Сохранить решение</button><button class="btn" type="button" id="decision-rebase" hidden>Загрузить новую версию, сохранить мои поля</button></div></form>
+    <h3>История решений</h3><p class="muted">Имя оператора вводится вручную и не подтверждает личность. Исправления сохраняют исходное наблюдение и предыдущие решения.</p><ol id="decision-history" class="attendance-audit"></ol>
+  </section>
+  <section class="panel attendance-editor" id="gap-editor" aria-labelledby="gap-title" hidden>
+    <div class="panel-head"><h2 id="gap-title" tabindex="-1">Сверка потери наблюдения</h2><button class="btn ghost" type="button" id="gap-close">Закрыть</button></div>
+    <p id="gap-description"></p>
+    <form id="gap-form" class="attendance-form">
+      <input type="hidden" name="expected_revision">
+      <label class="field checkbox-field attendance-check"><input type="checkbox" name="reconciled" required>Я сверил возможные входы и выходы, добавил или исправил недостающие события</label>
+      <div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Результат сверки<textarea name="reason" maxlength="1000" required rows="3"></textarea></label></div>
+      <div id="gap-error" class="test-result err" role="alert" hidden></div><p id="gap-result" role="status"></p>
+      <button class="btn primary" type="submit">Отметить период проверенным</button><button class="btn" id="gap-rebase" type="button" hidden>Обновить версию, сохранить поля</button>
+    </form>
+    <h3>История сверки</h3><ol id="gap-history" class="attendance-audit"></ol>
+  </section>
+  <p class="attendance-help muted">Доступ — только localhost, доверенная локальная сеть или VPN. Не публикуйте эти страницы и API в интернете: учётных записей и аутентификации нет, подпись оператора не является проверкой личности. Снимки проходов и резервные копии содержат персональные данные; доступ предоставляется только уполномоченным сотрудникам.</p>
+</main>
 {% endblock %}
+{% block scripts %}<script src="/static/js/presence.js"></script>{% endblock %}

@@ -14,7 +14,9 @@ async function api(url, options = {}) {
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (e) { /* ignore */ }
-    throw new Error(detail);
+    const error = new Error(detail);
+    error.status = res.status;
+    throw error;
   }
   return res.status === 204 ? null : res.json();
 }
@@ -70,9 +72,9 @@ function renderEmployee(emp) {
   del.className = 'btn ghost danger';
   del.textContent = 'Удалить';
   del.onclick = async () => {
-    if (!confirm(`Удалить сотрудника «${emp.name}» вместе с лицами и историей присутствия?`)) return;
+    if (!confirm(`Удалить сотрудника «${emp.name}» и его фотографии? Если есть история, удаление запрещено — отключите флаг «Активен» в карточке. История рабочего времени и наблюдений не удаляется.`)) return;
     try { await api(`/api/employees/${emp.id}`, { method: 'DELETE' }); loadEmployees(); }
-    catch (e) { alert('Ошибка удаления: ' + e.message); }
+    catch (e) { alert(e.status === 409 ? 'У сотрудника есть история: удаление запрещено. Откройте карточку и отключите флаг «Активен». Часы и наблюдения останутся в журнале.' : 'Ошибка удаления: ' + e.message); }
   };
   actions.append(open, del);
 
