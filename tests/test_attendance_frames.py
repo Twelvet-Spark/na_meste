@@ -332,6 +332,9 @@ def test_tracker_receives_each_packets_receipt_monotonic_not_loop_time():
     service, _state, outcomes = run_worker([(FrameReader("a", 1, 99.6), 100.0)])
     assert len(outcomes) == 1
     assert service._trackers[1].tracks[0].last_seen == 99.6
+    evidence = outcomes[0].detections[0].fresh_face_evidence
+    assert evidence.frame_seq == 1 and evidence.received_at == STAMP
+    assert evidence.received_mono == 99.6
 
 
 @test

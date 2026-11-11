@@ -155,6 +155,8 @@ class AIWorker(threading.Thread):
                 try:
                     outcome = self.service.process_frame(
                         packet.frame, camera_id, packet.received_mono,
+                        frame_seq=packet.seq, received_at=packet.received_at,
+                        attendance=config.attendance,
                     )
                 except Exception:
                     logger.exception("Camera %d: ошибка AI-обработки кадра", camera_id)

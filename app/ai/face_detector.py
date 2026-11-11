@@ -18,7 +18,7 @@ class FaceInfo:
     bbox: np.ndarray          # xyxy в координатах входного изображения
     det_score: float          # уверенность детекции
     embedding: np.ndarray     # 512-d, L2-нормирован (косинус = скалярное произведение)
-    aligned: np.ndarray       # выровненное лицо 112x112 BGR (для миниатюры)
+    aligned: np.ndarray | None  # настоящее выровненное лицо 112x112 BGR или отказ
 
 
 class FaceEngine:

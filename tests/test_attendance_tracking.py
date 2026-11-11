@@ -5,7 +5,7 @@ Run: .venv/Scripts/python.exe tests/test_attendance_tracking.py
 import sys
 import tempfile
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -169,10 +169,11 @@ class NoFaces:
 def test_recognition_reset_always_changes_generation_and_clears_employee_cache():
     detector = Detector()
     service = RecognitionService(detector, NoFaces(), EmbeddingStore(), min_hits=1)
-    first = service.process_frame(FRAME, 1, 10.)
+    first = service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
     identified(service._trackers[1].tracks[0])
     generation = service.reset_camera(1)
-    second = service.process_frame(FRAME, 1, 10.1)
+    second = service.process_frame(FRAME, 1, 10.1, frame_seq=2,
+                                   received_at=STAMP + timedelta(seconds=.1))
     assert first.tracking_generation != generation == second.tracking_generation
     assert second.detections[0].track_id == 1 and second.detections[0].employee_id is None
     third = service.reset_camera(1)
@@ -183,10 +184,11 @@ def test_recognition_reset_always_changes_generation_and_clears_employee_cache()
 def test_recognition_never_displays_cached_employee_after_ambiguous_overlap():
     detector = Detector()
     service = RecognitionService(detector, NoFaces(), EmbeddingStore(), min_hits=1)
-    service.process_frame(FRAME, 1, 10.)
+    service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
     identified(service._trackers[1].tracks[0])
     detector.persons = [(box(-2., 98.), .99), (box(2., 102.), .99)]
-    outcome = service.process_frame(FRAME, 1, 10.1)
+    outcome = service.process_frame(FRAME, 1, 10.1, frame_seq=2,
+                                    received_at=STAMP + timedelta(seconds=.1))
     assert all(det.employee_id is None for det in outcome.detections)
     assert not outcome.new_recognitions
     assert any(item.track_id == 1 and item.state == "AMBIGUOUS"

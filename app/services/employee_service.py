@@ -12,13 +12,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.ai.face_detector import FaceEngine
-from app.ai.face_recognition import EmbeddingStore
+from app.ai.face_quality import measure_face_quality, quality_reasons
+from app.ai.face_recognition import EmbeddingStore, normalized_embedding
 from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
     EmployeeFace, PresenceSession, WorkSession,
 )
+from app.services.attendance_evidence import encode_evidence
 
 logger = logging.getLogger("app.services.employees")
 
@@ -74,10 +76,17 @@ def list_employees(db: Session) -> list[tuple[Employee, int]]:
 
 
 def create_employee(db: Session, data: EmployeeCreate) -> Employee:
-    employee = Employee(**data.model_dump())
-    db.add(employee)
-    db.commit()
-    db.refresh(employee)
+    bind = db.get_bind().engine
+    db.rollback()
+    try:
+        with immediate_session(bind) as writer:
+            employee = Employee(**data.model_dump())
+            writer.add(employee)
+            writer.flush()
+            _advance_gallery(writer)
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     logger.info("Создан сотрудник #%d «%s»", employee.id, employee.name)
     return employee
 
@@ -93,8 +102,7 @@ def update_employee(db: Session, employee: Employee, data: EmployeeUpdate) -> Em
                 raise HTTPException(status_code=404, detail="Employee not found")
             for field, value in data.model_dump(exclude_unset=True).items():
                 setattr(current, field, value)
-            writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
-                gallery_revision=AttendanceRuntime.gallery_revision + 1))
+            _advance_gallery(writer)
             writer.flush()
         db.expire_all()
         return current
@@ -125,12 +133,17 @@ def delete_employee(db: Session, employee: Employee, store: Optional[EmbeddingSt
                 raise HTTPException(status_code=409, detail="Employee has history; deactivate instead")
             writer.query(EmployeeFace).filter_by(employee_id=employee_id).delete()
             writer.delete(current)
-            writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
-                gallery_revision=AttendanceRuntime.gallery_revision + 1))
+            _advance_gallery(writer)
         db.expire_all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     logger.info("Удалён сотрудник #%d «%s»", employee_id, name)
+
+
+def _advance_gallery(db: Session) -> None:
+    """Identity data and its durable invalidation token share one transaction."""
+    db.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
+        gallery_revision=AttendanceRuntime.gallery_revision + 1))
 
 
 # --------------------------------------------------------- зачисление лица
@@ -143,73 +156,84 @@ def enroll_face(
     store: EmbeddingStore,
     filename: str = "photo",
 ) -> FaceEnrollResult:
-    """Фото → (детекция лица → проверки) → эмбеддинг → employee_faces.
-
-    Ошибки: нет лица / несколько лиц / лицо слишком маленькое.
-    Предупреждения (не мешают сохранению): низкое качество, размытость.
-    """
+    """Persist only usable aligned faces, rejecting another active identity."""
     img = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return FaceEnrollResult(filename=filename, success=False,
                                 error="Не удалось прочитать файл изображения")
-
     faces = face_engine.detect(img)
     if not faces:
         return FaceEnrollResult(filename=filename, success=False,
                                 error="Лицо на фотографии не найдено")
-    if len(faces) > 1:
-        return FaceEnrollResult(
-            filename=filename, success=False,
-            error=f"На фотографии {len(faces)} лиц — загрузите фото с одним лицом",
-        )
-
+    if len(faces) != 1:
+        return FaceEnrollResult(filename=filename, success=False,
+                                error=f"На фотографии {len(faces)} лиц — загрузите фото с одним лицом")
     face = faces[0]
-    fw = float(face.bbox[2] - face.bbox[0])
-    fh = float(face.bbox[3] - face.bbox[1])
-    if min(fw, fh) < settings.face_min_size:
-        return FaceEnrollResult(
-            filename=filename, success=False,
-            error=(f"Лицо слишком маленькое ({fw:.0f}×{fh:.0f}px, "
-                   f"минимум {settings.face_min_size}px)"),
-        )
+    quality = measure_face_quality(face)
+    reasons = quality_reasons(quality, min_size=max(80, settings.face_min_size),
+                              det_score=.80, blur_min=20.)
+    embedding = normalized_embedding(face.embedding)
+    errors = {
+        "FACE_TOO_SMALL": "Лицо слишком маленькое — минимум 80 px",
+        "BAD_ALIGNMENT": "Не удалось выровнять лицо — загрузите другое фото",
+        "LOW_FACE_DETECTION": "Низкая уверенность детекции — минимум 0.80",
+        "BLURRY_FACE": "Изображение размыто — загрузите более чёткое фото",
+    }
+    if reasons or embedding is None:
+        return FaceEnrollResult(filename=filename, success=False,
+                                error=errors[reasons[0]] if reasons else "Некорректный эмбеддинг лица")
+    thumbnail = encode_evidence(before=None, after=None, face=face.aligned).face_jpeg
+    if thumbnail is None:
+        return FaceEnrollResult(filename=filename, success=False,
+                                error="Не удалось сохранить выровненное лицо")
 
-    warnings: list[str] = []
-    if face.det_score < 0.65:
-        warnings.append(f"Низкая уверенность детекции ({face.det_score:.2f})")
-    if face.aligned is not None:
-        gray = cv2.cvtColor(face.aligned, cv2.COLOR_BGR2GRAY)
-        blur = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur < 20:
-            warnings.append("Изображение размыто — качество распознавания может снизиться")
-
-    thumbnail = None
-    if face.aligned is not None:
-        ok, buf = cv2.imencode(".jpg", face.aligned,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if ok:
-            thumbnail = buf.tobytes()
-
-    employee_face = EmployeeFace(
-        employee_id=employee.id,
-        embedding=np.asarray(face.embedding, dtype=np.float32).tobytes(),
-        thumbnail=thumbnail,
-    )
-    db.add(employee_face)
-    db.commit()
-    db.refresh(employee_face)
+    employee_id = employee.id
+    bind = db.get_bind().engine
+    db.rollback()
+    try:
+        with immediate_session(bind) as writer:
+            if writer.get(Employee, employee_id) is None:
+                raise HTTPException(status_code=404, detail="Employee not found")
+            # Another enrollment may have committed while model inference ran.
+            # Match the current gallery under the write lock, not a stale cache.
+            current_gallery = EmbeddingStore()
+            current_gallery.refresh(writer)
+            match = current_gallery.match(embedding, exclude_employee_id=employee_id)
+            if match.employee_id is not None and match.score >= .55 and match.margin >= .08:
+                return FaceEnrollResult(
+                    filename=filename, success=False,
+                    error="Лицо совпадает с другим активным сотрудником: "
+                          f"{current_gallery.employee_name(match.employee_id)}",
+                )
+            employee_face = EmployeeFace(employee_id=employee_id,
+                                         embedding=embedding.tobytes(), thumbnail=thumbnail)
+            writer.add(employee_face)
+            writer.flush()
+            _advance_gallery(writer)
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     store.refresh(db)
-    logger.info("Сотруднику #%d добавлено лицо (face_id=%d, предупреждений: %d)",
-                employee.id, employee_face.id, len(warnings))
-    return FaceEnrollResult(
-        filename=filename, success=True, face_id=employee_face.id, warnings=warnings
-    )
+    logger.info("Сотруднику #%d добавлено лицо (face_id=%d)", employee_id, employee_face.id)
+    return FaceEnrollResult(filename=filename, success=True, face_id=employee_face.id)
 
 
 def delete_face(db: Session, face: EmployeeFace, store: EmbeddingStore) -> None:
-    db.delete(face)
-    db.commit()
+    face_id = face.id
+    bind = db.get_bind().engine
+    db.rollback()
+    try:
+        with immediate_session(bind) as writer:
+            current = writer.get(EmployeeFace, face_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Face not found")
+            writer.delete(current)
+            _advance_gallery(writer)
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
     store.refresh(db)
-    logger.info("Удалено лицо #%d", face.id)
+    logger.info("Удалено лицо #%d", face_id)
 
 
 def get_face(db: Session, employee_id: int, face_id: int) -> Optional[EmployeeFace]:
