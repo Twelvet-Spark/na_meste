@@ -378,6 +378,57 @@ def test_database_failure_returns_503_and_rolls_back_request_and_event():
 
 
 @test
+def test_status_keeps_live_clock_fault_before_persistence_and_clears_reviewed_admission():
+    with api() as (client, engine, service):
+        clock, health = commission_ready(engine, service)
+        client.json("POST", "/api/attendance/commission", commission_payload())
+        service.persist_health([], healthy=True, reasons=[], observed_at=clock.utc)
+        assert client.json("GET", "/api/attendance/status")["automatic_ready"]
+        assert health.observe_clock(clock.utc, clock.mono)
+
+        clock.advance(.1, utc_seconds=-5)
+        assert not health.observe_clock(clock.utc, clock.mono)
+        # No monitor tick has durably recorded this live technical failure yet.
+        with Session(engine) as db:
+            assert not any("CLOCK_DISCONTINUITY" in gap.reason_codes
+                           for gap in db.query(AttendanceCoverageGap))
+        live = client.json("GET", "/api/attendance/status")
+        assert not live["technical_ready"] and not live["automatic_ready"]
+        assert live["pending_fault_count"] > 0
+        assert "CLOCK_DISCONTINUITY" in live["reasons"]
+
+        clock.advance(.1)
+        assert health.observe_clock(clock.utc, clock.mono)
+        faults = health.pending_faults()
+        service.persist_health([(fault, health.fault_source_ids(fault.id)) for fault in faults],
+                               healthy=True, reasons=[], observed_at=clock.utc)
+        for fault in faults:
+            health.ack_fault(fault.id)
+        durable = client.json("GET", "/api/attendance/status")
+        assert durable["technical_ready"] and not durable["automatic_ready"]
+        assert "CLOCK_DISCONTINUITY" in durable["reasons"]
+        with Session(engine) as db:
+            gap = next(gap for gap in db.query(AttendanceCoverageGap).filter_by(reviewed=False)
+                       if "CLOCK_DISCONTINUITY" in gap.reason_codes)
+            gap_id, revision = gap.id, gap.revision
+        client.json("POST", f"/api/attendance/gaps/{gap_id}/review",
+                    human(expected_revision=revision))
+        # The health monitor has not refreshed its cached admission flag. A
+        # completed human reconciliation must still clear that obsolete reason.
+        assert "CLOCK_DISCONTINUITY" in health.snapshot()["reasons"]
+        reviewed = client.json("GET", "/api/attendance/status")
+        assert reviewed["technical_ready"] and reviewed["automatic_ready"]
+        assert not reviewed["clock_blocked"]
+        assert "CLOCK_DISCONTINUITY" not in reviewed["reasons"]
+        health.set_pending_writes(1)
+        assert "CLOCK_DISCONTINUITY" in health.snapshot()["reasons"]
+        other_fault = client.json("GET", "/api/attendance/status")
+        assert not other_fault["technical_ready"] and not other_fault["automatic_ready"]
+        assert "PERSISTENCE_ERROR" in other_fault["reasons"]
+        assert "CLOCK_DISCONTINUITY" not in other_fault["reasons"]
+
+
+@test
 def test_status_exposes_actual_readiness_providers_metrics_and_unresolved_counts():
     with api() as (client, _engine, service):
         review_crossing(service)

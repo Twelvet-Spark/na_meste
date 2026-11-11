@@ -247,6 +247,7 @@ class AttendanceHealth:
             if self._clock_blocked:
                 admission_reasons.add("CLOCK_DISCONTINUITY")
             return dict(roles=roles, providers=copy.deepcopy(self._providers), reasons=sorted(admission_reasons),
+                        technical_reasons=sorted(reasons),
                         technical_ready=technical, automatic_ready=automatic,
                         technically_healthy_seconds=0. if self._healthy_since is None else max(0., now - self._healthy_since),
                         pending_fault_count=len(self._pending), pending_write_count=self._pending_writes)

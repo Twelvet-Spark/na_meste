@@ -66,7 +66,9 @@ def attendance_status(request: Request):
     snapshot["automatic_ready"] = (snapshot["technical_ready"] and not persisted["commissioning_required"]
                                    and not persisted["clock_blocked"]
                                    and not snapshot["pending_fault_count"] and not snapshot["pending_write_count"])
-    reasons = set(snapshot["reasons"]) - {"COMMISSIONING_REQUIRED", "CLOCK_DISCONTINUITY"}
+    # Live faults and cached admission gates have different lifetimes. Only the
+    # latter are replaced with the current durable commission/clock decisions.
+    reasons = set(snapshot["technical_reasons"])
     if persisted["commissioning_required"]:
         reasons.add("COMMISSIONING_REQUIRED")
     if persisted["clock_blocked"]:
