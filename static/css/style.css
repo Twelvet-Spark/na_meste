@@ -759,6 +759,11 @@ main > .panel + .panel { margin-top: 20px; }
 .attendance-evidence figure { margin: 0; min-width: 0; }
 .attendance-evidence figcaption { font-size: 14px; font-weight: 500; margin-bottom: 8px; }
 .attendance-evidence img { display: block; width: 100%; max-height: 360px; object-fit: contain; background: var(--md-surface-container-low); border-radius: 12px; }
+.attendance-evidence-image { position: relative; overflow: hidden; border-radius: 12px; }
+.attendance-evidence-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; }
+.attendance-gate-outline { stroke: var(--md-inverse-surface); stroke-width: 6; }
+.attendance-gate-line { stroke: var(--vid-warn); stroke-width: 3; }
+.attendance-geometry { font-size: 12px; overflow-wrap: anywhere; margin-block: 8px 0; }
 .attendance-workspace pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--md-surface-container-low); border-radius: 12px; padding: 14px; font-size: 12px; }
 .attendance-audit { padding-left: 24px; }
 .attendance-audit > li { padding-block: 6px; border-bottom: 1px solid var(--md-outline-variant); }

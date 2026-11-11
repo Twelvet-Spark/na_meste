@@ -93,13 +93,21 @@
   </section>
 
   <section class="panel attendance-editor" id="event-editor" aria-labelledby="event-title" hidden>
-    <div class="panel-head"><h2 id="event-title" tabindex="-1">Проверка события</h2><button class="btn ghost" type="button" id="event-close">Закрыть</button></div><p id="event-effective"></p><div id="event-images" class="attendance-evidence"></div><div id="event-candidates"></div>
+    <div class="panel-head"><h2 id="event-title" tabindex="-1">Проверка события</h2><button class="btn ghost" type="button" id="event-close">Закрыть</button></div>
+    <p id="event-loading" class="muted" role="status" hidden></p>
+    <button id="event-load-retry" class="btn" type="button" hidden>Повторить загрузку события</button>
+    <div id="event-content" hidden inert>
+    <p id="event-effective"></p><div id="event-images" class="attendance-evidence"></div><div id="event-candidates"></div>
     <details><summary>Исходные неизменяемые данные</summary><p class="muted">Время в исходной записи — UTC получения сервером, не время экспозиции камеры. Сходство не является вероятностью.</p><pre id="event-raw"></pre></details>
     <form id="decision-form" class="attendance-form"><input name="expected_revision" type="hidden"><div class="attendance-fields"><label class="field">Решение<select name="action"><option value="ACCEPT">Принять / исправить</option><option value="VISITOR">Посетитель — без рабочего времени</option><option value="VOID">Аннулировать ошибочное событие</option></select></label><label class="field">Сотрудник<select name="employee_id" class="attendance-employees"></select></label><label class="field">Направление<select name="direction"><option value="">Не установлено</option><option value="ENTRY">Вход</option><option value="EXIT">Выход</option></select></label><label class="field">Исправленное время <span class="zone-label">UTC+05:00</span><input type="datetime-local" name="occurred_at" step="0.001"></label></div><div class="attendance-fields"><label class="field">Оператор<input name="actor" maxlength="100" required autocomplete="name"></label><label class="field">Основание<textarea name="reason" maxlength="1000" required rows="3"></textarea></label></div><div id="decision-error" class="test-result err" role="alert" hidden></div><p id="decision-result" role="status"></p><div class="attendance-actions"><button class="btn primary" type="submit">Сохранить решение</button><button class="btn" type="button" id="decision-rebase" hidden>Загрузить новую версию, сохранить мои поля</button></div></form>
     <h3>История решений</h3><p class="muted">Имя оператора вводится вручную и не подтверждает личность. Исправления сохраняют исходное наблюдение и предыдущие решения.</p><ol id="decision-history" class="attendance-audit"></ol>
+    </div>
   </section>
   <section class="panel attendance-editor" id="gap-editor" aria-labelledby="gap-title" hidden>
     <div class="panel-head"><h2 id="gap-title" tabindex="-1">Сверка потери наблюдения</h2><button class="btn ghost" type="button" id="gap-close">Закрыть</button></div>
+    <p id="gap-loading" class="muted" role="status" hidden></p>
+    <button id="gap-load-retry" class="btn" type="button" hidden>Повторить загрузку периода</button>
+    <div id="gap-content" hidden inert>
     <p id="gap-description"></p>
     <form id="gap-form" class="attendance-form">
       <input type="hidden" name="expected_revision">
@@ -109,6 +117,7 @@
       <button class="btn primary" type="submit">Отметить период проверенным</button><button class="btn" id="gap-rebase" type="button" hidden>Обновить версию, сохранить поля</button>
     </form>
     <h3>История сверки</h3><ol id="gap-history" class="attendance-audit"></ol>
+    </div>
   </section>
   <p class="attendance-help muted">Доступ — только localhost, доверенная локальная сеть или VPN. Не публикуйте эти страницы и API в интернете: учётных записей и аутентификации нет, подпись оператора не является проверкой личности. Снимки проходов и резервные копии содержат персональные данные; доступ предоставляется только уполномоченным сотрудникам.</p>
 </main>

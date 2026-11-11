@@ -2,7 +2,8 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const state = { tab: 'active', employees: [], status: null, event: null, gap: null,
-  offsets: { events: 0, review: 0, legacy: 0 }, selected: new Map(), imageUrls: [], eventLoad: 0 };
+  offsets: { events: 0, review: 0, legacy: 0 }, selected: new Map(), imageUrls: [], eventLoad: 0,
+  eventReady: false, gapReady: false };
 const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принято', REVIEW: 'На проверке',
   VISITOR: 'Посетитель', VOID: 'Аннулировано', OPEN: 'Открыт — предварительно', CLOSED: 'Закрыт',
   FRAME_GAP: 'Пропуск кадров', STREAM_RESET: 'Переподключение потока', CLOCK_DISCONTINUITY: 'Скачок часов',
@@ -10,6 +11,7 @@ const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принят�
   CAMERA_OFFLINE: 'Камера недоступна', AI_UNAVAILABLE: 'AI-модели недоступны', AI_EXCLUDED: 'Камера исключена из AI',
   PERFORMANCE_WARMUP: 'Измеряется производительность', PERFORMANCE_DEGRADED: 'Недостаточная производительность',
   PERSISTENCE_ERROR: 'Ошибка сохранения', COVERAGE_UNAVAILABLE: 'Нет надёжного наблюдения',
+  COVERAGE_UNRECONCILED: 'Сбой наблюдения ещё не сохранён и не сверён',
   EVIDENCE_UNAVAILABLE: 'Не сохранено изображение', EVIDENCE_LOST: 'Потеряно доказательство прохода',
   PROCESS_DOWNTIME: 'Перерыв работы сервера', NO_FACE: 'Нет подтверждённого лица', AMBIGUOUS_FACE: 'Неоднозначное лицо',
   ASSOCIATION_UNCERTAIN: 'Неоднозначное сопровождение', INCOMPLETE_CROSSING: 'Неполный проход',
@@ -160,6 +162,101 @@ function activate(name, { focus = false } = {}) {
 document.querySelectorAll('[data-tab]').forEach((node) => { node.onclick = () => { location.hash = node.dataset.tab; }; node.onkeydown = (event) => { const tabs = [...document.querySelectorAll('[data-tab]')]; let index = tabs.indexOf(node); if (event.key === 'ArrowRight') index = (index + 1) % tabs.length; else if (event.key === 'ArrowLeft') index = (index + tabs.length - 1) % tabs.length; else if (event.key === 'Home') index = 0; else if (event.key === 'End') index = tabs.length - 1; else return; event.preventDefault(); location.hash = tabs[index].dataset.tab; activate(tabs[index].dataset.tab, { focus: true }); }; });
 window.addEventListener('hashchange', () => activate(location.hash.slice(1)));
 for (const name of ['events', 'review', 'legacy']) $(`${name}-filter`).onsubmit = (event) => { event.preventDefault(); state.offsets[name] = 0; if (name === 'review') { state.selected.clear(); selectionCount(); } loadPage(name); };
+function beginEditor(kind) {
+  state.eventReady = false;
+  state.gapReady = false;
+  $('event-editor').hidden = kind !== 'event';
+  $('gap-editor').hidden = kind !== 'gap';
+  $(`${kind}-content`).hidden = true;
+  $(`${kind}-content`).inert = true;
+  $(`${kind}-loading`).hidden = false;
+  $(`${kind}-loading`).textContent = kind === 'event' ? 'Загрузка выбранного события…' : 'Загрузка выбранного периода…';
+  $(`${kind}-load-retry`).hidden = true;
+}
+function finishEditor(kind) {
+  state[`${kind}Ready`] = true;
+  $(`${kind}-loading`).hidden = true;
+  $(`${kind}-content`).inert = false;
+  $(`${kind}-content`).hidden = false;
+}
+function editorLoadError(kind, error, retry) {
+  $(`${kind}-loading`).textContent = `Данные не загружены. ${error.message}`;
+  $(`${kind}-load-retry`).onclick = retry;
+  $(`${kind}-load-retry`).hidden = false;
+}
+function savedGateOverlay(event, kind, image, frame, generation) {
+  if (event.source !== 'CAMERA' || !['before', 'after'].includes(kind)) return null;
+  const raw = event.raw;
+  const calibration = raw.calibration;
+  const crop = raw[`${kind}_crop`];
+  const point = (value) => Array.isArray(value) && value.length === 2
+    && value.every((coordinate) => Number.isFinite(coordinate) && coordinate >= 0 && coordinate <= 1);
+  const a = calibration?.line_start, b = calibration?.line_end, inside = calibration?.inside_point;
+  if (!point(a) || !point(b) || !point(inside) || !Array.isArray(crop) || crop.length !== 4
+      || !crop.every((value) => Number.isFinite(value) && value >= 0 && value <= 1)
+      || crop[2] <= crop[0] || crop[3] <= crop[1]) return null;
+  const dx = b[0] - a[0], dy = b[1] - a[1], length = Math.hypot(dx, dy);
+  const interiorSide = (inside[0] - a[0]) * -dy + (inside[1] - a[1]) * dx;
+  if (length < 1e-9 || Math.abs(interiorSide) < 1e-9) return null;
+  const width = image.naturalWidth, height = image.naturalHeight;
+  const project = ([x, y]) => [(x - crop[0]) / (crop[2] - crop[0]) * width,
+    (y - crop[1]) / (crop[3] - crop[1]) * height];
+  const svgNode = (name, attributes = {}) => {
+    const node = document.createElementNS('http://www.w3.org/2000/svg', name);
+    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+    return node;
+  };
+  const svg = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'xMidYMid meet',
+    'aria-hidden': 'true', focusable: 'false', class: 'attendance-evidence-overlay' });
+  const clipId = `attendance-crop-${generation}-${kind}`;
+  const definitions = svgNode('defs');
+  const clip = svgNode('clipPath', { id: clipId });
+  clip.append(svgNode('rect', { width, height }));
+  definitions.append(clip);
+  const drawing = svgNode('g', { 'clip-path': `url(#${clipId})` });
+  const stroke = (path) => {
+    for (const name of ['attendance-gate-outline', 'attendance-gate-line']) {
+      drawing.append(svgNode('path', { d: path, class: name, fill: 'none',
+        'vector-effect': 'non-scaling-stroke', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+    }
+  };
+  const from = project(a), to = project(b);
+  stroke(`M ${from.join(' ')} L ${to.join(' ')}`);
+  // Clip the finite segment in full-frame coordinates, so a cropped view can
+  // place its direction arrow on the visible gate rather than off the image.
+  let first = 0, last = 1;
+  for (const [position, delta, lower, upper] of [[a[0], dx, crop[0], crop[2]], [a[1], dy, crop[1], crop[3]]]) {
+    if (Math.abs(delta) < 1e-12) {
+      if (position < lower || position > upper) { last = -1; break; }
+    } else {
+      const entry = (lower - position) / delta, exit = (upper - position) / delta;
+      first = Math.max(first, Math.min(entry, exit));
+      last = Math.min(last, Math.max(entry, exit));
+    }
+  }
+  const observed = ['ENTRY', 'EXIT'].includes(raw.direction);
+  const direction = observed ? raw.direction : calibration.role;
+  if (first <= last && ['ENTRY', 'EXIT'].includes(direction)) {
+    const midpoint = (first + last) / 2;
+    const center = [a[0] + dx * midpoint, a[1] + dy * midpoint];
+    const sign = Math.sign(interiorSide) * (direction === 'EXIT' ? -1 : 1);
+    const reach = Math.min(.1, (crop[2] - crop[0]) / 4, (crop[3] - crop[1]) / 4);
+    const nx = -dy / length * sign * reach, ny = dx / length * sign * reach;
+    const tail = project([center[0] - nx, center[1] - ny]);
+    const tip = project([center[0] + nx, center[1] + ny]);
+    const angle = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
+    const head = Math.min(14, Math.hypot(tip[0] - tail[0], tip[1] - tail[1]) / 3);
+    const left = [tip[0] - head * Math.cos(angle - .45), tip[1] - head * Math.sin(angle - .45)];
+    const right = [tip[0] - head * Math.cos(angle + .45), tip[1] - head * Math.sin(angle + .45)];
+    stroke(`M ${tail.join(' ')} L ${tip.join(' ')} M ${left.join(' ')} L ${tip.join(' ')} L ${right.join(' ')}`);
+  }
+  svg.append(definitions, drawing);
+  frame.append(svg);
+  const coordinates = (values) => values.map((value) => value.toFixed(3)).join(', ');
+  const description = el('p', null, 'attendance-geometry muted');
+  description.textContent = `Сохранённая линия: (${coordinates(a)}) — (${coordinates(b)}); фрагмент: (${coordinates(crop)}). Калибровка ${calibration.revision}, источник ${calibration.source_revision}. ${first > last ? 'Линия вне этого фрагмента. ' : ''}${observed ? `Стрелка — исходное направление: ${label(direction)}.` : `Направление прохода не установлено; стрелка — направление калибровки: ${label(direction)}.`} Роль камеры при записи: ${label(calibration.role)}.`;
+  return description;
+}
 function clearImages() { for (const url of state.imageUrls) URL.revokeObjectURL(url); state.imageUrls = []; }
 async function evidenceImage(event, kind, name, target, generation) {
   const figure = el('figure'); const caption = el('figcaption', name); const message = el('p', event.evidence.purged ? 'Срок хранения изображения истёк' : !event.evidence[kind] ? 'Изображение не сохранено' : 'Загрузка изображения…', 'muted'); figure.append(caption, message); target.append(figure);
@@ -169,14 +266,40 @@ async function evidenceImage(event, kind, name, target, generation) {
     if (generation !== state.eventLoad) return;
     if (!response.ok) { message.textContent = response.status === 410 ? 'Срок хранения изображения истёк' : response.status === 404 ? 'Изображение отсутствует' : 'Изображение временно недоступно — откройте событие повторно'; return; }
     const blob = await response.blob(); if (generation !== state.eventLoad) return;
-    const url = URL.createObjectURL(blob); state.imageUrls.push(url); const image = el('img'); image.src = url; image.alt = `${name}: событие ${time(event.occurred_at)}`; message.replaceWith(image);
+    const url = URL.createObjectURL(blob);
+    state.imageUrls.push(url);
+    const image = el('img');
+    const frame = el('div', null, 'attendance-evidence-image');
+    image.alt = `${name}: событие ${time(event.occurred_at)}`;
+    image.onload = () => {
+      if (generation !== state.eventLoad) return;
+      const description = savedGateOverlay(event, kind, image, frame, generation);
+      if (description) figure.append(description);
+      else if (event.source === 'CAMERA' && kind !== 'face') {
+        figure.append(el('p', 'Для этого снимка нет пригодной сохранённой геометрии; текущая калибровка не подставляется.', 'attendance-geometry muted'));
+      }
+    };
+    image.onerror = () => {
+      if (generation === state.eventLoad) frame.replaceWith(el('p', 'Сохранённое изображение не удалось прочитать. Откройте событие повторно.', 'muted'));
+    };
+    frame.append(image);
+    message.replaceWith(frame);
+    image.src = url;
   } catch (_) { if (generation === state.eventLoad) message.textContent = 'Нет связи: изображение не загружено. Откройте событие повторно.'; }
 }
 async function openEvent(identifier, preserve = false) {
+  preserve = preserve && state.event?.id === identifier;
   const generation = ++state.eventLoad;
+  beginEditor('event');
+  clearImages();
+  if (!preserve) {
+    $('event-editor').scrollIntoView({ behavior: 'auto', block: 'start' });
+    $('event-title').focus();
+  }
   try {
-    const data = await api(`/api/attendance/events/${encodeURIComponent(identifier)}`); if (generation !== state.eventLoad) return;
-    state.event = data; clearImages(); $('event-editor').hidden = false; $('gap-editor').hidden = true;
+    const data = await api(`/api/attendance/events/${encodeURIComponent(identifier)}`);
+    if (generation !== state.eventLoad) return;
+    state.event = data;
     $('event-effective').textContent = `${time(data.occurred_at)} · ${label(data.direction)} · ${data.employee_name || 'Сотрудник не установлен'} · ${label(data.status)} · версия ${data.revision}. Причины: ${reasons([...data.reason_codes, ...data.projection_reasons])}`;
     const images = $('event-images'); images.replaceChildren(); for (const [kind, name] of [['before', 'До прохода'], ['after', 'После прохода'], ['face', 'Лицо']]) evidenceImage(data, kind, name, images, generation);
     const candidates = $('event-candidates'); candidates.replaceChildren(el('h3', 'Кандидаты и качество лица'));
@@ -191,25 +314,47 @@ async function openEvent(identifier, preserve = false) {
     const f = fields($('decision-form')); f.expected_revision.value = data.revision;
     if (!preserve) { f.action.value = 'ACCEPT'; f.employee_id.value = data.employee_id || ''; f.direction.value = data.direction || ''; f.occurred_at.value = inputTime(data.occurred_at); f.reason.value = ''; $('decision-result').textContent = ''; $('decision-form').pendingWrite = null; }
     showError('decision-error', null); $('decision-rebase').hidden = true; decisionFields();
-    if (!preserve) { $('event-editor').scrollIntoView({ behavior: 'auto', block: 'start' }); $('event-title').focus(); }
-    else $('decision-result').textContent = 'Загружена актуальная версия. Ваши поля сохранены: сравните их с текущим состоянием выше, затем явно сохраните решение.';
-  } catch (error) { showError(state.tab === 'review' ? 'review-error' : 'events-error', error); }
+    finishEditor('event');
+    if (preserve) $('decision-result').textContent = 'Загружена актуальная версия. Ваши поля сохранены: сравните их с текущим состоянием выше, затем явно сохраните решение.';
+  } catch (error) {
+    if (generation === state.eventLoad) editorLoadError('event', error, () => openEvent(identifier, preserve));
+  }
 }
 function decisionFields() { const f = fields($('decision-form')); const accept = f.action.value === 'ACCEPT'; for (const name of ['employee_id', 'direction', 'occurred_at']) { f[name].required = accept; f[name].disabled = !accept || (name === 'employee_id' && !state.employees.length); } }
 fields($('decision-form')).action.onchange = decisionFields;
-$('event-close').onclick = () => { $('event-editor').hidden = true; state.eventLoad++; clearImages(); };
+$('event-close').onclick = () => { $('event-editor').hidden = true; state.eventReady = false; state.eventLoad++; clearImages(); };
 $('decision-rebase').onclick = () => openEvent(state.event.id, true);
 $('decision-form').onsubmit = async (event) => {
-  event.preventDefault(); const form = event.currentTarget; const f = fields(form); const data = { ...human(form), expected_revision: Number(f.expected_revision.value), action: f.action.value };
+  event.preventDefault();
+  if (!state.eventReady) return;
+  const identifier = state.event.id, generation = state.eventLoad;
+  const form = event.currentTarget, f = fields(form);
+  const data = { ...human(form), expected_revision: Number(f.expected_revision.value), action: f.action.value };
   if (data.action === 'ACCEPT') Object.assign(data, { employee_id: Number(f.employee_id.value), direction: f.direction.value, occurred_at: timestamp(f.occurred_at) });
-  try { const result = await write(form, `/api/attendance/events/${encodeURIComponent(state.event.id)}/decision`, data); await openEvent(result.id, true); $('decision-result').textContent = 'Решение сохранено. Рабочие интервалы пересчитаны; исходные данные не изменены.'; loadActive(); loadStatus(); if (['events', 'review'].includes(state.tab)) loadPage(state.tab); }
-  catch (error) { showError('decision-error', error); $('decision-rebase').hidden = error.status !== 409; }
+  try {
+    const result = await write(form, `/api/attendance/events/${encodeURIComponent(identifier)}/decision`, data);
+    loadActive(); loadStatus();
+    if (['events', 'review'].includes(state.tab)) loadPage(state.tab);
+    if (generation !== state.eventLoad) return;
+    await openEvent(result.id, true);
+    if (state.eventReady && state.event.id === result.id) {
+      $('decision-result').textContent = 'Решение сохранено. Рабочие интервалы пересчитаны; исходные данные не изменены.';
+    }
+  } catch (error) {
+    if (generation !== state.eventLoad) return;
+    showError('decision-error', error);
+    $('decision-rebase').hidden = error.status !== 409;
+  }
 };
 async function openGap(gap, preserve = false) {
+  preserve = preserve && state.gap?.id === gap.id;
   const generation = ++state.eventLoad;
+  beginEditor('gap');
   clearImages();
-  $('gap-editor').hidden = false;
-  $('event-editor').hidden = true;
+  if (!preserve) {
+    $('gap-editor').scrollIntoView({ block: 'start' });
+    $('gap-title').focus();
+  }
   const form = $('gap-form');
   form.querySelector('[type="submit"]').disabled = true;
   try {
@@ -238,26 +383,33 @@ async function openGap(gap, preserve = false) {
     if (!current.decisions.length) history.append(el('li', 'Сверок оператора ещё нет.'));
     showError('gap-error', null);
     $('gap-rebase').hidden = true;
-    $('gap-editor').scrollIntoView({ block: 'start' });
-    $('gap-title').focus();
-  } catch (error) { showError('gap-error', error); }
+    finishEditor('gap');
+  } catch (error) {
+    if (generation === state.eventLoad) editorLoadError('gap', error, () => openGap(gap, preserve));
+  }
 }
-$('gap-close').onclick = () => { $('gap-editor').hidden = true; state.eventLoad++; };
+$('gap-close').onclick = () => { $('gap-editor').hidden = true; state.gapReady = false; state.eventLoad++; };
 $('gap-rebase').onclick = async () => {
   await openGap(state.gap, true);
   $('gap-result').textContent = 'Ваши поля сохранены. Сравните новую версию и повторно сверьте период перед подтверждением.';
 };
 $('gap-form').onsubmit = async (event) => {
   event.preventDefault();
+  if (!state.gapReady || !state.gap.ended_at) return;
+  const identifier = state.gap.id, generation = state.eventLoad;
   const form = event.currentTarget;
   try {
-    const result = await write(form, `/api/attendance/gaps/${state.gap.id}/review`, {
+    const result = await write(form, `/api/attendance/gaps/${identifier}/review`, {
       ...human(form), expected_revision: Number(fields(form).expected_revision.value),
     });
-    await openGap(result, true);
-    $('gap-result').textContent = 'Сверка сохранена. История потери наблюдения остаётся в журнале.';
     loadActive(); loadStatus(); loadPage('review');
+    if (generation !== state.eventLoad) return;
+    await openGap(result, true);
+    if (state.gapReady && state.gap.id === result.id) {
+      $('gap-result').textContent = 'Сверка сохранена. История потери наблюдения остаётся в журнале.';
+    }
   } catch (error) {
+    if (generation !== state.eventLoad) return;
     showError('gap-error', error);
     $('gap-rebase').hidden = error.status !== 409;
   }
