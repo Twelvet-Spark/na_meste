@@ -1,10 +1,10 @@
 """Read-only pre-attendance observations: never evidence of worked hours."""
-from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.attendance_types import AttendanceDate
 from app.database.database import get_db
 from app.database.models import Camera, Employee, PresenceSession
 from app.services.attendance_queries import read_snapshot
@@ -14,8 +14,8 @@ router = APIRouter(prefix="/api/presence", tags=["legacy observations"])
 
 
 @router.get("/legacy")
-def legacy_observations(employee_id: int | None = None, from_date: date | None = None,
-                        to_date: date | None = None, limit: int = Query(50, ge=1, le=200),
+def legacy_observations(employee_id: int | None = None, from_date: AttendanceDate | None = None,
+                        to_date: AttendanceDate | None = None, limit: int = Query(50, ge=1, le=200),
                         offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     if from_date is not None and to_date is not None and to_date < from_date:
         raise HTTPException(422, "End date precedes start date")

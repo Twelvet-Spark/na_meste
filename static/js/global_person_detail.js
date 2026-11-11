@@ -1,4 +1,4 @@
-// карточка глобальной личности: шапка, слияние, траектория, таймлайн.
+// Архив глобальной личности: только чтение, траектория и таймлайн.
 
 const globalId = window.GLOBAL_ID;
 const $ = (id) => document.getElementById(id);
@@ -23,28 +23,30 @@ async function loadPerson() {
     if (!res.ok) throw new Error();
     p = await res.json();
   } catch (e) {
-    $('gp-name').textContent = 'Не найдена';
-    $('gp-title').textContent = 'не найдена';
+    $('gp-name').textContent = 'Запись недоступна';
+    $('gp-title').textContent = 'Не удалось загрузить · обновление через 5 секунд';
     return;
   }
-  lastPerson = p;
   const title = p.employee_name
     ? `G#${p.global_id} · ${p.employee_name}`
     : `G#${p.global_id}`;
   document.title = `${title}`;
   $('gp-name').textContent = title;
-  $('gp-title').textContent = `${p.status}`;
+  $('gp-title').textContent = `Только чтение · ${p.status}`;
 
-  const meta = [];
-  meta.push(`Статус: <b>${p.status}</b>`);
+  const meta = $('gp-meta');
+  meta.replaceChildren();
+  meta.append(`Сохранённый статус: ${p.status} · `);
   if (p.employee_id) {
-    meta.push(`Сотрудник: <a href="/employees/${p.employee_id}">${p.employee_name || '#' + p.employee_id}</a>`);
+    const employee = document.createElement('a');
+    employee.href = `/employees/${p.employee_id}`;
+    employee.textContent = p.employee_name || `#${p.employee_id}`;
+    meta.append('Сотрудник: ', employee, ' · ');
   }
-  meta.push(`Наблюдений: <b>${p.observations_count}</b>`);
-  meta.push(`Последняя камера: <b>${p.last_camera_name || (p.last_camera_id ? '#' + p.last_camera_id : '—')}</b>`);
-  meta.push(`Последнее наблюдение: ${fmtDateTime(p.last_seen_at)}`);
-  meta.push(`Создана: ${fmtDateTime(p.created_at)}`);
-  $('gp-meta').innerHTML = meta.join(' · ');
+  meta.append(`Наблюдений: ${p.observations_count} · `,
+    `Последняя камера: ${p.last_camera_name || (p.last_camera_id ? '#' + p.last_camera_id : '—')} · `,
+    `Последнее наблюдение: ${fmtDateTime(p.last_seen_at)} · `,
+    `Создана: ${fmtDateTime(p.created_at)}`);
 
   if (p.has_photo) {
     const img = $('gp-avatar');
@@ -52,82 +54,7 @@ async function loadPerson() {
     img.hidden = false;
     img.onerror = () => { img.hidden = true; };
   }
-  syncEmployeeForm(p);
 }
-
-// Привязка сотрудника: список загружается один раз, форма отражает текущую связь
-let employeesLoaded = false;
-let lastPerson = null;
-
-async function loadEmployees() {
-  try {
-    const res = await fetch('/api/employees');
-    if (!res.ok) throw new Error();
-    const employees = await res.json();
-    const select = $('employee-select');
-    select.innerHTML = '';
-    for (const e of employees) {
-      const option = document.createElement('option');
-      option.value = e.id;
-      option.textContent = e.active ? e.name : `${e.name} (неактивен)`;
-      select.appendChild(option);
-    }
-    employeesLoaded = true;
-    syncEmployeeForm(lastPerson);
-  } catch (e) { /* список недоступен — форма останется пустой */ }
-}
-
-function syncEmployeeForm(p) {
-  if (!employeesLoaded || !p) return;
-  const select = $('employee-select');
-  const unlink = $('employee-unlink');
-  if (p.employee_id) {
-    select.value = p.employee_id;
-    unlink.hidden = false;
-  } else {
-    unlink.hidden = true;
-  }
-}
-
-$('employee-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const employeeId = parseInt($('employee-select').value, 10);
-  const status = $('employee-status');
-  if (!employeeId) return;
-  status.textContent = 'Сохранение…';
-  try {
-    const res = await fetch(`/api/global-persons/${globalId}/employee/${employeeId}`, {
-      method: 'PUT',
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      status.textContent = data.detail || 'Ошибка привязки';
-      return;
-    }
-    status.textContent = `Связано: ${data.employee_name || '#' + data.employee_id}`;
-    loadPerson();
-  } catch (err) {
-    status.textContent = 'Ошибка привязки';
-  }
-});
-
-$('employee-unlink').addEventListener('click', async () => {
-  const status = $('employee-status');
-  status.textContent = 'Отвязка…';
-  try {
-    const res = await fetch(`/api/global-persons/${globalId}/employee`, {
-      method: 'DELETE',
-    });
-    if (!res.ok) {
-      status.textContent = 'Ошибка отвязки';
-      return;
-    }
-    status.textContent = 'Привязка снята';
-    loadPerson();
-  } catch (err) {
-    status.textContent = 'Ошибка отвязки';
-  }
-});
 
 async function loadTrajectory() {
   let data;
@@ -135,12 +62,15 @@ async function loadTrajectory() {
     const res = await fetch(`/api/global-persons/${globalId}/trajectory`);
     if (!res.ok) throw new Error();
     data = await res.json();
-  } catch (e) { return; }
+  } catch (e) {
+    $('trajectory').textContent = 'Траектория недоступна. Повторная загрузка через 5 секунд.';
+    return;
+  }
 
   const box = $('trajectory');
-  box.innerHTML = '';
+  box.replaceChildren();
   if (!data.segments.length) {
-    box.innerHTML = '<span class="muted">Траектории пока нет.</span>';
+    box.textContent = 'Траектории пока нет.';
     return;
   }
   data.segments.forEach((seg, i) => {
@@ -152,8 +82,11 @@ async function loadTrajectory() {
     }
     const node = document.createElement('span');
     node.className = 'traj-node';
-    node.innerHTML = `${seg.camera_name}
-      <span class="muted small">${fmtTime(seg.from)}–${fmtTime(seg.to)} · ${seg.observations}</span>`;
+    node.textContent = seg.camera_name;
+    const times = document.createElement('span');
+    times.className = 'muted small';
+    times.textContent = `${fmtTime(seg.from)}–${fmtTime(seg.to)} · ${seg.observations}`;
+    node.appendChild(times);
     box.appendChild(node);
   });
 }
@@ -164,10 +97,15 @@ async function loadTimeline() {
     const res = await fetch(`/api/global-persons/${globalId}/timeline?limit=300`);
     if (!res.ok) throw new Error();
     items = await res.json();
-  } catch (e) { return; }
+  } catch (e) {
+    $('timeline-empty').textContent = 'Таймлайн недоступен. Повторная загрузка через 5 секунд.';
+    $('timeline-empty').hidden = false;
+    return;
+  }
 
   const tbody = $('timeline-table').querySelector('tbody');
   tbody.innerHTML = '';
+  $('timeline-empty').textContent = 'Наблюдений пока нет.';
   $('timeline-empty').hidden = items.length > 0;
 
   for (const item of items) {
@@ -250,42 +188,7 @@ async function loadTimeline() {
   }
 }
 
-// Слияние: G#source вливается в текущую личность
-$('merge-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const sourceId = parseInt($('merge-source').value, 10);
-  const status = $('merge-status');
-  if (!sourceId) return;
-  if (sourceId === globalId) {
-    status.textContent = 'Это текущая личность — укажите id другой (лишней).';
-    return;
-  }
-  status.textContent = 'Объединение…';
-  try {
-    const res = await fetch(`/api/global-persons/${globalId}/merge/${sourceId}`, {
-      method: 'POST',
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      status.textContent = data.detail || 'Ошибка объединения';
-      return;
-    }
-    const moved = data.moved || {};
-    status.textContent =
-      `G#${data.merged_from} влит: наблюдений +${moved.observations ?? 0},` +
-      ` событий +${moved.events ?? 0}` +
-      (data.employee_conflict ? ' · внимание: у личностей были разные сотрудники!' : '');
-    $('merge-source').value = '';
-    loadPerson();
-    loadTrajectory();
-    loadTimeline();
-  } catch (err) {
-    status.textContent = 'Ошибка объединения';
-  }
-});
-
 loadPerson();
-loadEmployees();
 loadTrajectory();
 loadTimeline();
 setInterval(() => { loadPerson(); loadTrajectory(); loadTimeline(); }, 5000);

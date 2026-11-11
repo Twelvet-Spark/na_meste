@@ -1,15 +1,29 @@
 """Shared attendance HTTP payloads and materialized read views."""
-from datetime import datetime, timezone
-from typing import Literal
+from datetime import date, datetime, timezone
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.time_utils import attendance_iso, day_bounds
 
 
 def milliseconds(value: datetime) -> datetime:
-    if value.tzinfo is not None:
-        value = value.astimezone(timezone.utc).replace(tzinfo=None)
-    return value.replace(microsecond=value.microsecond // 1000 * 1000)
+    try:
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.replace(microsecond=value.microsecond // 1000 * 1000)
+    except OverflowError as exc:
+        raise ValueError("Timestamp cannot be represented in UTC") from exc
+
+
+def _attendance_date(value: date) -> date:
+    """Validate both bounds once at every public date-input boundary."""
+    day_bounds(value)
+    return value
+
+
+AttendanceDate = Annotated[date, AfterValidator(_attendance_date)]
 
 
 class HumanInput(BaseModel):
@@ -36,7 +50,9 @@ class TimedInput(HumanInput):
             return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("Timestamp requires an explicit UTC offset")
-        return milliseconds(value).replace(tzinfo=timezone.utc)
+        normalized = milliseconds(value)
+        attendance_iso(normalized)  # Accepted input must also render after commit.
+        return normalized.replace(tzinfo=timezone.utc)
 
 
 class EventDecisionInput(TimedInput):

@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% set active_page = 'global' %}
 
-{% block title %}Global{% endblock %}
+{% block title %}Архив Re-ID{% endblock %}
 
 {% block topbar_right %}
   <span id="gp-title" class="muted">Global</span>
 {% endblock %}
 
 {% block content %}
-  <main class="container wide">
+  <main class="container wide global-archive">
     <!-- Шапка личности -->
     <section class="panel">
       <div class="gp-head">
@@ -18,39 +18,14 @@
           <div id="gp-meta" class="muted small"></div>
         </div>
       </div>
-    </section>
-
-    <!-- Привязка сотрудника -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Сотрудник</h2>
-        <span class="muted small">Если распознавание не сработало, но вы знаете, кто это — свяжите личность с сотрудником вручную</span>
-      </div>
-      <form id="employee-form" class="merge-form">
-        <select id="employee-select"></select>
-        <button type="submit" class="btn primary">Связать</button>
-        <button type="button" id="employee-unlink" class="btn ghost" hidden>Отвязать</button>
-        <span id="employee-status" class="muted small"></span>
-      </form>
+      <p class="archive-notice muted">Только чтение · не рабочие часы. Сохранённая связь с сотрудником и статус — данные Re-ID, а не подтверждение присутствия на работе. После перезапуска записи не меняются; новая живая галерея использует новые global_id. Объединение и ручная привязка недоступны.</p>
+      <a href="/global">К списку наблюдений</a> · <a href="/presence">Учёт рабочего времени</a>
     </section>
 
     <!-- Траектория -->
     <section class="panel">
       <div class="panel-head"><h2>Траектория</h2></div>
       <div id="trajectory" class="trajectory"></div>
-    </section>
-
-    <!-- Объединение личностей -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Объединение</h2>
-        <span class="muted small">Если один и тот же человек получил два global_id — влейте лишний сюда</span>
-      </div>
-      <form id="merge-form" class="merge-form">
-        <input type="number" id="merge-source" min="1" placeholder="G#id лишней личности" required>
-        <button type="submit" class="btn">Влить в эту личность</button>
-        <span id="merge-status" class="muted small"></span>
-      </form>
     </section>
 
     <!-- Таймлайн -->

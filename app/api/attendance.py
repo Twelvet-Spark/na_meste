@@ -1,7 +1,7 @@
 """Attendance calibration, consistent work views and audited human corrections."""
 import base64
 import time
-from datetime import date, datetime
+from datetime import datetime
 from typing import Literal
 
 import cv2
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.doorway import DoorwayCalibration
 from app.attendance_types import (
-    ActiveView, CommissionInput, EventDecisionInput, EventDetail, EventPage, EventView,
+    ActiveView, AttendanceDate, CommissionInput, EventDecisionInput, EventDetail, EventPage, EventView,
     GapDecisionInput, GapDetail, GapView, ManualEventInput, ReviewPage, SessionPage, VisitorBatchInput, milliseconds,
 )
 from app.config import settings
@@ -279,7 +279,7 @@ def _event_query(db, employee_id, from_date, to_date, status=None):
 
 @router.get("/events", response_model=EventPage)
 def list_events(request: Request, employee_id: int | None = None,
-                from_date: date | None = None, to_date: date | None = None,
+                from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
                 status: Literal["ACCEPTED", "REVIEW", "VISITOR", "VOID"] | None = None,
                 limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     def read(db):
@@ -345,7 +345,7 @@ def _sessions(db, employee_id, from_date, to_date, status, as_of, *, active=Fals
 
 @router.get("/sessions", response_model=SessionPage)
 def list_sessions(request: Request, employee_id: int | None = None,
-                  from_date: date | None = None, to_date: date | None = None,
+                  from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
                   status: Literal["OPEN", "CLOSED", "REVIEW"] | None = None,
                   limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     as_of = milliseconds(_service(request)._now())
@@ -371,12 +371,12 @@ def _report(request, from_date, to_date, employee_id):
 
 
 @router.get("/report", response_model=AttendanceReport)
-def attendance_report(request: Request, from_date: date, to_date: date, employee_id: int | None = None):
+def attendance_report(request: Request, from_date: AttendanceDate, to_date: AttendanceDate, employee_id: int | None = None):
     return _report(request, from_date, to_date, employee_id)
 
 
 @router.get("/report.csv")
-def attendance_report_csv(request: Request, from_date: date, to_date: date, employee_id: int | None = None):
+def attendance_report_csv(request: Request, from_date: AttendanceDate, to_date: AttendanceDate, employee_id: int | None = None):
     report = _report(request, from_date, to_date, employee_id)
     return Response(report_csv(report), media_type="text/csv", headers={
         "Content-Disposition": f'attachment; filename="attendance-{from_date}-{to_date}.csv"',
@@ -386,7 +386,7 @@ def attendance_report_csv(request: Request, from_date: date, to_date: date, empl
 
 @router.get("/review", response_model=ReviewPage)
 def list_review(request: Request, employee_id: int | None = None,
-                from_date: date | None = None, to_date: date | None = None,
+                from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
                 kind: Literal["event", "gap"] | None = None,
                 limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     def read(db):

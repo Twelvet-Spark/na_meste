@@ -1,29 +1,30 @@
 {% extends "base.html" %}
 {% set active_page = 'global' %}
 
-{% block title %}Люди{% endblock %}
+{% block title %}Архив Re-ID{% endblock %}
 
 {% block topbar_right %}
   <span id="summary" class="muted"></span>
 {% endblock %}
 
 {% block content %}
-  <main class="container wide">
+  <main class="container wide global-archive">
     <section class="panel">
       <div class="panel-head">
-        <h2>Глобальные личности</h2>
-        <span class="muted small">Один человек = один global_id на всех камерах (межкамерный Re-ID трекинг)</span>
+        <h2>Архив глобальных наблюдений</h2>
+        <span class="muted">Только чтение · не рабочие часы</span>
       </div>
+      <p class="archive-notice muted">Необязательный Re-ID связывает наблюдения по внешности, но не подтверждает личность или рабочее время. После перезапуска сохранённые записи не меняются, а новые наблюдения получают новые global_id. Объединение и ручная привязка недоступны. <a href="/presence">Перейти к учёту рабочего времени</a>.</p>
 
       <div class="filters">
-        <input type="search" id="f-search" placeholder="Поиск: G#184 или имя сотрудника" autocomplete="off">
-        <select id="f-status">
+        <input type="search" id="f-search" aria-label="Поиск глобальной личности" placeholder="Поиск: G#184 или имя сотрудника" autocomplete="off">
+        <select id="f-status" aria-label="Сохранённый статус">
           <option value="">Все статусы</option>
           <option value="ACTIVE">ACTIVE</option>
           <option value="NEW">NEW</option>
           <option value="LOST">LOST</option>
         </select>
-        <select id="f-camera">
+        <select id="f-camera" aria-label="Последняя сохранённая камера">
           <option value="">Все камеры</option>
         </select>
       </div>
@@ -32,7 +33,7 @@
         <table class="table" id="persons-table">
           <thead>
             <tr>
-              <th></th><th>Global ID</th><th>Статус</th><th>Сотрудник</th>
+              <th></th><th>Global ID</th><th>Сохранённый статус</th><th>Сотрудник</th>
               <th>Последняя камера</th><th>Наблюдений</th>
               <th>Последнее наблюдение</th><th></th>
             </tr>

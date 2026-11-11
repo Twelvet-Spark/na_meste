@@ -16,9 +16,9 @@ global_events пишется событие person_lost). Связывание: 
 при первом матче, CONFIRMED_MATCH после повторного совпадения эмбеддинга
 с той же identity.
 
-Дробление identity (лишний global_id) безопаснее ложного слияния, поэтому
-фрагменты накапливаются — их объединяет merge() (вызывается из API
-/api/global-persons/{id}/merge/{source}): БД-часть в API, память — здесь.
+Дробление identity безопаснее ложного слияния. При запуске сохранённые
+личности становятся неизменяемым архивом: новая галерея пуста, новые ID
+строго выше максимального сохранённого. Архив не участвует в матчинге.
 
 Ошибка Re-ID/БД не должна ронять pipeline: воркер вызывает process()
 в try/except; здесь дополнительно защищены записи в БД.
@@ -29,12 +29,13 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+from sqlalchemy import func
 
 from app.ai.reid import PersonReID
 from app.config import BASE_DIR, settings
@@ -165,10 +166,13 @@ class GlobalIdentityManager:
         self.notifier = notifier
         self._identities: dict[int, GlobalIdentity] = {}
         self._bindings: dict[tuple[int, int], TrackBinding] = {}
-        self._next_id = 1
         self._lock = threading.RLock()
         self._last_sweep = 0.0
-        self._load_from_db()
+        # A failed seed must abort this optional manager, never reuse ID 1.
+        # build_ai_worker isolates this failure from attendance inference.
+        with self._session_factory() as db:
+            maximum = db.query(func.max(GlobalPerson.id)).scalar()
+        self._next_id = (maximum if maximum is not None else 0) + 1
 
     # ------------------------------------------------------------ публичное
 
@@ -268,63 +272,6 @@ class GlobalIdentityManager:
                 }
                 for i in self._identities.values()
             ]
-
-    def cleanup(self) -> None:
-        """Удалить наблюдения/события/персон старше global_keep_days."""
-        cutoff = utcnow() - timedelta(days=settings.global_keep_days)
-        try:
-            with self._session_factory() as db:
-                db.query(GlobalEvent).filter(GlobalEvent.created_at < cutoff).delete()
-                db.query(GlobalObservation).filter(
-                    GlobalObservation.created_at < cutoff).delete()
-                db.query(GlobalPerson).filter(
-                    GlobalPerson.last_seen_at < cutoff).delete()
-                db.commit()
-        except Exception:
-            logger.exception("Global: ошибка очистки старых данных")
-
-    def merge(self, target_id: int, source_id: int) -> None:
-        """Объединить личности в ПАМЯТИ (БД-часть делает API перед вызовом):
-        галерея эмбеддингов source вливается в target, живые привязки треков
-        переключаются на target, source исчезает из памяти."""
-        with self._lock:
-            source = self._identities.pop(source_id, None)
-            target = self._identities.get(target_id)
-            if source is not None:
-                if target is None:
-                    # target не в памяти — переименовываем source: его записи
-                    # уже слиты в БД, живые привязки должны указывать на target
-                    source.global_id = target_id
-                    self._identities[target_id] = source
-                else:
-                    target.embeddings.extend(source.embeddings)
-                    while len(target.embeddings) > settings.global_history_len:
-                        target.embeddings.popleft()
-                    if target.employee_id is None:
-                        target.employee_id = source.employee_id
-                    if source.last_seen > target.last_seen:
-                        target.last_seen = source.last_seen
-                        target.last_seen_wall = source.last_seen_wall
-                        target.last_camera = source.last_camera
-                        target.last_track_id = source.last_track_id
-            # привязки могли остаться на source даже если identity уже ушла
-            # из памяти (sweep) — переключаем в любом случае
-            for binding in self._bindings.values():
-                if binding.global_id == source_id:
-                    binding.global_id = target_id
-        logger.info("Global: merge global_id=%d вливается в global_id=%d",
-                    source_id, target_id)
-
-    def assign_employee(self, global_id: int, employee_id: Optional[int]) -> None:
-        """Ручная привязка/отвязка сотрудника (БД-часть делает API):
-        обновить identity в памяти, иначе периодический _db_update_person
-        активной личности затрёт global_persons.employee_id значением из
-        памяти (None при несработавшем распознавании)."""
-        with self._lock:
-            identity = self._identities.get(global_id)
-            if identity is not None:
-                identity.employee_id = employee_id
-        logger.info("Global: G#%d → employee_id=%s (вручную)", global_id, employee_id)
 
     # ------------------------------------------------------------- матчинг
 
@@ -738,49 +685,3 @@ class GlobalIdentityManager:
         except Exception:
             logger.exception("Global: не удалось обновить global_person")
 
-    def _load_from_db(self) -> None:
-        """Восстановить недавние identity из БД (переживает рестарт)."""
-        try:
-            cutoff = utcnow() - timedelta(seconds=settings.global_gallery_ttl)
-            with self._session_factory() as db:
-                persons = db.query(GlobalPerson).filter(
-                    GlobalPerson.last_seen_at >= cutoff
-                ).all()
-                for person in persons:
-                    obs = db.query(GlobalObservation).filter(
-                        GlobalObservation.global_id == person.id,
-                        GlobalObservation.created_at >= cutoff,
-                    ).order_by(GlobalObservation.created_at.desc())\
-                        .limit(settings.global_history_len).all()
-                    if not obs:
-                        continue
-                    # возраст identity = сколько прошло с последнего наблюдения
-                    age = max(0.0, (utcnow() - person.last_seen_at).total_seconds())
-                    identity = GlobalIdentity(
-                        global_id=person.id,
-                        created_at=time.monotonic() - age,
-                        last_seen=time.monotonic() - age,
-                        last_seen_wall=person.last_seen_at,
-                        last_camera=person.last_camera_id,
-                        last_track_id=person.last_track_id,
-                        employee_id=person.employee_id,
-                        status="LOST",  # в памяти до первого нового наблюдения
-                        last_db_sync=time.monotonic(),
-                    )
-                    for o in reversed(obs):
-                        vec = np.frombuffer(o.embedding, dtype=np.float32)
-                        norm = np.linalg.norm(vec)
-                        if norm > 0:
-                            identity.embeddings.append((vec / norm, 0.0, o.camera_id))
-                    self._identities[person.id] = identity
-                    self._next_id = max(self._next_id, person.id + 1)
-                # _next_id выше абсолютного максимума
-                from sqlalchemy import func
-                max_id = db.query(func.max(GlobalPerson.id)).scalar()
-                if max_id:
-                    self._next_id = max(self._next_id, max_id + 1)
-            if self._identities:
-                logger.info("Global: восстановлено identity из БД — %d",
-                            len(self._identities))
-        except Exception:
-            logger.exception("Global: не удалось восстановить identity из БД")

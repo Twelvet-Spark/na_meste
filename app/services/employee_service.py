@@ -18,7 +18,7 @@ from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
-    EmployeeFace, PresenceSession, WorkSession,
+    EmployeeFace, GlobalPerson, PresenceSession, WorkSession,
 )
 from app.services.attendance_evidence import encode_evidence
 
@@ -128,6 +128,7 @@ def delete_employee(db: Session, employee: Employee, store: Optional[EmbeddingSt
                 or writer.query(AttendanceEmployeeReference.event_id).filter_by(employee_id=employee_id).first()
                 or writer.query(WorkSession.entry_event_id).filter_by(employee_id=employee_id).first()
                 or writer.query(AttendanceEvent.id).filter_by(employee_id=employee_id).first()
+                or writer.query(GlobalPerson.id).filter_by(employee_id=employee_id).first()
             )
             if history:
                 raise HTTPException(status_code=409, detail="Employee has history; deactivate instead")

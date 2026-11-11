@@ -633,25 +633,9 @@ main > .panel + .panel { margin-top: 20px; }
   border: 2px solid var(--md-secondary-container);
   display: block; flex: none; object-fit: cover;
 }
-.merge-form { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.merge-form input, .merge-form select {
-  background: var(--md-surface-container-low);
-  color: var(--md-on-surface);
-  border: none;
-  border-bottom: 2px solid var(--md-outline);
-  border-radius: 12px 12px 0 0;
-  padding: 11px 16px 9px;
-  font-size: 14px;
-  font-family: inherit;
-  width: 220px;
-  transition: border-bottom-color 0.2s var(--ease), background-color 0.2s var(--ease);
-}
-.merge-form input:focus, .merge-form select:focus {
-  outline: none;
-  border-bottom-color: var(--md-primary);
-  background: var(--md-surface-container);
-}
-.merge-form button { flex: none; }
+.global-archive .panel-head, .global-archive .gp-head { flex-wrap: wrap; }
+.global-archive .gp-head-info { overflow-wrap: anywhere; }
+.archive-notice { max-width: 75ch; margin: 16px 0; line-height: 1.5; }
 
 /* ---------- таблицы ---------- */
 .table-wrap { overflow-x: auto; }

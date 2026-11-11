@@ -113,7 +113,6 @@ class AIWorker(threading.Thread):
         self._streams, self._configurations = {}, {}
         self._gallery_revision = service.store.revision
         self._rotation = 0
-        self._last_global_cleanup = 0.
 
     def stop(self, timeout=None):
         self._stop_event.set()
@@ -212,12 +211,6 @@ class AIWorker(threading.Thread):
             did_work = True
         self._persist(self.doorway.expire(time.monotonic()))
         self.health.snapshot()
-        if self.global_manager is not None and now - self._last_global_cleanup > 3600:
-            self._last_global_cleanup = now
-            try:
-                self.global_manager.cleanup()
-            except Exception:
-                logger.exception("Optional global history cleanup failed")
         return did_work
 
     def _reset_camera(self, camera_id, reason="STREAM_RESET"):

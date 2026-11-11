@@ -1,4 +1,4 @@
-// глобальные личности (межкамерный трекинг): список с фильтрами.
+// Архив глобальных наблюдений: только чтение, отдельно от рабочих часов.
 
 const $ = (id) => document.getElementById(id);
 
@@ -49,9 +49,8 @@ async function load() {
   const tbody = $('persons-table').querySelector('tbody');
   tbody.innerHTML = '';
   $('empty').hidden = persons.length > 0;
-  const active = persons.filter((p) => p.status === 'ACTIVE').length;
   $('summary').textContent = persons.length
-    ? `${persons.length} личностей · ${active} активных` : '';
+    ? `Показано: ${persons.length} · только чтение` : 'Только чтение';
 
   for (const p of persons) {
     const tr = document.createElement('tr');

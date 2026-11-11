@@ -7,12 +7,16 @@ from itertools import count
 from typing import Optional
 
 from fastapi import HTTPException
+from sqlalchemy import case, func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.database.database import immediate_session
-from app.database.models import AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, PresenceSession
+from app.database.models import (
+    AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera,
+    GlobalEvent, GlobalObservation, GlobalPerson, PresenceSession,
+)
 from app.rtsp.source import CONNECTION_FIELDS, CameraSource
 from app.rtsp.dahua import build_rtsp_url, mask_url
 from app.rtsp.reader import parse_frame_rate
@@ -236,9 +240,20 @@ def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
             if current is None:
                 raise HTTPException(status_code=404, detail="Camera not found")
             config = writer.get(AttendanceCamera, camera_id)
+            # Old global events use a text JSON payload, not normalized FKs.
+            # Transition endpoints are still used to name historical cameras.
+            payload = case((func.json_valid(GlobalEvent.payload), GlobalEvent.payload), else_="{}")
             history = (
                 writer.query(PresenceSession.id).filter_by(camera_id=camera_id).first()
                 or writer.query(AttendanceEvent.id).filter_by(camera_id=camera_id).first()
+                or writer.query(GlobalPerson.id).filter_by(last_camera_id=camera_id).first()
+                or writer.query(GlobalObservation.id).filter_by(camera_id=camera_id).first()
+                or writer.query(GlobalEvent.id).filter(or_(
+                    GlobalEvent.camera_id == camera_id,
+                    func.json_extract(payload, "$.from_camera") == camera_id,
+                    func.json_extract(payload, "$.to_camera") == camera_id,
+                    func.json_extract(payload, "$.last_camera") == camera_id,
+                )).first()
                 or (config is not None and config.role is not None)
             )
             if history:

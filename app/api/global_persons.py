@@ -1,13 +1,12 @@
-"""REST API глобальных персон (межкамерный трекинг).
+"""Read-only global observation archive, separate from attendance/work hours.
 
 Список считается батч-запросами (имена/счётчики/наличие снимков — по одному
 GROUP BY на всю страницу, без N+1). Таймлайн/траектория/наблюдения читают
 только нужные колонки — эмбеддинги и снимки (BLOB) не тянутся из БД.
 """
 import json
-import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import String, cast, func, or_
 from sqlalchemy.orm import Session
 
@@ -17,7 +16,6 @@ from app.database.models import (
 )
 from app.time_utils import iso_local
 
-logger = logging.getLogger("app.api.global_persons")
 
 router = APIRouter(prefix="/api/global-persons", tags=["global-persons"])
 
@@ -31,11 +29,6 @@ def _person_or_404(db: Session, global_id: int) -> GlobalPerson:
         raise HTTPException(status_code=404, detail="Global person not found")
     return person
 
-
-def get_global_manager(request: Request):
-    """GlobalIdentityManager из работающего AI-воркера (None — AI выключен)."""
-    worker = getattr(request.app.state, "ai_worker", None)
-    return getattr(worker, "global_manager", None) if worker else None
 
 
 def _rows(db: Session, persons: list[GlobalPerson]) -> list[dict]:
@@ -129,98 +122,6 @@ def api_global_person_photo(global_id: int, db: Session = Depends(get_db)):
     if row is None or not row[0]:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return Response(content=row[0], media_type="image/jpeg")
-
-
-@router.post("/{global_id}/merge/{source_id}")
-def api_merge_global_person(
-    global_id: int, source_id: int,
-    db: Session = Depends(get_db), manager=Depends(get_global_manager),
-):
-    """Объединить личности: G#source вливается в G#global_id (target).
-
-    Дробление identity — осознанная стратегия матчинга (ложное слияние
-    опаснее лишнего ID), поэтому фрагменты устраняются вручную: наблюдения
-    и события переносятся на target, source удаляется.
-    """
-    if global_id == source_id:
-        raise HTTPException(status_code=400,
-                            detail="Нельзя объединить личность с самой собой")
-    target = _person_or_404(db, global_id)
-    source = _person_or_404(db, source_id)
-
-    employee_conflict = (target.employee_id is not None
-                         and source.employee_id is not None
-                         and target.employee_id != source.employee_id)
-    moved = {
-        "observations": db.query(GlobalObservation)
-            .filter(GlobalObservation.global_id == source_id)
-            .update({"global_id": global_id}, synchronize_session=False),
-        "events": db.query(GlobalEvent)
-            .filter(GlobalEvent.global_id == source_id)
-            .update({"global_id": global_id}, synchronize_session=False),
-    }
-    if target.employee_id is None and source.employee_id is not None:
-        target.employee_id = source.employee_id
-    if target.created_at is None or (source.created_at and source.created_at < target.created_at):
-        target.created_at = source.created_at
-    if source.last_seen_at and source.last_seen_at > target.last_seen_at:
-        target.last_seen_at = source.last_seen_at
-        target.last_camera_id = source.last_camera_id
-        target.last_track_id = source.last_track_id
-    if target.status == "LOST" and source.status != "LOST":
-        target.status = source.status
-    db.delete(source)
-    db.commit()
-    logger.info("Global: merge G#%d → G#%d (%s)", source_id, global_id, moved)
-
-    if manager is not None:
-        try:
-            manager.merge(global_id, source_id)   # память: галерея + привязки
-        except Exception:
-            logger.exception("Global: merge в памяти не выполнен (БД уже слита)")
-
-    row = _rows(db, [target])[0]
-    row["merged_from"] = source_id
-    row["moved"] = moved
-    if employee_conflict:
-        row["employee_conflict"] = True
-    return row
-
-
-def _set_employee(db: Session, global_id: int, employee_id: int | None,
-                  manager) -> dict:
-    """Общая часть привязки/отвязки: правка БД + синхронизация identity
-    в памяти воркера, чтобы периодический sync не вернул None."""
-    person = _person_or_404(db, global_id)
-    if employee_id is not None and db.get(Employee, employee_id) is None:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    person.employee_id = employee_id
-    db.commit()
-    if manager is not None:
-        try:
-            manager.assign_employee(global_id, employee_id)
-        except Exception:
-            logger.exception("Global: assign в памяти не выполнен (БД уже обновлена)")
-    return _rows(db, [person])[0]
-
-
-@router.put("/{global_id}/employee/{employee_id}")
-def api_assign_employee(
-    global_id: int, employee_id: int,
-    db: Session = Depends(get_db), manager=Depends(get_global_manager),
-):
-    """Связать личность с сотрудником: ручная коррекция, когда распознавание
-    лиц не сработало, но оператор знает, кто это (например, «G#184 — Иван»)."""
-    return _set_employee(db, global_id, employee_id, manager)
-
-
-@router.delete("/{global_id}/employee")
-def api_unassign_employee(
-    global_id: int,
-    db: Session = Depends(get_db), manager=Depends(get_global_manager),
-):
-    """Снять привязку личности к сотруднику (сотрудник больше не она)."""
-    return _set_employee(db, global_id, None, manager)
 
 
 @router.get("/{global_id}/timeline")

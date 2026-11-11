@@ -124,8 +124,8 @@ class GlobalPerson(Base):
 
 class GlobalObservation(Base):
     """Наблюдение глобальной личности: появление на камере с новым локальным
-    треком. Хранит appearance-эмбеддинг (OSNet, 512-d) — это persistent
-    identity gallery — и снимок для таймлайна в UI."""
+    треком. Appearance-эмбеддинг (OSNet, 512-d) и снимок хранятся как архив;
+    после перезапуска эти записи не загружаются в живую галерею."""
     __tablename__ = "global_observations"
 
     id: Mapped[int] = mapped_column(primary_key=True)

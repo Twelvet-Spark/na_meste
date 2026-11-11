@@ -84,7 +84,6 @@ class Settings(BaseSettings):
     global_match_margin: float = 0.05       # мин. отрыв от второго кандидата (неоднозначность)
     global_gallery_ttl: float = 600.0       # сек жизни identity в памяти без наблюдений
     global_history_len: int = 20            # эмбеддингов в истории identity
-    global_keep_days: int = 30              # хранение наблюдений/событий в БД
     topology_config: str = ""               # topology.json — пусто = без ограничений
     mc_debug: bool = False                  # подробные логи [REID]/[MATCH]/[IDENTITY]
 

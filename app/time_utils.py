@@ -24,10 +24,18 @@ def attendance_iso(dt: datetime | None) -> str | None:
         return None
     zone = timezone(timedelta(minutes=settings.attendance_utc_offset_minutes))
     aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-    return aware.astimezone(zone).isoformat()
+    try:
+        return aware.astimezone(zone).isoformat()
+    except OverflowError as exc:
+        raise ValueError("Timestamp cannot be represented in the workplace offset") from exc
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
     """Return half-open naive-UTC bounds of a workplace calendar date."""
-    start = datetime.combine(day, time.min) - timedelta(minutes=settings.attendance_utc_offset_minutes)
-    return start, start + timedelta(days=1)
+    try:
+        # Shift first: date.max can still have a representable UTC end when
+        # the workplace offset is positive. Never construct local year 10000.
+        start = datetime.combine(day, time.min) - timedelta(minutes=settings.attendance_utc_offset_minutes)
+        return start, start + timedelta(days=1)
+    except OverflowError as exc:
+        raise ValueError("Date has no representable UTC day bounds in the workplace offset") from exc

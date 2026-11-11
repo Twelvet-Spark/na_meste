@@ -9,9 +9,10 @@ import json
 import sys
 import traceback
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+from unittest.mock import patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.api import attendance, employees, presence
 from app.attendance_types import VisitorBatchInput
+from app.config import settings
 from app.database.database import get_db, immediate_session
 from app.database.models import (
     AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
@@ -71,7 +73,9 @@ class Client:
             start = next(item for item in messages if item["type"] == "http.response.start")
             data = b"".join(item.get("body", b"") for item in messages if item["type"] == "http.response.body")
             headers = dict(start["headers"])
-            if headers.get(b"content-type", b"").startswith(b"application/json"):
+            if not data:
+                data = None
+            elif headers.get(b"content-type", b"").startswith(b"application/json"):
                 data = json.loads(data)
             return start["status"], headers, data
         return asyncio.run(run())
@@ -543,6 +547,144 @@ def test_legacy_archive_is_separate_offset_explicit_and_not_trusted_for_hours():
         assert archive["items"][0]["started_at"].endswith("+05:00")
         assert client.json("GET", "/api/attendance/sessions")["total"] == 0
         client.json("GET", "/api/presence", status=404)
+
+
+DATE_FILTER_ROUTES = (
+    "/api/attendance/events", "/api/attendance/sessions", "/api/attendance/review",
+    "/api/presence/legacy", "/api/attendance/report", "/api/attendance/report.csv",
+)
+
+
+def assert_date_boundary(offset, day, expected_status):
+    with patch.object(settings, "attendance_utc_offset_minutes", offset):
+        with api() as (client, _engine, _service):
+            for route in DATE_FILTER_ROUTES:
+                queries = [f"from_date={day}&to_date={day}"]
+                if not route.startswith("/api/attendance/report"):
+                    queries += [f"from_date={day}", f"to_date={day}"]
+                for query in queries:
+                    status, _headers, body = client.request("GET", f"{route}?{query}")
+                    assert status == expected_status, (offset, route, query, status, body)
+                    if expected_status == 200 and route == "/api/attendance/report":
+                        assert body["from_date"] == body["to_date"] == day
+                        assert len(body["rows"]) == 2
+                        assert all(row["date"] == day and row["confirmed_ms"] == 0 for row in body["rows"])
+                        assert not body["finalizable"]
+
+
+@test
+def test_minimum_date_positive_offset_is_422_across_all_date_filters():
+    assert_date_boundary(300, "0001-01-01", 422)
+
+
+@test
+def test_maximum_date_negative_or_zero_offset_is_422_across_all_date_filters():
+    for offset in (-300, 0):
+        assert_date_boundary(offset, "9999-12-31", 422)
+
+
+@test
+def test_representable_extreme_dates_remain_valid_across_all_date_filters():
+    # Shift midnight to UTC BEFORE adding the day: +05:00's final UTC bound
+    # is 9999-12-31 19:00, not an unrepresentable local year 10000.
+    for offset, day in ((300, "9999-12-31"), (-300, "0001-01-01"), (0, "0001-01-01"),
+                        (300, "0001-01-02"), (-300, "9999-12-30")):
+        assert_date_boundary(offset, day, 200)
+
+
+def assert_timestamp_rejected_without_writes(offset, timestamps):
+    with patch.object(settings, "attendance_utc_offset_minutes", offset):
+        with api() as (client, engine, _service):
+            original = manual(client)
+            for value in timestamps:
+                payload = manual_payload(when=value)
+                client.json("POST", "/api/attendance/manual", payload, status=422)
+                # VOID would otherwise ignore occurred_at, exposing missing
+                # input validation even when a future-date business check could
+                # hide an unrenderable maximum timestamp on ACCEPT.
+                decision = human(expected_revision=0, action="VOID", occurred_at=value)
+                client.json("POST", f"/api/attendance/events/{original['id']}/decision",
+                            decision, status=422)
+                with Session(engine) as db:
+                    assert db.query(AttendanceEvent).count() == 1
+                    assert db.query(AttendanceRequest).count() == 1
+                    assert db.query(AttendanceDecision).count() == 1
+                    assert db.get(AttendanceRequest, payload["request_id"]) is None
+                    assert db.get(AttendanceRequest, decision["request_id"]) is None
+                    row = db.get(AttendanceEvent, original["id"])
+                    assert row.revision == 0 and row.status == "ACCEPTED"
+
+
+@test
+def test_timestamp_utc_underflow_and_overflow_return_422_without_partial_writes():
+    assert_timestamp_rejected_without_writes(300, (
+        "0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00",
+    ))
+
+
+@test
+def test_timestamp_workplace_overflow_returns_422_without_partial_writes():
+    assert_timestamp_rejected_without_writes(300, ("9999-12-31T20:00:00Z",))
+
+
+@test
+def test_timestamp_workplace_underflow_returns_422_without_partial_writes():
+    assert_timestamp_rejected_without_writes(-300, ("0001-01-01T00:00:00Z",))
+
+
+@test
+def test_supported_timestamp_extremes_normalize_once_and_roundtrip_through_http():
+    cases = (
+        (300, "0001-01-01T05:00:00.123999+05:00", "0001-01-01T05:00:00.123000+05:00",
+         datetime(1, 1, 1, 0, 0, 0, 123000), AS_OF),
+        (-300, "0001-01-01T00:00:00.123999-05:00", "0001-01-01T00:00:00.123000-05:00",
+         datetime(1, 1, 1, 5, 0, 0, 123000), AS_OF),
+        (300, "9999-12-31T23:59:59.123999+05:00", "9999-12-31T23:59:59.123000+05:00",
+         datetime(9999, 12, 31, 18, 59, 59, 123000), datetime(9999, 12, 31, 18, 59, 59, 999000)),
+        (-300, "9999-12-31T18:59:59.123999-05:00", "9999-12-31T18:59:59.123000-05:00",
+         datetime(9999, 12, 31, 23, 59, 59, 123000), datetime(9999, 12, 31, 23, 59, 59, 999000)),
+    )
+    for offset, value, rendered, stored, now in cases:
+        with patch.object(settings, "attendance_utc_offset_minutes", offset):
+            with api() as (client, engine, service):
+                service._now = lambda: now
+                payload = manual_payload(direction="EXIT", when=value)
+                row = client.json("POST", "/api/attendance/manual", payload)
+                assert row["occurred_at"] == rendered
+                assert client.json("POST", "/api/attendance/manual", payload) == row
+                detail = client.json("GET", f"/api/attendance/events/{row['id']}")
+                assert detail["occurred_at"] == rendered
+                assert detail["decisions"][0]["after"]["occurred_at"] == rendered
+                with Session(engine) as db:
+                    assert db.get(AttendanceEvent, row["id"]).occurred_at == stored
+                    assert db.query(AttendanceRequest).count() == db.query(AttendanceDecision).count() == 1
+
+
+@test
+def test_shared_time_helpers_expose_value_errors_not_arithmetic_overflows():
+    from app.attendance_types import milliseconds
+    from app.time_utils import attendance_iso, day_bounds
+
+    cases = (
+        (300, lambda: day_bounds(date.min)),
+        (-300, lambda: day_bounds(date.max)),
+        (300, lambda: milliseconds(datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))))),
+        (300, lambda: milliseconds(datetime(9999, 12, 31, 23, tzinfo=timezone(timedelta(hours=-5))))),
+        (300, lambda: attendance_iso(datetime.max)),
+        (-300, lambda: attendance_iso(datetime.min)),
+    )
+    for offset, operation in cases:
+        with patch.object(settings, "attendance_utc_offset_minutes", offset):
+            try:
+                operation()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Unsupported time must raise a validation ValueError")
+    with patch.object(settings, "attendance_utc_offset_minutes", 300):
+        assert day_bounds(date.max) == (datetime(9999, 12, 30, 19), datetime(9999, 12, 31, 19))
+    with patch.object(settings, "attendance_utc_offset_minutes", -300):
+        assert day_bounds(date.min) == (datetime(1, 1, 1, 5), datetime(1, 1, 2, 5))
 
 
 if __name__ == "__main__":

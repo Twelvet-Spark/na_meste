@@ -1000,9 +1000,6 @@ def test_pending_crossing_is_saved_before_optional_global_processing_even_when_i
             def drop_camera(self, camera_id):
                 return None
 
-            def cleanup(self):
-                return None
-
             def process(self, *args):
                 # An external embedding failure must occur AFTER old crossing
                 # state was durably flushed by continuity reconciliation.
