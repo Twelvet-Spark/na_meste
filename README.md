@@ -129,9 +129,11 @@ python main.py
   неизвестных
 - **Камера**: живое видео + bounding boxes поверх (зелёный — сотрудник с именем
   и уверенностью, красный — Unknown, жёлтый пунктир — распознаётся)
-- **Сотрудники**: список, добавление, страница сотрудника с загрузкой фото
-  (шаги: поиск лица → эмбеддинг → сохранение; ошибки: нет лица / несколько
-  лиц / лицо слишком маленькое; предупреждение о размытости)
+- **Сотрудники**: фамилия и имя, необязательные рабочие места и 1–15 фотографий.
+  Создание и замена итогового набора фото атомарны: ошибка одного файла ничего
+  не сохраняет. В карточке есть явные сохранение/отмена и восстановление черновика
+  при конфликте версий. Размытые, неоднозначные и совпадающие с другим активным
+  сотрудником лица отклоняются. [Порядок работы и сохранность истории](ATTENDANCE.md#сотрудники-и-рабочие-места).
 - **Присутствие**: кто сейчас на камерах + история сессий
 - **Люди**: глобальные личности (межкамерный трекинг) — список с аватарками
   (последний снимок), фильтрами (статус, камера, поиск по G#id или имени
@@ -307,12 +309,33 @@ curl http://localhost:8000/api/cameras/1/status
 curl http://localhost:8000/api/cameras/1/detections     # текущие люди (треки)
 curl -m 3 http://localhost:8000/api/cameras/1/stream -o stream.bin
 
-# Сотрудники
+# Рабочие места — необязательные метки
+curl http://localhost:8000/api/workplaces
+curl -X POST http://localhost:8000/api/workplaces \
+  -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
+  -d '{"name":"Магазин №1"}'
+
+# Сотрудники: metadata + 1–15 файлов в одном multipart-запросе
 curl http://localhost:8000/api/employees
-curl -X POST http://localhost:8000/api/employees -H "Content-Type: application/json" \
-  -d '{"name":"Иван Петров","external_id":"10023"}'
-curl -X POST http://localhost:8000/api/employees/1/faces -F "files=@photo1.jpg" -F "files=@photo2.jpg"
-curl http://localhost:8000/api/employees/1?faces=1
+curl -X POST http://localhost:8000/api/employees -H "X-Operator-Request: 1" \
+  -F 'metadata={"first_name":"Иван","last_name":"Петров","external_id":"10023","workplace_ids":[],"request_id":"67e149b7-70f0-4fe5-b2c9-566503591416"}' \
+  -F "files=@photo1.jpg" -F "files=@photo2.jpg"
+curl "http://localhost:8000/api/employees/1?faces=true"
+
+# Полная замена: keep_face_ids содержит только оставляемые ID из ответа GET.
+# Здесь прежние фото заменяются одним новым; expected_revision берётся из GET.
+curl -X PUT http://localhost:8000/api/employees/1/faces -H "X-Operator-Request: 1" \
+  -F 'metadata={"expected_revision":1,"keep_face_ids":[]}' -F "files=@replacement.jpg"
+
+# Данные: ревизия после предыдущего сохранения; [] снимает все метки.
+curl -X PUT http://localhost:8000/api/employees/1 \
+  -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
+  -d '{"expected_revision":2,"first_name":"Иван","last_name":"Петров","workplace_ids":[]}'
+
+# Переименование/архивирование места не удаляет существующие назначения.
+curl -X PUT http://localhost:8000/api/workplaces/1 \
+  -H "X-Operator-Request: 1" -H "Content-Type: application/json" \
+  -d '{"name":"Магазин №1 — архив","active":false}'
 
 # Присутствие
 curl http://localhost:8000/api/presence/active
@@ -331,6 +354,22 @@ curl -X POST http://localhost:8000/api/global-persons/1/merge/2  # G#2 влив�
 curl http://localhost:8000/api/cameras/1/tracks
 ```
 
+В примерах замените ID и `expected_revision` фактическими значениями из ответа;
+для нового создания используйте новый UUID. Повтор создания с тем же UUID,
+нормализованными данными и теми же файлами в том же порядке возвращает исходный
+результат, даже если AI позже недоступен. Иное содержимое с тем же UUID — 409.
+Ответ создания — 201 с `revision`, `faces`, `faces_count`, `workplaces` и признаками
+`needs_name_completion` / `needs_photo_remediation`.
+
+JPEG/PNG должны быть неподвижными: максимум 15 МиБ и 20 миллионов пикселей на
+файл, 15 файлов, 64 КиБ для JSON `metadata`, 226 МиБ для всего запроса.
+Ошибка проверки фото возвращает 422:
+`{"detail":{"code":"PHOTO_VALIDATION_FAILED","committed":false,"files":[{"index":0,"filename":"photo.jpg","error":"…"}]}}`.
+При 409 карточка изменилась: загрузите текущую версию, проверьте сохранённый
+черновик и повторите сохранение. Старые JSON-создание без фото,
+`POST /api/employees/{id}/faces` и удаление отдельного фото больше не поддерживаются;
+используйте атомарный `PUT` итогового набора (1–15 фото, новые файлы необязательны).
+
 ## Безопасность
 
 - Пароль камеры никогда не возвращается API, не пишется в логи (URL маскируется
@@ -339,6 +378,10 @@ curl http://localhost:8000/api/cameras/1/tracks
   исходные фотографии сотрудников не сохраняются.
 - В логах нет изображений и эмбеддингов.
 - Авторизации нет: приложение — для локальной машины или доверенной сети.
+- Изменение сотрудников и рабочих мест требует `X-Operator-Request: 1`.
+  Если есть `Origin`, он должен совпадать с origin приложения. Это защита от
+  межсайтовых форм, не аутентификация; доступ по-прежнему только через localhost,
+  доверенную LAN или VPN.
 
 ## Структура проекта
 

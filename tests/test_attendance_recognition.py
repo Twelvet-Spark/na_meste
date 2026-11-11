@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -341,7 +343,8 @@ def test_gallery_refresh_during_third_face_observation_requires_three_new_revisi
             with Session(engine) as db:
                 employee_service.update_employee(
                     db, db.get(Employee, 1),
-                    employee_service.EmployeeUpdate(name="First revised"),
+                    employee_service.EmployeeUpdate(expected_revision=db.get(Employee, 1).revision,
+                                                    last_name="First", first_name="revised"),
                 )
                 store.refresh(db)
             return original_detect(image, max_num=max_num)
@@ -379,7 +382,8 @@ def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
                 with Session(engine) as db:
                     employee_service.update_employee(
                         db, db.get(Employee, 1),
-                        employee_service.EmployeeUpdate(name="First revised"),
+                        employee_service.EmployeeUpdate(expected_revision=db.get(Employee, 1).revision,
+                                                        last_name="First", first_name="revised"),
                     )
                     store.refresh(db)
             return original_detect(image, max_num=max_num)
@@ -423,7 +427,8 @@ def test_in_frame_refresh_clears_other_tracks_cached_confirmation_without_resamp
                 with Session(engine) as db:
                     employee_service.update_employee(
                         db, db.get(Employee, 1),
-                        employee_service.EmployeeUpdate(name="First revised"),
+                        employee_service.EmployeeUpdate(expected_revision=db.get(Employee, 1).revision,
+                                                        last_name="First", first_name="revised"),
                     )
                     store.refresh(db)
             return original_detect(image, max_num=max_num)
@@ -442,7 +447,7 @@ def test_gallery_deactivation_invalidates_confirmed_identity_before_next_samplin
         confirm(service)
         with Session(engine) as db:
             employee_service.update_employee(db, db.get(Employee, 1),
-                                             employee_service.EmployeeUpdate(active=False))
+                                             employee_service.EmployeeUpdate(expected_revision=0, active=False))
             store.refresh(db)
         result = detection(service, 4, 10.6)
         assert result.employee_id is None
@@ -452,13 +457,13 @@ def test_gallery_deactivation_invalidates_confirmed_identity_before_next_samplin
 
 
 @test
-def test_face_deletion_invalidates_confirmation_and_uses_committed_gallery_revision():
+def test_face_replacement_invalidates_confirmation_and_uses_committed_gallery_revision():
     with database() as engine:
         service, _people, _faces, store = recognition(engine)
         confirm(service)
         with Session(engine) as db:
             sample = db.query(EmployeeFace).filter_by(employee_id=1).one()
-            employee_service.delete_face(db, sample, store)
+            replace_sample(db, store, sample)
         assert detection(service, 4, 10.6).employee_id is None
         assert store.match(vector()).store_revision == 8
 
@@ -560,11 +565,47 @@ def photo_bytes():
     return data.tobytes()
 
 
-def enroll(db, store, observation, employee_id=1):
+def prepared(observation):
     faces = Faces()
     faces.observations = [observation]
-    return employee_service.enroll_face(db, db.get(Employee, employee_id),
-                                        photo_bytes(), faces, store)
+    return employee_service.prepare_face(photo_bytes(), faces, "photo.png")
+
+
+def third_face():
+    embedding = np.zeros(512, dtype=np.float32)
+    embedding[2] = 1.
+    return face(embedding)
+
+
+def create_identity(db):
+    data = employee_service.EmployeeCreate(first_name="Person", last_name="Third", request_id=uuid4())
+    digest = hashlib.sha256(str(data.request_id).encode()).hexdigest()
+    return employee_service.create_employee_with_faces(db, data, [prepared(third_face())], digest)
+
+
+def replace_sample(db, store, sample):
+    employee_id, omitted_id = sample.employee_id, sample.id
+    keep = [row.id for row in db.query(EmployeeFace).filter_by(employee_id=employee_id) if row.id != omitted_id]
+    additions = [] if keep else [prepared(third_face())]
+    employee_service.replace_employee_faces(db, employee_id, db.get(Employee, employee_id).revision, keep, additions)
+    store.refresh(db)
+
+
+def enroll(db, store, observation, employee_id=1):
+    result = prepared(observation)
+    if isinstance(result, employee_service.FaceEnrollResult):
+        return result
+    keep = [row.id for row in db.query(EmployeeFace).filter_by(employee_id=employee_id)]
+    try:
+        employee_service.replace_employee_faces(db, employee_id, db.get(Employee, employee_id).revision, keep, [result])
+    except HTTPException as exc:
+        if exc.status_code != 422:
+            raise
+        return employee_service.FaceEnrollResult(filename="photo.png", success=False,
+                                                error=str(exc.detail))
+    store.refresh(db)
+    added = db.query(EmployeeFace).filter_by(employee_id=employee_id).order_by(EmployeeFace.id.desc()).first()
+    return employee_service.FaceEnrollResult(filename="photo.png", success=True, face_id=added.id)
 
 
 @test
@@ -604,20 +645,21 @@ def test_every_employee_and_face_mutation_advances_durable_gallery_revision():
     with database() as engine:
         store = load_store(engine)
         with Session(engine) as db:
-            added = employee_service.create_employee(db, employee_service.EmployeeCreate(name="Third"))
+            added = create_identity(db)
             assert db.get(AttendanceRuntime, 1).gallery_revision == 8
             added = employee_service.update_employee(db, added,
-                                                     employee_service.EmployeeUpdate(name="Renamed"))
+                                                     employee_service.EmployeeUpdate(expected_revision=added.revision,
+                                                                                     last_name="Renamed", first_name="Person"))
             db.expire_all()
             assert db.get(AttendanceRuntime, 1).gallery_revision == 9
             result = enroll(db, store, face(), employee_id=1)
             assert result.success
             db.expire_all()
             assert db.get(AttendanceRuntime, 1).gallery_revision == 10
-            employee_service.delete_face(db, db.get(EmployeeFace, result.face_id), store)
+            replace_sample(db, store, db.get(EmployeeFace, result.face_id))
             db.expire_all()
             assert db.get(AttendanceRuntime, 1).gallery_revision == 11
-            employee_service.delete_employee(db, added, store)
+            employee_service.delete_employee(db, added)
             db.expire_all()
             assert db.get(AttendanceRuntime, 1).gallery_revision == 12
             store.refresh(db)
@@ -655,20 +697,19 @@ def assert_revision_failure_rolls_back(operation):
 
 @test
 def test_employee_create_is_rolled_back_when_gallery_revision_write_fails():
-    assert_revision_failure_rolls_back(lambda db, store: employee_service.create_employee(
-        db, employee_service.EmployeeCreate(name="Must roll back")))
+    assert_revision_failure_rolls_back(lambda db, store: create_identity(db))
 
 
 @test
 def test_employee_update_is_rolled_back_when_gallery_revision_write_fails():
     assert_revision_failure_rolls_back(lambda db, store: employee_service.update_employee(
-        db, db.get(Employee, 1), employee_service.EmployeeUpdate(active=False)))
+        db, db.get(Employee, 1), employee_service.EmployeeUpdate(expected_revision=0, active=False)))
 
 
 @test
 def test_employee_delete_is_rolled_back_when_gallery_revision_write_fails():
     assert_revision_failure_rolls_back(lambda db, store: employee_service.delete_employee(
-        db, db.get(Employee, 1), store))
+        db, db.get(Employee, 1)))
 
 
 @test
@@ -677,9 +718,9 @@ def test_face_enrollment_is_rolled_back_when_gallery_revision_write_fails():
 
 
 @test
-def test_face_delete_is_rolled_back_when_gallery_revision_write_fails():
-    assert_revision_failure_rolls_back(lambda db, store: employee_service.delete_face(
-        db, db.query(EmployeeFace).filter_by(employee_id=1).one(), store))
+def test_face_replacement_is_rolled_back_when_gallery_revision_write_fails():
+    assert_revision_failure_rolls_back(lambda db, store: replace_sample(
+        db, store, db.query(EmployeeFace).filter_by(employee_id=1).one()))
 
 
 if __name__ == "__main__":

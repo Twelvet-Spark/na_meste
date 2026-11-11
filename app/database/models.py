@@ -53,6 +53,11 @@ class Employee(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    first_name: Mapped[str | None] = mapped_column(String(74), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(74), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+
+    __table_args__ = (CheckConstraint("revision >= 0"),)
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Employee id={self.id} name={self.name!r}>"
@@ -155,6 +160,45 @@ class GlobalEvent(Base):
     track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payload: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+class OperatorSchema(Base):
+    __tablename__ = "operator_schema"
+    __table_args__ = (CheckConstraint("id = 1"), CheckConstraint("version >= 0"))
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Workplace(Base):
+    __tablename__ = "workplaces"
+    __table_args__ = (
+        CheckConstraint("length(name) BETWEEN 1 AND 150 AND name = trim(name)"),
+        CheckConstraint("active IN (0, 1)"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(150))
+    name_key: Mapped[str] = mapped_column(String(450), unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"))
+
+
+class EmployeeWorkplace(Base):
+    __tablename__ = "employee_workplaces"
+
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), primary_key=True)
+    workplace_id: Mapped[int] = mapped_column(ForeignKey("workplaces.id", ondelete="RESTRICT"), primary_key=True)
+
+
+class OperatorRequest(Base):
+    __tablename__ = "operator_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(100))
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    result: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
 
 
 class AttendanceCamera(Base):

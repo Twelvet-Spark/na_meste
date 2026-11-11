@@ -1,148 +1,173 @@
-// Employee profile, enrollment, work intervals and separate legacy observations.
-
+// Atomic employee profile; history below remains read-only and independent.
 const employeeId = window.EMPLOYEE_ID;
 const $ = (id) => document.getElementById(id);
+const form = $('emp-form');
+let current = null;
+let kept = new Set();
+let staged = [];
+let busy = false;
+let loadSequence = 0;
 
+function errorText(detail) {
+  if (typeof detail === 'string') return detail;
+  if (detail?.code === 'PHOTO_VALIDATION_FAILED') {
+    return 'Ничего не сохранено. ' + detail.files.map((file) => `${file.filename}: ${file.error}`).join('; ');
+  }
+  if (Array.isArray(detail)) return detail.map((error) => `${error.loc?.join('.') || ''}: ${error.msg}`).join('; ');
+  return 'Не удалось выполнить запрос. Повторите попытку.';
+}
 async function api(url, options = {}) {
-  const res = await fetch(url, { ...options });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch (e) { /* ignore */ }
-    throw new Error(detail);
+  const headers = { ...options.headers };
+  if (options.method && options.method !== 'GET') headers['X-Operator-Request'] = '1';
+  const response = await fetch(url, { ...options, headers });
+  const data = response.status === 204 ? null : await response.json();
+  if (!response.ok) {
+    const error = new Error(errorText(data?.detail)); error.status = response.status; throw error;
   }
-  return res.status === 204 ? null : res.json();
+  return data;
 }
-
-// ---------- данные сотрудника ----------
-
-async function loadEmployee() {
-  let emp;
-  try {
-    emp = await api(`/api/employees/${employeeId}`);
-  } catch (e) {
-    alert('Сотрудник не найден');
-    location.href = '/employees';
-    return;
-  }
-  document.title = `${emp.name}`;
-  $('emp-title').textContent = emp.name;
-  const f = $('emp-form');
-  f.name.value = emp.name;
-  f.external_id.value = emp.external_id || '';
-  f.active.checked = emp.active;
-  $('faces-count').textContent = emp.faces_count ? `· ${emp.faces_count}` : '';
+function status(message, error = null, photo = false) {
+  $(photo ? 'photo-status' : 'employee-status').textContent = message;
+  if (error?.status === 409) $('reload-conflict').hidden = false;
 }
-
-$('emp-form').onsubmit = async (e) => {
-  e.preventDefault();
-  const f = $('emp-form');
+function setBusy(value) {
+  busy = value;
+  for (const element of form.elements) element.disabled = value;
+  for (const id of ['file-input', 'save-photos', 'cancel-photos']) $(id).disabled = value;
+  for (const button of $('faces-grid').querySelectorAll('button')) button.disabled = value;
+  form.setAttribute('aria-busy', String(value));
+}
+function updateSummary() {
+  document.title = current.name; $('emp-title').textContent = current.name;
+  $('employee-remediation').textContent = [
+    current.needs_name_completion ? 'Старое имя сохранено. Укажите имя и фамилию, когда сможете их уточнить.' : '',
+    current.needs_photo_remediation ? 'Нужно исправить набор фотографий до 1–15. До этого можно менять данные и отключать активность.' : '',
+  ].filter(Boolean).join(' ');
+}
+async function fillPlaces(selected) {
+  const places = await api('/api/workplaces');
+  const existing = new Set((current?.workplaces || []).map((place) => place.id));
+  const selectedSet = new Set(selected);
+  form.elements.workplace_ids.replaceChildren(...places.filter((place) => place.active || existing.has(place.id)).map((place) => {
+    const option = new Option(place.name + (place.active ? '' : ' (архив)'), place.id);
+    option.selected = selectedSet.has(place.id); return option;
+  }));
+}
+async function loadEmployee(preserveDraft = false) {
+  const sequence = ++loadSequence;
   try {
-    await api(`/api/employees/${employeeId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: f.name.value.trim(),
-        external_id: f.external_id.value.trim() || null,
-        active: f.active.checked,
-      }),
-    });
-    loadEmployee();
-  } catch (err) {
-    alert('Ошибка сохранения: ' + err.message);
-  }
-};
-
-// ---------- загрузка фото ----------
-
-$('btn-upload').onclick = () => $('file-input').click();
-$('file-input').onchange = () => uploadFiles($('file-input').files);
-
-async function uploadFiles(fileList) {
-  const files = Array.from(fileList);
-  if (!files.length) return;
-
-  for (const file of files) {
-    const li = addStatusItem(file.name);
-    setStep(li, 'pending', 'Поиск лица…');
-    const fd = new FormData();
-    fd.append('files', file);
-    try {
-      const res = await fetch(`/api/employees/${employeeId}/faces`, {
-        method: 'POST',
-        body: fd,
-      });
-      const data = await res.json();
-      const r = (data.results || [])[0];
-      if (!res.ok || !r || !r.success) {
-        const msg = (r && r.error) || data.detail || 'Ошибка обработки';
-        setStep(li, 'err', `✕ ${msg}`);
-        continue;
-      }
-      let text = '✓ Лицо найдено · Эмбеддинг создан · Сохранено';
-      if (r.warnings && r.warnings.length) {
-        text += ` Предупреждения: ${r.warnings.join('; ')}`;
-      }
-      setStep(li, 'ok', text);
-    } catch (e) {
-      setStep(li, 'err', '✕ Ошибка загрузки: ' + e.message);
+    const employee = await api(`/api/employees/${employeeId}?faces=true`);
+    if (sequence !== loadSequence) return;
+    const omitted = new Set((current?.faces || []).filter((face) => !kept.has(face.id)).map((face) => face.id));
+    const selectedPlaces = preserveDraft
+      ? Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value))
+      : employee.workplaces.map((place) => place.id);
+    current = employee;
+    kept = new Set(employee.faces.filter((face) => !preserveDraft || !omitted.has(face.id)).map((face) => face.id));
+    if (!preserveDraft) {
+      form.elements.first_name.value = employee.first_name || '';
+      form.elements.last_name.value = employee.last_name || '';
+      form.elements.external_id.value = employee.external_id || '';
+      form.elements.active.checked = employee.active;
     }
+    updateSummary(); renderFaces();
+    await fillPlaces(selectedPlaces);
+    $('reload-conflict').hidden = true;
+    status(preserveDraft ? 'Текущая версия загружена. Черновик и новые файлы сохранены; проверьте данные и нажмите сохранение ещё раз.' : '');
+  } catch (error) {
+    status('Не удалось загрузить карточку: ' + error.message, error);
+    $('reload-conflict').hidden = false;
+  }
+}
+form.onsubmit = async (event) => {
+  event.preventDefault(); if (busy || !current) return;
+  const first = form.elements.first_name.value.trim(), last = form.elements.last_name.value.trim();
+  if ((!first || !last) && !(current.needs_name_completion && !first && !last)) {
+    status('Укажите непустые имя и фамилию вместе.'); return;
+  }
+  const payload = {
+    expected_revision: current.revision, external_id: form.elements.external_id.value.trim() || null,
+    active: form.elements.active.checked,
+    workplace_ids: Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value)),
+  };
+  if (first && last) Object.assign(payload, { first_name: first, last_name: last });
+  setBusy(true); status('Сохраняем данные…');
+  try {
+    current = await api(`/api/employees/${employeeId}`, { method: 'PUT',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    updateSummary(); status('Данные сохранены.'); $('reload-conflict').hidden = true;
+  } catch (error) { status(error.message + ' Черновик оставлен без изменений.', error); }
+  finally { setBusy(false); }
+};
+function renderFaces() {
+  if (!current) return;
+  $('faces-count').textContent = `· принято ${current.faces_count}/15 · в черновике ${kept.size} сохранённых + ${staged.length} новых`;
+  const entries = [
+    ...current.faces.filter((face) => kept.has(face.id)).map((face) => ({ face, url: face.thumbnail_url, label: `Фотография ${face.id}` })),
+    ...staged.map((entry) => ({ ...entry, label: entry.file.name })),
+  ];
+  $('faces-grid').replaceChildren(...entries.map((entry) => {
+    const cell = document.createElement('div'); cell.className = 'face-cell';
+    const image = document.createElement('img'); image.src = entry.url; image.alt = entry.label;
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn';
+    remove.textContent = 'Убрать'; remove.setAttribute('aria-label', `Убрать: ${entry.label}`); remove.disabled = busy;
+    remove.onclick = () => {
+      if (entry.face) kept.delete(entry.face.id);
+      else { URL.revokeObjectURL(entry.url); staged = staged.filter((item) => item.url !== entry.url); }
+      renderFaces(); $('file-input').focus();
+    };
+    cell.append(image, remove); return cell;
+  }));
+}
+$('file-input').onchange = () => {
+  const incoming = Array.from($('file-input').files);
+  if (kept.size + staged.length + incoming.length > 15) {
+    status('Максимум 15 фото в итоговом наборе. Для замены сначала уберите прежнее фото из черновика.', null, true);
+  } else {
+    staged.push(...incoming.map((file) => ({ file, url: URL.createObjectURL(file) })));
+    renderFaces(); status('Файлы выбраны, но ещё не сохранены.', null, true);
   }
   $('file-input').value = '';
-  loadFaces();
-  loadEmployee();
-}
-
-function addStatusItem(filename) {
-  const li = document.createElement('li');
-  li.className = 'upload-item';
-  for (const name of ['upload-name', 'upload-step']) {
-    const span = document.createElement('span');
-    span.className = name;
-    li.append(span);
-  }
-  li.querySelector('.upload-name').textContent = filename;
-  $('upload-status').prepend(li);
-  return li;
-}
-
-function setStep(li, kind, text) {
-  li.className = `upload-item ${kind}`;
-  li.querySelector('.upload-step').textContent = text;
-}
-
-// ---------- список лиц ----------
-
-async function loadFaces() {
-  let emp;
+};
+$('save-photos').onclick = async () => {
+  if (busy || !current) return;
+  const count = kept.size + staged.length;
+  if (count < 1 || count > 15) { status('В итоговом наборе должно быть 1–15 фотографий.', null, true); return; }
+  const body = new FormData();
+  body.append('metadata', JSON.stringify({ expected_revision: current.revision, keep_face_ids: [...kept] }));
+  staged.forEach((entry) => body.append('files', entry.file));
+  setBusy(true); status('Проверяем весь набор фотографий…', null, true);
   try {
-    emp = await api(`/api/employees/${employeeId}?faces=1`);
-  } catch (e) { return; }
-  const grid = $('faces-grid');
-  grid.replaceChildren();
-  const faces = emp.faces || [];
-  $('faces-count').textContent = faces.length ? `· ${faces.length}` : '';
-  for (const face of faces) {
-    const cell = document.createElement('div');
-    cell.className = 'face-cell';
-    const img = document.createElement('img');
-    img.src = `/api/employees/${employeeId}/faces/${face.id}/thumbnail`;
-    img.alt = 'лицо';
-    const del = document.createElement('button');
-    del.className = 'btn ghost danger face-del';
-    del.textContent = '✕';
-    del.title = 'Удалить лицо';
-    del.onclick = async () => {
-      if (!confirm('Удалить это лицо?')) return;
-      try {
-        await api(`/api/employees/${employeeId}/faces/${face.id}`, { method: 'DELETE' });
-        loadFaces();
-        loadEmployee();
-      } catch (e) { alert('Ошибка удаления: ' + e.message); }
-    };
-    cell.append(img, del);
-    grid.appendChild(cell);
-  }
-}
+    current = await api(`/api/employees/${employeeId}/faces`, { method: 'PUT', body });
+    staged.forEach((entry) => URL.revokeObjectURL(entry.url)); staged = [];
+    kept = new Set(current.faces.map((face) => face.id));
+    renderFaces(); updateSummary(); status('Фотографии сохранены одним набором.', null, true);
+    $('reload-conflict').hidden = true;
+  } catch (error) { status(error.message + ' Прежние фотографии и черновик не изменены.', error, true); }
+  finally { setBusy(false); }
+};
+$('cancel-photos').onclick = () => {
+  if (!current || busy) return;
+  staged.forEach((entry) => URL.revokeObjectURL(entry.url)); staged = [];
+  kept = new Set(current.faces.map((face) => face.id)); renderFaces();
+  status('Изменения фотографий отменены.', null, true);
+};
+$('reload-conflict').onclick = () => { if (!busy) loadEmployee(Boolean(current)); };
+$('btn-workplace').onclick = () => { $('workplace-error').textContent = ''; $('workplace-dialog').showModal(); };
+$('workplace-cancel').onclick = () => $('workplace-dialog').close();
+$('workplace-dialog').addEventListener('close', () => $('btn-workplace').focus());
+$('workplace-form').onsubmit = async (event) => {
+  event.preventDefault(); const placeForm = event.currentTarget;
+  const button = placeForm.querySelector('[type="submit"]'); button.disabled = true;
+  try {
+    const place = await api('/api/workplaces', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: placeForm.elements.name.value.trim() }) });
+    const selected = Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value));
+    await fillPlaces([...selected, place.id]); placeForm.reset(); $('workplace-dialog').close();
+  } catch (error) { $('workplace-error').textContent = error.message; }
+  finally { button.disabled = false; }
+};
+window.addEventListener('pagehide', () => staged.forEach((entry) => URL.revokeObjectURL(entry.url)));
 
 // Work views use the server's explicit workplace offset, never browser-local time.
 const workOffsets = { work: 0, presence: 0 };
@@ -201,6 +226,6 @@ async function loadHistory(name) {
 $('employee-report').href = `/presence?employee_id=${employeeId}#report`;
 $('employee-events').href = `/presence?employee_id=${employeeId}#events`;
 loadEmployee();
-loadFaces();
+// Employee forms are never replaced by polling; only explicit conflict reloads rebase drafts.
 loadHistory('work');
 loadHistory('presence');

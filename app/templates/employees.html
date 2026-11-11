@@ -13,6 +13,7 @@
       <div class="panel-head">
         <h2>Сотрудники</h2>
         <span id="summary" class="muted"></span>
+        <button id="btn-retry" type="button" class="btn" hidden>Повторить загрузку</button>
       </div>
       <ul id="employee-list" class="employee-list"></ul>
       <div id="empty" class="empty" hidden>
@@ -21,25 +22,46 @@
     </section>
   </main>
 
-  <!-- Модальное окно добавления сотрудника -->
-  <div id="modal" class="modal-backdrop" hidden>
-    <div class="modal">
-      <h2>Добавить сотрудника</h2>
-      <form id="employee-form" autocomplete="off">
-        <label class="field">Имя
-          <input name="name" required maxlength="150" placeholder="Иван Петров">
-        </label>
-        <label class="field">Внешний ID (необязательно)
-          <input name="external_id" maxlength="64" placeholder="10023">
-        </label>
-        <div class="modal-actions">
-          <span class="spacer"></span>
-          <button type="button" id="btn-cancel" class="btn">Отмена</button>
-          <button type="submit" class="btn primary">Сохранить</button>
-        </div>
-      </form>
-    </div>
-  </div>
+  <dialog id="modal" class="modal" aria-labelledby="create-title">
+    <h2 id="create-title">Добавить сотрудника</h2>
+    <form id="employee-form" autocomplete="off">
+      <label class="field">Фамилия
+        <input name="last_name" required maxlength="74" autocomplete="family-name">
+      </label>
+      <label class="field">Имя
+        <input name="first_name" required maxlength="74" autocomplete="given-name">
+      </label>
+      <label class="field">Внешний ID (необязательно)
+        <input name="external_id" maxlength="64">
+      </label>
+      <label class="field">Рабочие места (необязательно; можно выбрать несколько)
+        <select name="workplace_ids" multiple size="3"></select>
+      </label>
+      <button id="btn-workplace" type="button" class="btn">Создать рабочее место</button>
+      <label class="field">Фотографии — от 1 до 15
+        <input id="create-files" type="file" accept="image/jpeg,image/png" multiple>
+      </label>
+      <p class="muted small">JPEG/PNG, до 15 МиБ и 20 миллионов пикселей на файл. Рекомендуем 3–5 разных ракурсов. Сохраняются только выровненные миниатюры и эмбеддинги, не оригиналы.</p>
+      <p id="draft-count" aria-live="polite">Выбрано: 0/15</p>
+      <div id="draft-photos" class="faces-grid"></div>
+      <p id="create-status" role="status" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button type="button" id="btn-cancel" class="btn">Отмена</button>
+        <button type="submit" class="btn primary">Создать сотрудника</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">
+    <h2 id="workplace-title">Новое рабочее место</h2>
+    <form id="workplace-form">
+      <label class="field">Название<input name="name" required maxlength="150"></label>
+      <p id="workplace-error" role="alert"></p>
+      <div class="modal-actions">
+        <button id="workplace-cancel" type="button" class="btn">Отмена</button>
+        <button type="submit" class="btn primary">Создать</button>
+      </div>
+    </form>
+  </dialog>
 {% endblock %}
 
 {% block scripts %}

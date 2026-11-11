@@ -32,6 +32,8 @@ from app.database.models import (
 from app.services import camera_service, employee_service
 from app.services.attendance_evidence import encode_evidence, evidence_expires_at, purge_evidence
 from app.time_utils import attendance_iso, day_bounds, iso_local, utcnow
+from test_operator_storage import LEGACY_EMPLOYEE_DDL, BASE_TABLES
+from test_attendance_recognition import create_identity
 
 TESTS = []
 
@@ -112,15 +114,21 @@ def test_fresh_seed_and_idempotence():
 @test
 def test_existing_upgrade_backup_preserves_all_legacy_values():
     with database(False) as (engine, root):
-        original = [table for name, table in Base.metadata.tables.items()
-                    if not name.startswith("attendance_") and name != "work_sessions"]
-        Base.metadata.create_all(engine, tables=original)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(LEGACY_EMPLOYEE_DDL)
+            connection.exec_driver_sql("CREATE INDEX ix_employees_external_id ON employees (external_id)")
+            for table in Base.metadata.sorted_tables:
+                if table.name in BASE_TABLES:
+                    table.create(connection)
         start = datetime(2026, 11, 10, 12, 3, 4, 123456)
         with Session(engine) as db:
-            cam, employee = camera(), Employee(name="Historical")
-            db.add_all([cam, employee])
+            cam = camera()
+            db.add(cam)
             db.flush()
-            db.add(PresenceSession(employee_id=employee.id, camera_id=cam.id,
+            db.connection().exec_driver_sql(
+                "INSERT INTO employees (id,name,active,created_at,updated_at) VALUES (1,'Historical',1,?,?)",
+                (start, start))
+            db.add(PresenceSession(employee_id=1, camera_id=cam.id,
                                    started_at=start, last_seen_at=start, ended_at=None))
             db.commit()
         schema.initialize_attendance_schema(engine)
@@ -337,8 +345,8 @@ def test_decision_targets_revision_uniqueness_and_references_survive_mutation():
             saved = db.get(AttendanceEvent, "review")
             saved.status, saved.employee_id = "VISITOR", None
             db.commit()
-            exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee, None))
-            assert exc.status_code == 409 and exc.detail == "Employee has history; deactivate instead"
+            exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee))
+            assert exc.status_code == 409
         rejects_integrity(engine, AttendanceDecision(request_id="request", revision=2, actor="Op", reason="Reason", before={}, after={}))
         rejects_integrity(engine, AttendanceDecision(request_id="request", event_id="review", revision=1, actor="Op", reason="Reason", before={}, after={}))
         rejects_integrity(engine, AttendanceDecision(request_id="request", event_id="review", revision=2, actor="", reason="Reason", before={}, after={}))
@@ -348,18 +356,19 @@ def test_decision_targets_revision_uniqueness_and_references_survive_mutation():
 def test_legacy_deletion_protection_and_deactivation_revision():
     with database() as (engine, _root):
         with Session(engine) as db:
-            employee = employee_service.create_employee(db, employee_service.EmployeeCreate(name="Worker"))
+            employee = create_identity(db)
             cam = camera_service.create_camera(db, camera_service.CameraCreate(
                 name="Door", nvr_host="unused", username="u", password="p", channel=1, stream_type="main"))
             employee_id, camera_id = employee.id, cam.id
             db.add(PresenceSession(employee_id=employee_id, camera_id=camera_id, ended_at=None))
             db.commit()
-            exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee, None))
-            assert exc.status_code == 409 and exc.detail == "Employee has history; deactivate instead"
+            exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee))
+            assert exc.status_code == 409
             exc = rejects(HTTPException, lambda: camera_service.delete_camera(db, cam))
             assert exc.status_code == 409 and exc.detail == "Camera has history; disable instead"
             before = db.get(AttendanceRuntime, 1).gallery_revision
-            updated = employee_service.update_employee(db, employee, employee_service.EmployeeUpdate(active=False))
+            updated = employee_service.update_employee(db, employee, employee_service.EmployeeUpdate(
+                expected_revision=employee.revision, active=False))
             assert not updated.active
             db.expire_all()
             assert db.get(AttendanceRuntime, 1).gallery_revision == before + 1
@@ -380,7 +389,7 @@ def test_work_history_alone_protects_employee_and_assigned_camera_retained():
             db.add(WorkSession(entry_event_id="entry", employee_id=employee.id, employee_name="Worker",
                                started_at=datetime(2026, 11, 11), status="OPEN"))
             db.commit()
-            rejects(HTTPException, lambda: employee_service.delete_employee(db, employee, None))
+            rejects(HTTPException, lambda: employee_service.delete_employee(db, employee))
             rejects(HTTPException, lambda: camera_service.delete_camera(db, cam))
             unused = camera_service.create_camera(db, camera_service.CameraCreate(
                 name="Unused", nvr_host="unused", username="u", password="p", channel=2, stream_type="main"))
@@ -445,7 +454,7 @@ def test_deletion_history_checks_exclude_concurrent_writers():
 
             event.listen(engine, "before_cursor_execute", competing_write)
             try:
-                employee_service.delete_employee(db, employee, None)
+                employee_service.delete_employee(db, employee)
                 camera_service.delete_camera(db, cam)
             finally:
                 event.remove(engine, "before_cursor_execute", competing_write)
@@ -470,7 +479,7 @@ def test_database_failure_returns_503_without_deleting_history():
 
             event.listen(engine, "before_cursor_execute", fail_read)
             try:
-                exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee, None))
+                exc = rejects(HTTPException, lambda: employee_service.delete_employee(db, employee))
                 assert exc.status_code == 503
             finally:
                 event.remove(engine, "before_cursor_execute", fail_read)

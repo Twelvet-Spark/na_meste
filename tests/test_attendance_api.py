@@ -67,7 +67,8 @@ class Client:
                 "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
                 "method": method, "scheme": "http", "path": parsed.path,
                 "raw_path": parsed.path.encode(), "query_string": parsed.query.encode(),
-                "root_path": "", "headers": [(b"content-type", b"application/json")],
+                "root_path": "", "headers": [(b"content-type", b"application/json"),
+                                            (b"x-operator-request", b"1")],
                 "client": ("127.0.0.1", 1234), "server": ("test", 80),
             }, receive, send)
             start = next(item for item in messages if item["type"] == "http.response.start")

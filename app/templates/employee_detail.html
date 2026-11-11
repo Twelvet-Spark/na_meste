@@ -13,9 +13,12 @@
     <section class="panel">
       <div class="panel-head"><h2>Данные сотрудника</h2></div>
       <form id="emp-form" class="emp-form" autocomplete="off">
-        <div class="row">
+        <div class="attendance-fields">
+          <label class="field grow">Фамилия
+            <input name="last_name" maxlength="74" autocomplete="family-name">
+          </label>
           <label class="field grow">Имя
-            <input name="name" required maxlength="150">
+            <input name="first_name" maxlength="74" autocomplete="given-name">
           </label>
           <label class="field grow">Внешний ID
             <input name="external_id" maxlength="64" placeholder="—">
@@ -24,6 +27,13 @@
             <input type="checkbox" name="active" checked> Активен
           </label>
         </div>
+        <label class="field">Рабочие места (необязательно; можно выбрать несколько)
+          <select name="workplace_ids" multiple size="3"></select>
+        </label>
+        <button id="btn-workplace" type="button" class="btn">Создать рабочее место</button>
+        <p id="employee-remediation" class="muted"></p>
+        <p id="employee-status" role="status" aria-live="polite"></p>
+        <button id="reload-conflict" type="button" class="btn" hidden>Загрузить текущую версию, сохранив черновик</button>
         <div class="modal-actions">
           <span class="spacer"></span>
           <button type="submit" class="btn primary">Сохранить</button>
@@ -37,14 +47,17 @@
         <h2>Фотографии лица <span id="faces-count" class="muted"></span></h2>
       </div>
       <p class="muted small">
-        Загрузите 3–5 фото: разные углы, выражения, освещение, очки.
+        Сохраните итоговый набор из 1–15 фото. Рекомендуем 3–5 разных ракурсов.
         Хранится только эмбеддинг и миниатюра лица — исходные фото не сохраняются.
       </p>
       <div class="upload-row">
-        <input type="file" id="file-input" accept="image/*" multiple hidden>
-        <button id="btn-upload" class="btn primary">Загрузить фото</button>
+        <label class="field">Выбрать новые фотографии
+          <input type="file" id="file-input" accept="image/jpeg,image/png" multiple>
+        </label>
+        <button id="save-photos" class="btn primary" type="button">Сохранить фотографии</button>
+        <button id="cancel-photos" class="btn" type="button">Отменить изменения</button>
       </div>
-      <ul id="upload-status" class="upload-status"></ul>
+      <p id="photo-status" role="status" aria-live="polite"></p>
       <div id="faces-grid" class="faces-grid"></div>
     </section>
 
@@ -66,6 +79,17 @@
       <div id="presence-pager" class="attendance-actions"></div>
     </section>
   </main>
+  <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">
+    <h2 id="workplace-title">Новое рабочее место</h2>
+    <form id="workplace-form">
+      <label class="field">Название<input name="name" required maxlength="150"></label>
+      <p id="workplace-error" role="alert"></p>
+      <div class="modal-actions">
+        <button id="workplace-cancel" type="button" class="btn">Отмена</button>
+        <button type="submit" class="btn primary">Создать</button>
+      </div>
+    </form>
+  </dialog>
 {% endblock %}
 
 {% block scripts %}

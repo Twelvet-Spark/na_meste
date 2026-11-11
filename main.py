@@ -7,6 +7,7 @@
     http://localhost:8000
 """
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -20,6 +21,7 @@ from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
 from app.api.attendance import router as attendance_router
 from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
+from app.api.workplaces import router as workplaces_router
 from app.api.global_persons import router as global_persons_router
 from app.api.presence import router as presence_router
 from app.config import BASE_DIR, settings
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
 
     # --- AI: сотрудники/лица/присутствие ---
     app.state.face_engine = None        # FaceEngine для загрузки фото (det 640)
+    app.state.enrollment_lock = threading.Lock()
     app.state.embedding_store = None
     app.state.ai_worker = None
     app.state.detection_state = None
@@ -138,6 +141,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "app" / "templates")
 
 app.include_router(cameras_router)
 app.include_router(employees_router)
+app.include_router(workplaces_router)
 app.include_router(presence_router)
 app.include_router(global_persons_router)
 app.include_router(attendance_router)

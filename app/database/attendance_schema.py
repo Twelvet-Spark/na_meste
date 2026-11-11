@@ -152,21 +152,33 @@ def _seed(connection) -> None:
 
 
 def initialize_attendance_schema(engine: Engine) -> None:
-    """Install or validate v1, refusing unsupported dialects before connecting."""
+    """Validate both schemas before installing either on one backed-up transaction."""
     if engine.dialect.name != "sqlite":
         raise RuntimeError("Attendance startup requires SQLite; other database dialects are unsupported")
+    from app.database import operator_schema
     with engine.connect() as connection:
         try:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
-            recognized = _preflight(connection)  # Before any DDL, including original tables.
-            if not recognized:
+            recognized = _preflight(connection)
+            operator_installed = operator_schema.preflight(connection)
+            if not recognized or not operator_installed:
                 if _has_rows(connection):
                     _backup(connection)
-                Base.metadata.create_all(connection)
-                connection.exec_driver_sql(_ROLE_TRIGGER)
+                existing = _catalog(connection)
+                if "employees" not in existing:
+                    operator_schema.create_legacy_employees(connection)
+                excluded = operator_schema.TABLES | operator_schema.FUTURE_TABLES | {"employees"}
+                for table in Base.metadata.sorted_tables:
+                    if table.name not in excluded and table.name not in existing:
+                        table.create(connection)
+                if not recognized:
+                    connection.exec_driver_sql(_ROLE_TRIGGER)
+                if not operator_installed:
+                    operator_schema.install(connection)
             _seed(connection)
             # A fresh install is validated too, before its version is committed.
             _preflight(connection)
+            operator_schema.preflight(connection)
             connection.commit()
         except BaseException:
             connection.rollback()
