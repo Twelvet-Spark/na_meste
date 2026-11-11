@@ -31,6 +31,7 @@ from app.ai.doorway import DoorwayDetector
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.recognition_service import RecognitionService
 from app.ai.worker import AIWorker, DetectionState
+from app.attendance_types import GapDecisionInput
 from app.config import settings
 from app.database.database import get_db, immediate_session
 from app.database.models import (
@@ -377,6 +378,118 @@ def test_valid_commission_and_live_coverage_admit_capture_and_committed_retry_st
 
 
 @test
+def test_commissioning_only_notifications_preserve_the_technical_healthy_streak():
+    with database() as (_engine, service):
+        clock = Clock()
+        health = health_for(service, clock)
+        warm(health, clock)
+        monitor = AttendanceMonitor(service, now=clock.utcnow, monotonic=clock.monotonic)
+        monitor.tick()
+        before = health.snapshot()
+        assert before["technical_ready"] and before["technically_healthy_seconds"] >= 10
+        assert not before["automatic_ready"]
+        approval = fault(clock, "COMMISSIONING_REQUIRED", end=None)
+        health.publish_fault(approval)
+        monitor.tick()
+        after_ack = health.snapshot()
+        assert after_ack["technical_ready"]
+        assert after_ack["technically_healthy_seconds"] == before["technically_healthy_seconds"]
+        assert health.pending_faults() == ()
+        clock.advance(.2)
+        health.publish_fault(replace(approval, id=str(uuid4()), ended_at=clock.utc))
+        process_metrics(health, clock, 999)
+        monitor.tick()
+        recovered = health.snapshot()
+        assert recovered["technical_ready"] and not recovered["automatic_ready"]
+        assert abs(recovered["technically_healthy_seconds"] -
+                   (before["technically_healthy_seconds"] + .2)) < 1e-9
+        assert health.pending_faults() == ()
+
+
+@test
+def test_reconnect_resets_warmed_technical_streak_even_after_fault_persistence():
+    with database(commissioned=True) as (engine, service):
+        clock = Clock()
+        health = health_for(service, clock)
+        warm(health, clock)
+        monitor = AttendanceMonitor(service, now=clock.utcnow, monotonic=clock.monotonic)
+        monitor.tick()
+        assert health.snapshot()["technically_healthy_seconds"] >= 10
+        assert health.pending_faults() == ()
+        clock.advance(.1)
+        health.record_frame("ENTRY", packet(clock, age=.07, stream="reconnected"),
+                            tracking_generation="new-generation",
+                            started_mono=clock.mono - .05, completed_mono=clock.mono)
+        reset_faults = [item for item in health.pending_faults() if "STREAM_RESET" in item.reason_codes]
+        assert len(reset_faults) == 1
+        # The new packet is explicit recovery, not ten seconds of healthy
+        # operation on the new stream. Polling must not retain the old streak.
+        assert health.snapshot()["technical_ready"]
+        assert 0 <= health.snapshot()["technically_healthy_seconds"] <= .1
+        monitor.tick()
+        assert health.pending_faults() == ()
+        assert 0 <= health.snapshot()["technically_healthy_seconds"] <= .1
+        with Session(engine) as db:
+            assert any(reset_faults[0].id in row.source_fault_ids
+                       for row in db.query(AttendanceCoverageGap))
+        for seq in range(2, 104):
+            clock.advance(.1)
+            for role, camera_id, stream in (("ENTRY", 1, "reconnected"), ("EXIT", 2, "stream-2")):
+                health.record_frame(role, packet(clock, camera_id, seq, age=.07, stream=stream),
+                                    tracking_generation="new-generation" if camera_id == 1 else "generation-2",
+                                    started_mono=clock.mono - .05, completed_mono=clock.mono)
+            health.snapshot()
+        assert health.snapshot()["technically_healthy_seconds"] >= 10
+
+
+@test
+def test_published_subtick_fault_breaks_streak_and_acknowledgement_is_not_recovery():
+    with database(commissioned=True) as (engine, service):
+        clock = Clock()
+        health = health_for(service, clock)
+        warm(health, clock)
+        monitor = AttendanceMonitor(service, now=clock.utcnow, monotonic=clock.monotonic)
+        monitor.tick()
+        assert health.snapshot()["technically_healthy_seconds"] >= 10
+        opened = fault(clock, end=None)
+        health.publish_fault(opened)
+        assert not health.snapshot()["technical_ready"]
+        assert health.snapshot()["technically_healthy_seconds"] == 0
+        monitor.tick()
+        assert health.pending_faults() == ()
+        # Durable acknowledgement only clears the notification backlog; this
+        # externally published technical fault is still unsafe until recovery.
+        assert not health.snapshot()["technical_ready"]
+        assert health.snapshot()["technically_healthy_seconds"] == 0
+        clock.advance(.2)
+        closed = replace(opened, id=str(uuid4()), ended_at=clock.utc)
+        health.publish_fault(closed)
+        process_metrics(health, clock, 999)
+        monitor.tick()
+        assert health.pending_faults() == ()
+        assert health.snapshot()["technical_ready"]
+        assert 0 <= health.snapshot()["technically_healthy_seconds"] <= .2
+        warm(health, clock, seconds=11)
+        assert health.snapshot()["technically_healthy_seconds"] >= 10
+        # Now hide the entire start/recovery interval between snapshots/ticks:
+        # publication itself must invalidate the streak, not polling cadence.
+        subtick = fault(clock, end=None)
+        health.publish_fault(subtick)
+        clock.advance(.2)
+        recovered = replace(subtick, id=str(uuid4()), ended_at=clock.utc)
+        health.publish_fault(recovered)
+        process_metrics(health, clock, 1000)
+        monitor.tick()
+        assert health.pending_faults() == ()
+        assert health.snapshot()["technical_ready"]
+        assert 0 <= health.snapshot()["technically_healthy_seconds"] <= .2
+        with Session(engine) as db:
+            persisted_ids = {identifier for row in db.query(AttendanceCoverageGap)
+                             for identifier in row.source_fault_ids}
+            assert {opened.id, closed.id, subtick.id, recovered.id} <= persisted_ids
+
+
+@test
 def test_threshold_fingerprint_change_revokes_but_gallery_and_same_source_reconnect_do_not():
     with database(commissioned=True) as (engine, service):
         clock = Clock()
@@ -432,24 +545,54 @@ def test_backward_clock_gap_is_nonnegative_and_blocks_admission_until_review():
         warm(health, clock)
         monitor = AttendanceMonitor(service, now=clock.utcnow, monotonic=clock.monotonic)
         monitor.tick()
+        assert health.snapshot()["automatic_ready"]
         previous = clock.utc
-        health.observe_clock(clock.utc, clock.mono)
+        assert health.observe_clock(clock.utc, clock.mono)
         clock.advance(.1, utc_seconds=-120)
         assert health.observe_clock(clock.utc, clock.mono) is False
         monitor.tick()
+        # Explicitly observe a recovered UTC/monotonic pair. Otherwise the
+        # in-memory ongoing fault, not the persisted gap, would block admission.
+        clock.advance(.1)
+        assert health.observe_clock(clock.utc, clock.mono)
         clock.advance(121)
+        assert health.observe_clock(clock.utc, clock.mono)
         warm(health, clock)
+        assert health.observe_clock(clock.utc, clock.mono)
         monitor.tick()
+        snapshot = health.snapshot()
+        assert snapshot["technical_ready"] and snapshot["technically_healthy_seconds"] >= 10
+        assert health.pending_faults() == () and snapshot["pending_write_count"] == 0
+        assert snapshot["reasons"] == ["CLOCK_DISCONTINUITY"]
+        assert not snapshot["automatic_ready"]
         with Session(engine) as db:
+            assert db.query(AttendanceCoverageGap).filter_by(ended_at=None).count() == 0
             clock_gaps = [row for row in db.query(AttendanceCoverageGap) if "CLOCK_DISCONTINUITY" in row.reason_codes]
             assert clock_gaps and min(row.started_at for row in clock_gaps) <= previous - timedelta(seconds=120)
             for row in clock_gaps:
-                assert row.ended_at is None or row.ended_at >= max(row.started_at, previous)
-        assert not health.snapshot()["automatic_ready"]
-        identifier = service.record_crossing(crossing(when=clock.utc))
+                assert row.ended_at is not None and row.ended_at >= max(row.started_at, previous)
+                assert not row.reviewed
+            revisions = [(row.id, row.revision) for row in clock_gaps]
+        evidence = crossing(when=clock.utc)
+        assert evidence.auto_eligible and evidence.disqualifying_reasons == ()
+        identifier = service.record_crossing(evidence)
         with Session(engine) as db:
-            assert db.get(AttendanceEvent, identifier).status == "REVIEW"
-            assert "CLOCK_DISCONTINUITY" in db.get(AttendanceEvent, identifier).reason_codes
+            blocked = db.get(AttendanceEvent, identifier)
+            assert blocked.status == "REVIEW" and blocked.employee_id is None
+            assert blocked.reason_codes == ["CLOCK_DISCONTINUITY"]
+        for gap_id, revision in revisions:
+            service.review_gap(gap_id, GapDecisionInput(
+                request_id=uuid4(), expected_revision=revision, actor="Operator",
+                reason="Host clock and all crossings in the closed unsafe interval reconciled"))
+        monitor.tick()
+        assert health.snapshot()["technical_ready"] and health.snapshot()["automatic_ready"]
+        assert health.pending_faults() == ()
+        accepted_id = service.record_crossing(replace(evidence, crossing_index=2))
+        with Session(engine) as db:
+            accepted = db.get(AttendanceEvent, accepted_id)
+            assert accepted.status == "ACCEPTED" and accepted.employee_id == 1
+            assert accepted.reason_codes == []
+            assert db.query(WorkSession).one().entry_event_id == accepted_id
 
 
 class PersonObservations:

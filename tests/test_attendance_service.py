@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import numpy as np
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
@@ -32,6 +33,9 @@ from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceEvidence, AttendanceRequest,
     AttendanceRuntime, Camera, Employee, PresenceSession, WorkSession,
 )
+from app.rtsp.reader import FramePacket
+from app.services.attendance_health import AttendanceHealth
+from app.services.attendance_monitor import AttendanceMonitor
 from app.services.attendance_queries import (
     TrustBlocker, evaluate_session, load_trust_blockers, read_snapshot,
 )
@@ -350,14 +354,51 @@ def test_camera_idempotency_precedes_gallery_revalidation_and_conflict_never_rep
 
 
 @test
-def test_capture_disqualifier_always_overrides_identity_and_direction():
+def test_capture_eligibility_and_disqualifying_reasons_independently_override_identity():
     with database(commissioned=True) as (engine, service):
-        identifier = service.record_crossing(crossing(eligible=False))
+        # Real role metrics and committed coverage isolate the capture gates;
+        # a commission row alone must not make a blocked test pass accidentally.
+        mono, utc = 1000., BASE
+        health = AttendanceHealth(now=lambda: utc, monotonic=lambda: mono)
+        health.set_providers(CUDA_PROVIDERS)
+        service.health = health
+        for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
+            health.configure_role(role, camera_id=camera_id, source_revision=2,
+                                  enabled=True, online=True, included=True)
+        frame = np.zeros((1, 1, 3), dtype=np.uint8)
+        frame.setflags(write=False)
+        for seq in range(1, 211):
+            mono += .1
+            utc += timedelta(seconds=.1)
+            for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
+                packet = FramePacket(f"stream-{camera_id}", 2, seq,
+                                     utc - timedelta(seconds=.07), mono - .07, frame)
+                health.record_frame(role, packet, tracking_generation=f"generation-{camera_id}",
+                                    started_mono=mono - .05, completed_mono=mono)
+            health.snapshot()
+        monitor = AttendanceMonitor(service, now=lambda: utc, monotonic=lambda: mono)
+        monitor.tick()
+        assert health.snapshot()["technical_ready"] and health.snapshot()["automatic_ready"]
+        assert health.pending_faults() == ()
+        control = crossing(when=utc)
+        assert control.auto_eligible and control.disqualifying_reasons == ()
+        control_id = service.record_crossing(control)
+        ineligible_id = service.record_crossing(replace(
+            control, crossing_index=2, auto_eligible=False, disqualifying_reasons=()))
+        disqualified_id = service.record_crossing(replace(
+            control, crossing_index=3, auto_eligible=True,
+            disqualifying_reasons=("ASSOCIATION_UNCERTAIN",)))
         with Session(engine) as db:
-            row = db.get(AttendanceEvent, identifier)
-            assert row.status == "REVIEW" and row.employee_id is None and row.direction == "ENTRY"
-            assert "NO_FACE" in row.reason_codes
-            assert db.query(WorkSession).count() == 0
+            accepted = db.get(AttendanceEvent, control_id)
+            assert accepted.status == "ACCEPTED" and accepted.employee_id == 1
+            assert accepted.reason_codes == []
+            for identifier, only_reason in (
+                    (ineligible_id, "CAPTURE_INELIGIBLE"),
+                    (disqualified_id, "ASSOCIATION_UNCERTAIN")):
+                row = db.get(AttendanceEvent, identifier)
+                assert row.status == "REVIEW" and row.employee_id is None and row.direction == "ENTRY"
+                assert row.reason_codes == [only_reason]
+            assert db.query(WorkSession).one().entry_event_id == control_id
 
 
 @test

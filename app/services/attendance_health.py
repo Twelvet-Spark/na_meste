@@ -31,6 +31,10 @@ class AttendanceHealth:
         self._pending = {}
         self._sources = {}
         self._ongoing = {}
+        # Delivery and recovery are separate: acknowledged open notifications
+        # still describe an unsafe interval. Recovery has a new notification
+        # UUID but retains the original start/monotonic/reason identity.
+        self._technical_faults = {}
         self._roles = {}
         self._providers = {key: [] for key in PROVIDER_KEYS}
         self._commission_valid = False
@@ -48,6 +52,17 @@ class AttendanceHealth:
                 if self._pending[fault.id] != fault:
                     raise ValueError("Fault notifications are immutable")
                 return
+            reasons = tuple(sorted(set(fault.reason_codes)))
+            technical_reasons = tuple(reason for reason in reasons if reason != "COMMISSIONING_REQUIRED")
+            if technical_reasons:
+                # Invalidate at publication, not at the next snapshot. A whole
+                # interruption may start and recover between two monitor polls.
+                self._healthy_since = None
+                identity = (fault.started_at, fault.started_mono, reasons)
+                if fault.ended_at is None:
+                    self._technical_faults[identity] = technical_reasons
+                else:
+                    self._technical_faults.pop(identity, None)
             self._pending[fault.id] = fault
             self._sources[fault.id] = (fault.id,)
             if len(self._pending) > 100:
@@ -216,9 +231,8 @@ class AttendanceHealth:
                                    processed_fps=fps, processing_age_p95_seconds=start_p95,
                                    completion_age_p95_seconds=end_p95, reasons=sorted(failures))
             self.transition("models", () if models_ready else ("AI_UNAVAILABLE",), at=utc, mono=now)
-            for key, item in self._ongoing.items():
-                if not key.startswith("role:") and key != "models":
-                    reasons.update(item.reason_codes)
+            for fault_reasons in self._technical_faults.values():
+                reasons.update(fault_reasons)
             if self._pending_writes:
                 reasons.add("PERSISTENCE_ERROR")
             technical = not reasons and len(roles) == 2
