@@ -41,7 +41,7 @@ from app.config import BASE_DIR, settings
 from app.database.models import (
     Camera, Employee, GlobalEvent, GlobalObservation, GlobalPerson,
 )
-from app.services.presence_service import utcnow
+from app.time_utils import utcnow
 
 logger = logging.getLogger("app.ai.global_tracker")
 

@@ -53,6 +53,21 @@ class Settings(BaseSettings):
     insightface_root: str = "."             # модели лежат в ./models/<имя_пакета>
     cuda_dll_path: str = ""                 # путь к CUDA/cuDNN DLL (пусто — авто-поиск)
 
+    # --- Учёт рабочего времени: консервативные начальные пороги ---
+    attendance_utc_offset_minutes: int = Field(default=300, ge=-720, le=840)
+    attendance_ai_fps: float = Field(default=10, gt=0, allow_inf_nan=False)
+    attendance_frame_max_age: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    attendance_max_frame_gap: float = Field(default=0.75, gt=0, allow_inf_nan=False)
+    attendance_face_threshold: float = Field(default=0.55, ge=0, le=1, allow_inf_nan=False)
+    attendance_face_margin: float = Field(default=0.08, ge=0, le=1, allow_inf_nan=False)
+    attendance_face_confirmations: int = Field(default=3, ge=1)
+    attendance_face_window: float = Field(default=1.5, gt=0, allow_inf_nan=False)
+    attendance_face_interval: float = Field(default=0.25, gt=0, allow_inf_nan=False)
+    attendance_face_min_size: int = Field(default=80, ge=1)
+    attendance_face_det_score: float = Field(default=0.80, ge=0, le=1, allow_inf_nan=False)
+    attendance_face_blur_min: float = Field(default=20.0, ge=0, allow_inf_nan=False)
+    attendance_evidence_keep_days: int = Field(default=30, ge=1)
+
     # --- Telegram ---
     telegram_enabled: bool = True
     telegram_bot_token: str = ""

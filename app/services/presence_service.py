@@ -10,28 +10,16 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from sqlalchemy.orm import sessionmaker
 
+from app import time_utils
 from app.database.models import Camera, Employee, PresenceSession
 
 logger = logging.getLogger("app.services.presence")
 
 WRITE_THROTTLE = 5.0     # сек между записями last_seen одной сессии
 TICK_INTERVAL = 5.0      # сек между проверками истёкших сессий
-
-
-def utcnow() -> datetime:
-    """Наивный UTC (в SQLite хранится без таймзоны, сравнения стабильны)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def iso_local(dt: Optional[datetime]) -> Optional[str]:
-    """Локальное время в ISO со смещением (для API/UI)."""
-    if dt is None:
-        return None
-    return dt.replace(tzinfo=timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 class PresenceManager:
@@ -46,7 +34,7 @@ class PresenceManager:
 
     def on_recognized(self, camera_id: int, employee_id: int, confidence: float) -> None:
         """Подтверждённое распознавание: открыть/продлить сессию."""
-        now = utcnow()
+        now = time_utils.utcnow()
         key = (employee_id, camera_id)
         with self._lock:
             if now - self._last_write.get(key, datetime.min) < timedelta(seconds=WRITE_THROTTLE):
@@ -108,7 +96,7 @@ class PresenceManager:
                 return
             self._last_tick = now_mono
 
-        cutoff = utcnow() - timedelta(seconds=self.end_timeout)
+        cutoff = time_utils.utcnow() - timedelta(seconds=self.end_timeout)
         try:
             with self._session_factory() as db:
                 stale = db.query(PresenceSession).filter(

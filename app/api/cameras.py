@@ -156,8 +156,8 @@ def api_delete_camera(
     manager: ReaderManager = Depends(get_manager),
 ):
     camera = _camera_or_404(db, camera_id)
-    manager.stop(camera.id)
     service.delete_camera(db, camera)
+    manager.stop(camera_id)
     return None
 
 

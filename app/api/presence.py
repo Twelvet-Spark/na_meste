@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.database.database import get_db
 from app.database.models import Camera, Employee, PresenceSession
-from app.services.presence_service import iso_local
+from app.time_utils import iso_local
 
 router = APIRouter(prefix="/api/presence", tags=["presence"])
 

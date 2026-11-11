@@ -5,10 +5,13 @@ import subprocess
 from datetime import datetime
 from typing import Optional
 
+from fastapi import HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app.database.models import Camera
+from app.database.database import immediate_session
+from app.database.models import AttendanceCamera, AttendanceEvent, Camera, PresenceSession
 from app.rtsp.dahua import build_rtsp_url, mask_url
 from app.rtsp.reader import parse_frame_rate
 
@@ -168,6 +171,8 @@ def list_cameras(db: Session) -> list[Camera]:
 def create_camera(db: Session, data: CameraCreate) -> Camera:
     camera = Camera(**data.model_dump())
     db.add(camera)
+    db.flush()
+    db.add(AttendanceCamera(camera_id=camera.id))
     db.commit()
     db.refresh(camera)
     logger.info("Создана камера #%d «%s» (%s ch%d)", camera.id, camera.name,
@@ -190,6 +195,28 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
 
 
 def delete_camera(db: Session, camera: Camera) -> None:
-    db.delete(camera)
-    db.commit()
-    logger.info("Удалена камера #%d «%s»", camera.id, camera.name)
+    """Retain every historical/ever-assigned camera, even when disabled."""
+    camera_id, name = camera.id, camera.name
+    bind = db.get_bind().engine
+    db.rollback()
+    try:
+        with immediate_session(bind) as writer:
+            current = writer.get(Camera, camera_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Camera not found")
+            config = writer.get(AttendanceCamera, camera_id)
+            history = (
+                writer.query(PresenceSession.id).filter_by(camera_id=camera_id).first()
+                or writer.query(AttendanceEvent.id).filter_by(camera_id=camera_id).first()
+                or (config is not None and config.role is not None)
+            )
+            if history:
+                raise HTTPException(status_code=409, detail="Camera has history; disable instead")
+            if config is not None:
+                writer.delete(config)
+                writer.flush()
+            writer.delete(current)
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    logger.info("Удалена камера #%d «%s»", camera_id, name)

@@ -5,14 +5,20 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func
+from sqlalchemy import func, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
 from app.config import settings
-from app.database.models import Employee, EmployeeFace, PresenceSession
+from app.database.database import immediate_session
+from app.database.models import (
+    AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
+    EmployeeFace, PresenceSession, WorkSession,
+)
 
 logger = logging.getLogger("app.services.employees")
 
@@ -77,23 +83,54 @@ def create_employee(db: Session, data: EmployeeCreate) -> Employee:
 
 
 def update_employee(db: Session, employee: Employee, data: EmployeeUpdate) -> Employee:
-    for field, value in data.model_dump(exclude_unset=True).items():
-        setattr(employee, field, value)
-    db.commit()
-    db.refresh(employee)
-    return employee
+    employee_id = employee.id
+    bind = db.get_bind().engine
+    db.rollback()  # End the caller's read before acquiring a fresh write lock.
+    try:
+        with immediate_session(bind) as writer:
+            current = writer.get(Employee, employee_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Employee not found")
+            for field, value in data.model_dump(exclude_unset=True).items():
+                setattr(current, field, value)
+            writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
+                gallery_revision=AttendanceRuntime.gallery_revision + 1))
+            writer.flush()
+        db.expire_all()
+        return current
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
 
 def delete_employee(db: Session, employee: Employee, store: Optional[EmbeddingStore]) -> None:
-    """Удаляет сотрудника вместе с лицами и историей присутствия.
+    """Delete only history-free employees, checking under the deletion lock.
 
-    Эмбеддинг-стор обновляет вызывающий код (у него своя сессия БД).
+    The caller refreshes its embedding store after the durable commit.
     """
-    db.query(PresenceSession).filter(PresenceSession.employee_id == employee.id).delete()
-    db.query(EmployeeFace).filter(EmployeeFace.employee_id == employee.id).delete()
-    db.delete(employee)
-    db.commit()
-    logger.info("Удалён сотрудник #%d «%s»", employee.id, employee.name)
+    employee_id, name = employee.id, employee.name
+    bind = db.get_bind().engine
+    db.rollback()
+    try:
+        with immediate_session(bind) as writer:
+            current = writer.get(Employee, employee_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Employee not found")
+            history = (
+                writer.query(PresenceSession.id).filter_by(employee_id=employee_id).first()
+                or writer.query(AttendanceEmployeeReference.event_id).filter_by(employee_id=employee_id).first()
+                or writer.query(WorkSession.entry_event_id).filter_by(employee_id=employee_id).first()
+                or writer.query(AttendanceEvent.id).filter_by(employee_id=employee_id).first()
+            )
+            if history:
+                raise HTTPException(status_code=409, detail="Employee has history; deactivate instead")
+            writer.query(EmployeeFace).filter_by(employee_id=employee_id).delete()
+            writer.delete(current)
+            writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
+                gallery_revision=AttendanceRuntime.gallery_revision + 1))
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    logger.info("Удалён сотрудник #%d «%s»", employee_id, name)
 
 
 # --------------------------------------------------------- зачисление лица

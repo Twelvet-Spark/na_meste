@@ -36,7 +36,7 @@ from app.database import models as db_models  # noqa: F401 — регистра�
 from app.database.models import (
     Camera, Employee, GlobalEvent, GlobalObservation, GlobalPerson,
 )
-from app.services.presence_service import utcnow
+from app.time_utils import utcnow
 
 # ------------------------------------------------------------------ стенды
 

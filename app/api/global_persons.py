@@ -15,7 +15,7 @@ from app.database.database import get_db
 from app.database.models import (
     Camera, Employee, GlobalEvent, GlobalObservation, GlobalPerson,
 )
-from app.services.presence_service import iso_local
+from app.time_utils import iso_local
 
 logger = logging.getLogger("app.api.global_persons")
 
