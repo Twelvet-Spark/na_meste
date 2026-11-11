@@ -4,22 +4,27 @@ Receipt timestamps describe server receipt, not camera exposure. Attendance vote
 are short-lived evidence; neither a cached identity nor a global body ID is proof
 of a new crossing. Nonattendance cameras retain their configurable match policy.
 """
+from __future__ import annotations
+
 import logging
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import uuid4
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from app.ai.detector import PersonDetector
 from app.ai.face_detector import FaceEngine
 from app.ai.face_quality import FaceQuality, measure_face_quality, quality_reasons
 from app.ai.face_recognition import EmbeddingStore, FaceMatch
 from app.ai.tracker import ByteTracker, Track, TrackLifecycle
 from app.config import settings
 from app.services.attendance_evidence import encode_evidence
+
+if TYPE_CHECKING:
+    from app.ai.detector import PersonDetector
 
 logger = logging.getLogger("app.ai.service")
 _CONFIRMATION_MAX_AGE = 0.75
@@ -59,7 +64,6 @@ class DetectionResult:
     confidence: float | None
     bbox: tuple[float, float, float, float]
     state: str
-    just_confirmed: bool = False  # Legacy presence bridge, removed at step 5.
     global_id: int | None = None
     association_uncertain: bool = False
     person_score: float = 0.
@@ -69,7 +73,6 @@ class DetectionResult:
 @dataclass
 class FrameOutcome:
     detections: list[DetectionResult] = field(default_factory=list)
-    new_recognitions: list[tuple[int, int, float]] = field(default_factory=list)
     tracking_generation: str = ""
     track_lifecycle: list[TrackLifecycle] = field(default_factory=list)
     # All YOLO person boxes, normalized, even low-score/min-hit-ineligible ones.
@@ -166,7 +169,7 @@ class RecognitionService:
                     run.last_attempt = now
                     track.last_recog_attempt = now
                     evidence = self._recognize(track, frame, heads, camera_id, now,
-                                               frame_seq, received_at, attendance, run, outcome)
+                                               frame_seq, received_at, attendance, run)
                 outcome.detections.append(self._to_result(track, width, height, evidence))
             return self._finalize_outcome(camera_id, outcome)
 
@@ -214,7 +217,7 @@ class RecognitionService:
         run.confirmed_at = None
 
     def _recognize(self, track, frame, heads, camera_id, now, frame_seq, received_at,
-                   attendance, run, outcome) -> FaceEvidence:
+                   attendance, run) -> FaceEvidence:
         head = self._head_region(track.bbox, frame.shape[1], frame.shape[0])
         hx1, hy1, hx2, hy2 = head
         faces = (self.faces.detect(frame[hy1:hy2, hx1:hx2])
@@ -301,7 +304,6 @@ class RecognitionService:
                 if run.confirmed_at is None:
                     run.confirmed_at = now
                 if previous_employee != track.employee_id:
-                    outcome.new_recognitions.append((track.track_id, track.employee_id, match.score))
                     logger.info("Camera %d: employee=%d similarity=%.3f revision=%d",
                                 camera_id, track.employee_id, match.score, match.store_revision)
         return FaceEvidence(
@@ -319,7 +321,6 @@ class RecognitionService:
         """Reconcile earlier/cached results after every model call has finished."""
         self._invalidate_gallery()
         tracks = {track.track_id: track for track in self._trackers[camera_id].tracks}
-        qualified = set()
         for result in outcome.detections:
             evidence = result.fresh_face_evidence
             stale = evidence is not None and evidence.store_revision != self._store_revision
@@ -338,12 +339,6 @@ class RecognitionService:
                 result.employee_name = None
                 result.confidence = None
                 result.state = "unknown"
-                result.just_confirmed = False
-            if result.employee_id is not None:
-                qualified.add((result.track_id, result.employee_id))
-        outcome.new_recognitions[:] = [
-            item for item in outcome.new_recognitions if item[:2] in qualified
-        ]
         return outcome
 
     @staticmethod

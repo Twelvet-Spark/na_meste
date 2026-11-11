@@ -12,11 +12,41 @@ from sqlalchemy.orm import Session
 from app.ai.doorway import DoorwayCalibration
 from app.config import settings
 from app.database.database import get_db, immediate_session
-from app.database.models import AttendanceCamera, AttendanceRuntime, Camera
+from app.database.models import (
+    AttendanceCamera, AttendanceCoverageGap, AttendanceEvent, AttendanceRuntime, Camera, WorkSession,
+)
 from app.rtsp.reader import CameraStatus
 from app.time_utils import attendance_iso, utcnow
+from app.services.attendance_queries import read_snapshot
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
+
+
+@router.get("/status")
+def attendance_status(request: Request):
+    service = getattr(request.app.state, "attendance", None)
+    if service is None:
+        raise HTTPException(503, "Attendance service unavailable")
+    snapshot = service.health.snapshot()
+
+    def read(db):
+        runtime = db.get(AttendanceRuntime, 1)
+        configurations = [_view(row) for row in db.query(AttendanceCamera).order_by(AttendanceCamera.camera_id)]
+        return dict(configuration=configurations, commission_id=runtime.commission_id,
+                    monitoring_started_at=attendance_iso(runtime.monitoring_started_at),
+                    heartbeat_at=attendance_iso(runtime.heartbeat_at), stopped_at=attendance_iso(runtime.stopped_at),
+                    unresolved_crossings=db.query(AttendanceEvent).filter_by(status="REVIEW").count(),
+                    projection_conflicts=db.query(AttendanceEvent).filter(AttendanceEvent.projection_reasons != []).count(),
+                    unreviewed_gaps=db.query(AttendanceCoverageGap).filter_by(reviewed=False).count(),
+                    open_sessions=db.query(WorkSession).filter(WorkSession.ended_at.is_(None)).count(),
+                    utc_offset_minutes=settings.attendance_utc_offset_minutes)
+    try:
+        persisted = read_snapshot(service.engine, read)
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Attendance status unavailable") from exc
+    snapshot.update(persisted)
+    snapshot["automatic_ready"] = snapshot["automatic_ready"] and persisted["commission_id"] is not None
+    return snapshot
 
 
 class CalibrationInput(BaseModel):

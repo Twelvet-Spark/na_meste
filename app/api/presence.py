@@ -1,65 +1,48 @@
-"""REST API присутствия: активные сессии и история."""
-from datetime import datetime
+"""Read-only pre-attendance observations: never evidence of worked hours."""
+from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database.database import get_db
 from app.database.models import Camera, Employee, PresenceSession
-from app.time_utils import iso_local
+from app.services.attendance_queries import read_snapshot
+from app.time_utils import attendance_iso, day_bounds
 
-router = APIRouter(prefix="/api/presence", tags=["presence"])
-
-
-def _session_row(session: PresenceSession, employee_name: str | None,
-                 camera_name: str | None) -> dict:
-    return {
-        "id": session.id,
-        "employee_id": session.employee_id,
-        "employee_name": employee_name,
-        "camera_id": session.camera_id,
-        "camera_name": camera_name,
-        "started_at": iso_local(session.started_at),
-        "last_seen_at": iso_local(session.last_seen_at),
-        "ended_at": iso_local(session.ended_at),
-        "confidence": session.confidence,
-    }
+router = APIRouter(prefix="/api/presence", tags=["legacy observations"])
 
 
-def _query(db: Session, q):
-    """JOIN с именами сотрудника и камеры."""
-    return q.join(Employee, PresenceSession.employee_id == Employee.id, isouter=True)\
-            .join(Camera, PresenceSession.camera_id == Camera.id, isouter=True)\
-            .add_columns(Employee.name, Camera.name)
+@router.get("/legacy")
+def legacy_observations(employee_id: int | None = None, from_date: date | None = None,
+                        to_date: date | None = None, limit: int = Query(50, ge=1, le=200),
+                        offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+    if from_date is not None and to_date is not None and to_date < from_date:
+        raise HTTPException(422, "End date precedes start date")
 
+    def read(snapshot):
+        if employee_id is not None and snapshot.get(Employee, employee_id) is None:
+            raise HTTPException(404, "Employee not found")
+        query = snapshot.query(PresenceSession)
+        if employee_id is not None:
+            query = query.filter(PresenceSession.employee_id == employee_id)
+        if from_date is not None:
+            query = query.filter(PresenceSession.started_at >= day_bounds(from_date)[0])
+        if to_date is not None:
+            query = query.filter(PresenceSession.started_at < day_bounds(to_date)[1])
+        total = query.count()
+        rows = query.outerjoin(Employee, Employee.id == PresenceSession.employee_id).outerjoin(
+            Camera, Camera.id == PresenceSession.camera_id).add_columns(Employee.name, Camera.name).order_by(
+                PresenceSession.started_at.desc(), PresenceSession.id.desc()).offset(offset).limit(limit).all()
+        items = [dict(id=row.id, employee_id=row.employee_id, employee_name=employee_name,
+                      camera_id=row.camera_id, camera_name=camera_name,
+                      started_at=attendance_iso(row.started_at), last_seen_at=attendance_iso(row.last_seen_at),
+                      ended_at=attendance_iso(row.ended_at), confidence=row.confidence,
+                      historical_unclosed=row.ended_at is None)
+                 for row, employee_name, camera_name in rows]
+        return dict(items=items, total=total, limit=limit, offset=offset, trusted_for_hours=False)
 
-@router.get("")
-def api_presence_history(limit: int = 100, db: Session = Depends(get_db)):
-    """История сессий (последние N), свежие сверху."""
-    limit = max(1, min(limit, 1000))
-    rows = _query(
-        db,
-        db.query(PresenceSession),
-    ).order_by(PresenceSession.last_seen_at.desc()).limit(limit).all()
-    return [_session_row(s, emp, cam) for s, emp, cam in rows]
-
-
-@router.get("/active")
-def api_presence_active(db: Session = Depends(get_db)):
-    """Открытые сессии (человек сейчас на камере)."""
-    rows = _query(
-        db,
-        db.query(PresenceSession).filter(PresenceSession.ended_at.is_(None)),
-    ).order_by(PresenceSession.last_seen_at.desc()).all()
-    return [_session_row(s, emp, cam) for s, emp, cam in rows]
-
-
-@router.get("/employee/{employee_id}")
-def api_presence_employee(employee_id: int, db: Session = Depends(get_db)):
-    if db.get(Employee, employee_id) is None:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    rows = _query(
-        db,
-        db.query(PresenceSession).filter(PresenceSession.employee_id == employee_id),
-    ).order_by(PresenceSession.last_seen_at.desc()).limit(200).all()
-    return [_session_row(s, emp, cam) for s, emp, cam in rows]
+    try:
+        return read_snapshot(db.get_bind().engine, read)
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Observation archive unavailable") from exc

@@ -389,7 +389,6 @@ def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
         assert store.match(vector()).store_revision == 8
         assert len(outcome.detections) == 2
         assert all(item.employee_id is None for item in outcome.detections)
-        assert not outcome.new_recognitions
         old_evidence = outcome.detections[0].fresh_face_evidence
         assert old_evidence.store_revision == 7
         assert old_evidence.confirmed_employee_id == 1
@@ -434,7 +433,6 @@ def test_in_frame_refresh_clears_other_tracks_cached_confirmation_without_resamp
         assert store.match(vector()).store_revision == 8
         assert len(outcome.detections) == 2
         assert all(item.employee_id is None for item in outcome.detections)
-        assert not outcome.new_recognitions
 
 
 @test

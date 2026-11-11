@@ -46,7 +46,6 @@ class Settings(BaseSettings):
     )
     min_confirmations: int = 2              # подряд совпавших распознаваний до подтверждения
     face_recognition_retry_interval: float = 2.0  # сек между попытками распознать неизвестного
-    presence_end_timeout: float = 30.0      # сек без наблюдений → сессия закрывается
     face_min_size: int = 80                 # мин. размер лица на фото, px
     yolo_model: str = "models/yolov8n.onnx"
     insightface_model: str = "buffalo_l"

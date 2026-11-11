@@ -1,30 +1,19 @@
-"""AI-воркер: один поток обрабатывает кадры всех камер.
+"""Single inference owner: recognition → doorway → durable attendance → optional Re-ID.
 
-Архитектура (ТЗ «Несколько камер → один AI-воркер»):
-
-    Camera 1..N ─► FrameBuffer ридеров (queue=2, drop old / keep latest)
-                        │
-                        ▼
-                   AI Worker ──► RecognitionService ──► DetectionState (для UI/API)
-                        │
-                        ▼
-                 PresenceManager (сессии присутствия)
-
-Кадры берутся напрямую из FrameBuffer ридеров: буфер уже реализует
-«max queue size = 2, старый кадр отбрасывается» — бесконечных очередей нет.
-Не успеваем — камера просто обрабатывается реже, превью не страдает.
-Для масштабирования можно запустить несколько воркеров с разбиением по камерам
-(service потокобезопасен).
+Only this thread mutates local trajectories. The monitor consumes immutable FIFO
+records and health notifications, never trackers. Reader publication remains the
+transaction-captured CameraSource interface.
 """
 import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.ai.detector import PersonDetector
+from app.ai.doorway import DoorwayCalibration, DoorwayDetector
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.providers import provider_label, resolve_providers, setup_cuda_dlls
@@ -32,8 +21,11 @@ from app.ai.recognition_service import RecognitionService
 from app.config import BASE_DIR, settings
 from app.database.models import AttendanceCamera, Camera
 from app.rtsp.manager import ReaderManager
-from app.rtsp.reader import CameraStatus, FramePacket
-from app.services.presence_service import PresenceManager
+from app.rtsp.reader import CameraStatus
+from app.services.attendance_health import CoverageFault
+from app.services.attendance_monitor import AttendanceWriteQueue
+from app.services.attendance_queries import read_snapshot
+from app.time_utils import utcnow
 
 logger = logging.getLogger("app.ai.worker")
 
@@ -90,147 +82,202 @@ class _CameraConfiguration:
     calibration_revision: int
     enabled: bool
     attendance: bool
+    role: str | None
+    calibration: DoorwayCalibration | None
+
+
+def loaded_providers(*, detector=None, live=None, enroll=None, reid=None):
+    """Evidence from loaded sessions, never available/requested providers."""
+    result = {}
+    for key, model in (("yolo", detector), ("reid", reid)):
+        result[key] = list(model.session.get_providers()) if model is not None else []
+    for prefix, face in (("live_face", live), ("enroll_face", enroll)):
+        for kind in ("detection", "recognition"):
+            model = face.app.models.get(kind) if face is not None else None
+            result[f"{prefix}_{kind}"] = list(model.session.get_providers()) if model is not None else []
+    return result
 
 
 class AIWorker(threading.Thread):
-    def __init__(
-        self,
-        manager: ReaderManager,
-        service: RecognitionService,
-        presence: PresenceManager,
-        detection_state: DetectionState,
-        global_manager=None,
-        *,
-        session_factory,
-    ):
+    def __init__(self, manager, service, attendance, detection_state, global_manager=None,
+                 *, doorway=None, health=None, write_queue=None):
         super().__init__(name="ai-worker", daemon=True)
-        self.manager = manager
-        self.service = service
-        self.presence = presence
-        self.state = detection_state
-        self.global_manager = global_manager
-        self._session_factory = session_factory
+        self.manager, self.service, self.attendance = manager, service, attendance
+        self.state, self.global_manager = detection_state, global_manager
+        self.doorway = doorway if doorway is not None else DoorwayDetector()
+        self.health = health if health is not None else attendance.health
+        self.write_queue = write_queue if write_queue is not None else AttendanceWriteQueue(attendance, self.health)
         self._stop_event = threading.Event()
-        self._last_seq: dict[int, int] = {}
-        self._last_ts: dict[int, float] = {}
-        self._last_received: dict[int, float] = {}
-        self._streams: dict[int, tuple[str, int]] = {}
-        self._configurations: dict[int, _CameraConfiguration] = {}
-        self._last_global_cleanup = 0.0
+        self._last_seq, self._last_ts, self._last_received = {}, {}, {}
+        self._last_received_at = {}
+        self._streams, self._configurations = {}, {}
+        self._gallery_revision = service.store.revision
+        self._rotation = 0
+        self._last_global_cleanup = 0.
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout=None):
         self._stop_event.set()
-        self.join(timeout=timeout)
+        if self.ident is not None:
+            # Do not stop the monitor while a timed-out producer can still enqueue.
+            self.join()
+        else:
+            self.flush("SHUTDOWN")
 
-    def run(self) -> None:
-        logger.info("AI worker запущен (AI_FPS=%.1f на камеру)", settings.ai_fps)
-        while not self._stop_event.is_set():
-            did_work = False
-            try:
-                packets = self._collect_frames()
-            except SQLAlchemyError:
-                # Never process a source under an unverified persisted revision.
-                logger.exception("AI worker: настройки камер недоступны")
-                for camera_id in list(self._configurations):
-                    self._reset_camera(camera_id)
-                self._configurations.clear()
-                self._stop_event.wait(0.05)
-                continue
+    def run(self):
+        logger.info("AI worker started")
+        try:
+            while not self._stop_event.is_set():
+                did_work = self.step()
+                if not did_work:
+                    self._stop_event.wait(.05)
+        finally:
+            self.flush("SHUTDOWN")
+            logger.info("AI worker stopped")
 
-            for camera_id, packet, config in packets:
-                if self._stop_event.is_set():
-                    break
-                started = time.monotonic()
-                if (config.attendance
-                        and started - packet.received_mono > settings.attendance_frame_max_age):
-                    self._reset_camera(camera_id)
-                    continue
-                fps = settings.attendance_ai_fps if config.attendance else max(0.5, settings.ai_fps)
-                interval = 1.0 / fps
-                if started - self._last_ts.get(camera_id, float("-inf")) < interval:
-                    continue
-                self._last_seq[camera_id] = packet.seq
-                self._last_ts[camera_id] = started
-                self._last_received[camera_id] = packet.received_mono
-                try:
-                    outcome = self.service.process_frame(
-                        packet.frame, camera_id, packet.received_mono,
-                        frame_seq=packet.seq, received_at=packet.received_at,
-                        attendance=config.attendance,
-                    )
-                except Exception:
-                    logger.exception("Camera %d: ошибка AI-обработки кадра", camera_id)
-                    self._reset_camera(camera_id)
-                    self._streams[camera_id] = (packet.stream_id, packet.source_revision)
-                    self._last_seq[camera_id] = packet.seq
-                    continue
+    def _persist(self, events):
+        for crossing in events:
+            self.write_queue.submit(crossing)
 
-                if self.global_manager is not None:
-                    try:
-                        self.global_manager.process(
-                            camera_id, outcome, packet.frame, packet.received_mono,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Camera %d: ошибка глобального трекинга — "
-                            "локальный трекинг продолжается", camera_id,
-                        )
-                self.state.update(camera_id, outcome.detections)
-                for _track_id, employee_id, confidence in outcome.new_recognitions:
-                    self.presence.on_recognized(camera_id, employee_id, confidence)
-                did_work = True
-
-            self.presence.tick()
-            now = time.monotonic()
-            if (self.global_manager is not None
-                    and now - self._last_global_cleanup > 3600.0):
-                self._last_global_cleanup = now
-                self.global_manager.cleanup()
-            if not did_work:
-                self._stop_event.wait(0.05)
-
+    def flush(self, reason):
         for camera_id in list(self._configurations):
-            self._reset_camera(camera_id)
-        logger.info("AI worker остановлен")
+            self._reset_camera(camera_id, reason)
+        self._persist(self.doorway.expire(time.monotonic()))
 
-    def _reset_camera(self, camera_id: int) -> None:
-        """Worker-owned reset of every generation-bound consumer."""
+    def step(self):
+        now = time.monotonic()
+        if not self.health.observe_clock(utcnow(), now):
+            for camera_id in list(self._configurations):
+                self._reset_camera(camera_id, "CLOCK_DISCONTINUITY")
+        if self.service.store.revision != self._gallery_revision:
+            for camera_id in list(self._configurations):
+                self._reset_camera(camera_id, "GALLERY_CHANGED")
+            self._gallery_revision = self.service.store.revision
+        try:
+            packets = self._collect_frames()
+            self.health.transition("configuration", [])
+        except SQLAlchemyError:
+            logger.exception("Attendance camera configuration unavailable")
+            self.health.transition("configuration", ["PERSISTENCE_ERROR"])
+            for camera_id in list(self._configurations):
+                self._reset_camera(camera_id, "CONFIGURATION_UNAVAILABLE")
+            self._persist(self.doorway.expire(now))
+            return False
+        priority = [item for item in packets if item[2].attendance]
+        others = [item for item in packets if not item[2].attendance]
+        if priority:
+            offset = self._rotation % len(priority)
+            priority = priority[offset:] + priority[:offset]
+            self._rotation += 1
+        did_work = False
+        for camera_id, packet, config in priority + others:
+            if self._stop_event.is_set():
+                break
+            started = time.monotonic()
+            if config.attendance and started - packet.received_mono > settings.attendance_frame_max_age:
+                self._reset_camera(camera_id, "FRAME_GAP")
+                continue
+            fps = settings.attendance_ai_fps if config.attendance else max(.5, settings.ai_fps)
+            if started - self._last_ts.get(camera_id, float("-inf")) < 1 / fps:
+                continue
+            self._last_seq[camera_id], self._last_ts[camera_id] = packet.seq, started
+            self._last_received[camera_id] = packet.received_mono
+            self._last_received_at[camera_id] = packet.received_at
+            try:
+                outcome = self.service.process_frame(
+                    packet.frame, camera_id, packet.received_mono, frame_seq=packet.seq,
+                    received_at=packet.received_at, attendance=config.attendance)
+                completed = time.monotonic()
+                self.health.transition(f"inference:{camera_id}", [])
+                if config.calibration is not None:
+                    self.health.record_frame(config.role, packet, tracking_generation=outcome.tracking_generation,
+                                             started_mono=started, completed_mono=completed)
+                    self._persist(self.doorway.process(packet, camera_id, outcome, config.calibration))
+            except Exception:
+                logger.exception("Camera %d inference failed", camera_id)
+                if config.attendance:
+                    self.health.transition(f"inference:{camera_id}", ["AI_UNAVAILABLE"],
+                                           at=packet.received_at, mono=packet.received_mono)
+                self._reset_camera(camera_id, "AI_UNAVAILABLE")
+                self._streams[camera_id] = (packet.stream_id, packet.source_revision)
+                self._last_seq[camera_id] = packet.seq
+                continue
+            # This optional layer cannot influence a work key or delay saving the
+            # completed crossing produced by this frame.
+            if self.global_manager is not None:
+                try:
+                    self.global_manager.process(camera_id, outcome, packet.frame, packet.received_mono)
+                except Exception:
+                    logger.exception("Optional global tracking failed for camera %d", camera_id)
+            self.state.update(camera_id, outcome.detections)
+            did_work = True
+        self._persist(self.doorway.expire(time.monotonic()))
+        self.health.snapshot()
+        if self.global_manager is not None and now - self._last_global_cleanup > 3600:
+            self._last_global_cleanup = now
+            try:
+                self.global_manager.cleanup()
+            except Exception:
+                logger.exception("Optional global history cleanup failed")
+        return did_work
+
+    def _reset_camera(self, camera_id, reason="STREAM_RESET"):
+        # Flush BEFORE destroying recognition/generation/global bindings.
+        if camera_id in self._last_received and reason in (
+                "FRAME_GAP", "STREAM_RESET", "SOURCE_CHANGED", "CALIBRATION_CHANGED",
+                "GALLERY_CHANGED", "AI_UNAVAILABLE", "CLOCK_DISCONTINUITY"):
+            config = self._configurations.get(camera_id)
+            if config is not None and config.attendance:
+                current = utcnow()
+                start = min(self._last_received_at[camera_id], current)
+                self.health.publish_fault(CoverageFault(str(uuid4()), start,
+                                                        self._last_received[camera_id],
+                                                        max(current, self._last_received_at[camera_id]), (reason,)))
+        self._persist(self.doorway.reset_camera(camera_id, reason))
         self.service.reset_camera(camera_id)
         self.state.drop_camera(camera_id)
         if self.global_manager is not None:
             self.global_manager.drop_camera(camera_id)
-        self._streams.pop(camera_id, None)
-        self._last_seq.pop(camera_id, None)
-        self._last_ts.pop(camera_id, None)
-        self._last_received.pop(camera_id, None)
+        for mapping in (self._streams, self._last_seq, self._last_ts, self._last_received, self._last_received_at):
+            mapping.pop(camera_id, None)
 
-    def _read_configurations(self) -> dict[int, _CameraConfiguration]:
-        with self._session_factory() as db:
-            rows = db.query(
-                AttendanceCamera.camera_id, AttendanceCamera.source_revision,
-                AttendanceCamera.revision, AttendanceCamera.role,
-                AttendanceCamera.enabled, Camera.enabled,
-            ).join(Camera, Camera.id == AttendanceCamera.camera_id).all()
-        return {
-            camera_id: _CameraConfiguration(
-                source, revision, camera_enabled and (role is None or enabled),
-                role is not None,
-            )
-            for camera_id, source, revision, role, enabled, camera_enabled in rows
-        }
+    def _read_configurations(self):
+        def read(db):
+            result = {}
+            for config, camera_enabled in db.query(AttendanceCamera, Camera.enabled).join(
+                    Camera, Camera.id == AttendanceCamera.camera_id):
+                calibration = None
+                if config.enabled and config.role is not None:
+                    calibration = DoorwayCalibration(
+                        config.camera_id, config.role, config.revision, config.source_revision,
+                        tuple(config.line_start), tuple(config.line_end), tuple(config.inside_point),
+                        config.reference_width, config.reference_height)
+                result[config.camera_id] = _CameraConfiguration(
+                    config.source_revision, config.revision,
+                    camera_enabled and (config.role is None or config.enabled),
+                    config.role is not None, config.role, calibration)
+            return result
+        return read_snapshot(self.attendance.engine, read)
 
-    def _collect_frames(self) -> list[tuple[int, FramePacket, _CameraConfiguration]]:
-        # Reconcile every camera before doing inference on any of their frames.
+    def _collect_frames(self):
         camera_ids = self._camera_ids()
         configurations = self._read_configurations()
-        included = {
-            camera_id for camera_id in camera_ids
-            if camera_id in configurations and configurations[camera_id].enabled
-        }
+        included = {key for key in camera_ids if key in configurations and configurations[key].enabled}
+        for role in ("ENTRY", "EXIT"):
+            assigned = [(key, config) for key, config in configurations.items() if config.role == role and config.enabled]
+            if assigned:
+                key, config = assigned[0]
+                reader = self.manager.get(key)
+                online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
+                          and reader.source_revision == config.source_revision)
+                self.health.configure_role(role, camera_id=key, source_revision=config.source_revision,
+                                           enabled=True, online=online, included=key in included)
+            else:
+                self.health.configure_role(role, camera_id=None, source_revision=0,
+                                           enabled=False, online=False, included=False)
         for camera_id in set(self._configurations) - included:
-            self._reset_camera(camera_id)
+            self._reset_camera(camera_id, "CAMERA_DISABLED")
+            self.health.transition(f"inference:{camera_id}", [])
             self._configurations.pop(camera_id, None)
-
         packets = []
         for camera_id in camera_ids:
             if camera_id not in included:
@@ -238,49 +285,46 @@ class AIWorker(threading.Thread):
             config = configurations[camera_id]
             previous = self._configurations.get(camera_id)
             if previous is not None and previous != config:
-                self._reset_camera(camera_id)
+                reason = "SOURCE_CHANGED" if previous.source_revision != config.source_revision else "CALIBRATION_CHANGED"
+                self._reset_camera(camera_id, reason)
             self._configurations[camera_id] = config
             reader = self.manager.get(camera_id)
-            if (reader is None or not reader.is_alive()
-                    or reader.status() is not CameraStatus.ONLINE
+            if (reader is None or not reader.is_alive() or reader.status() is not CameraStatus.ONLINE
                     or reader.source_revision != config.source_revision):
                 if camera_id in self._streams:
-                    self._reset_camera(camera_id)
+                    self._reset_camera(camera_id, "STREAM_RESET")
                 continue
             packet = reader.buffer.latest()
             if packet is None or packet.source_revision != config.source_revision:
                 if camera_id in self._streams:
-                    self._reset_camera(camera_id)
+                    self._reset_camera(camera_id, "STREAM_RESET")
                 continue
             stream = (packet.stream_id, packet.source_revision)
             if camera_id in self._streams and self._streams[camera_id] != stream:
-                self._reset_camera(camera_id)
+                self._reset_camera(camera_id, "STREAM_RESET")
             self._streams[camera_id] = stream
             age = time.monotonic() - packet.received_mono
             if config.attendance and age > settings.attendance_frame_max_age:
-                self._reset_camera(camera_id)
+                if camera_id in self._last_received:
+                    self._reset_camera(camera_id, "FRAME_GAP")
                 continue
             if packet.seq <= self._last_seq.get(camera_id, 0):
-                if (camera_id in self._last_received
-                        and age > settings.attendance_max_frame_gap):
-                    self._reset_camera(camera_id)
+                if camera_id in self._last_received and age > settings.attendance_max_frame_gap:
+                    self._reset_camera(camera_id, "FRAME_GAP")
                     self._streams[camera_id] = stream
                     self._last_seq[camera_id] = packet.seq
                 continue
-            last_received = self._last_received.get(camera_id)
-            if (last_received is not None
-                    and packet.received_mono - last_received > settings.attendance_max_frame_gap):
-                self._reset_camera(camera_id)
+            previous_receipt = self._last_received.get(camera_id)
+            if previous_receipt is not None and packet.received_mono - previous_receipt > settings.attendance_max_frame_gap:
+                self._reset_camera(camera_id, "FRAME_GAP")
                 self._streams[camera_id] = stream
             packets.append((camera_id, packet, config))
         return packets
 
-    def _camera_ids(self) -> list[int]:
+    def _camera_ids(self):
         ids = set(self.manager.reader_ids())
         allowed = settings.ai_camera_ids()
-        if allowed:
-            ids &= allowed
-        return sorted(ids)
+        return sorted(ids if not allowed else ids & allowed)
 
 
 # ------------------------------------------------------------- инициализация
@@ -301,11 +345,14 @@ def build_enroll_engine() -> Optional[FaceEngine]:
 
 
 def build_ai_worker(
-    manager: ReaderManager, presence: PresenceManager, store: EmbeddingStore,
-    *, session_factory, notifier=None,
+    manager: ReaderManager, attendance, store: EmbeddingStore,
+    *, session_factory, notifier=None, enroll_engine=None,
 ) -> Optional[AIWorker]:
     """Собирает полный AI-стек. None — модели недоступны (приложение работает
     только как RTSP-превью, не падая)."""
+    if store is None:
+        logger.error("Employee gallery unavailable; live attendance inference disabled")
+        return None
     setup_cuda_dlls()
     providers = resolve_providers(settings.ai_device)
 
@@ -339,6 +386,7 @@ def build_ai_worker(
                            "отключён (см. README)", reid_path)
 
     try:
+        from app.ai.detector import PersonDetector
         detector = PersonDetector(
             str(yolo_path), providers, settings.person_confidence,
         )
@@ -348,6 +396,9 @@ def build_ai_worker(
             providers=providers,
             det_size=320,
         )
+        attendance.health.set_providers(loaded_providers(
+            detector=detector, live=face_engine, enroll=enroll_engine,
+            reid=global_manager.reid if global_manager is not None else None))
     except Exception as exc:
         logger.error("AI-модели не загрузились (%s) — AI отключён", exc)
         return None
@@ -364,5 +415,4 @@ def build_ai_worker(
     )
     state = DetectionState()
     logger.info("AI Provider: %s", provider_label(detector.session.get_providers()))
-    return AIWorker(manager, service, presence, state,
-                    global_manager=global_manager, session_factory=session_factory)
+    return AIWorker(manager, service, attendance, state, global_manager=global_manager)

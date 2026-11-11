@@ -190,7 +190,6 @@ def test_recognition_never_displays_cached_employee_after_ambiguous_overlap():
     outcome = service.process_frame(FRAME, 1, 10.1, frame_seq=2,
                                     received_at=STAMP + timedelta(seconds=.1))
     assert all(det.employee_id is None for det in outcome.detections)
-    assert not outcome.new_recognitions
     assert any(item.track_id == 1 and item.state == "AMBIGUOUS"
                for item in outcome.track_lifecycle)
 

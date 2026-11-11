@@ -29,6 +29,7 @@ from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import AttendanceCamera, Camera
 from app.rtsp.reader import CameraStatus, ConnectionLost, FrameBuffer, RTSPReader
+from app.services.attendance_service import AttendanceService
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4, 0, 0, 123456)
@@ -265,12 +266,6 @@ class FrameReader:
         return CameraStatus.ONLINE
 
 
-class Presence:
-    def tick(self):
-        pass
-
-    def on_recognized(self, camera_id, employee_id, confidence):
-        raise AssertionError("No-face fixture cannot recognize an employee")
 
 
 def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
@@ -303,14 +298,15 @@ def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
             if global_reid is not None else None
         )
         worker = AIWorker(
-            LoopManager(stages, clock, advance), service, Presence(), state,
-            session_factory=factory, global_manager=global_manager,
+            LoopManager(stages, clock, advance), service, AttendanceService(db.get_bind()), state,
+            global_manager=global_manager,
         )
         with patch.object(service, "process_frame", side_effect=collect), \
                 patch("app.ai.worker.time.monotonic", side_effect=lambda: clock[0]), \
                 patch.object(settings, "ai_cameras", ""), patch.object(settings, "ai_fps", 100.0):
             try:
-                worker.run()
+                while True:
+                    worker.step()
             except EndLoop:
                 pass
     return service, state, outcomes

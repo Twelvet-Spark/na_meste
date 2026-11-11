@@ -16,18 +16,20 @@ from fastapi.templating import Jinja2Templates
 
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.providers import provider_label
-from app.ai.worker import build_ai_worker, build_enroll_engine
+from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
 from app.api.attendance import router as attendance_router
 from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
 from app.api.global_persons import router as global_persons_router
 from app.api.presence import router as presence_router
 from app.config import BASE_DIR, settings
-from app.database.database import SessionLocal, init_db
+from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
 from app.rtsp.manager import ReaderManager
 from app.rtsp.source import CameraSource
-from app.services.presence_service import PresenceManager
+from app.services.attendance_service import AttendanceService
+from app.services.attendance_monitor import AttendanceMonitor
+from app.time_utils import utcnow
 from app.services.telegram_service import TelegramNotifier
 
 logging.basicConfig(
@@ -58,9 +60,7 @@ async def lifespan(app: FastAPI):
     app.state.embedding_store = None
     app.state.ai_worker = None
     app.state.detection_state = None
-    app.state.presence = PresenceManager(
-        SessionLocal, settings.presence_end_timeout, notifier=notifier
-    )
+    app.state.attendance = AttendanceService(engine, notifier=notifier, now=utcnow)
 
     try:
         store = EmbeddingStore()
@@ -74,17 +74,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("AI-инициализация для сотрудников не удалась — "
                          "загрузка фото будет недоступна")
+    app.state.attendance.health.set_providers(loaded_providers(enroll=app.state.face_engine))
 
     if settings.ai_enabled:
-        worker = build_ai_worker(
-            app.state.manager, app.state.presence, app.state.embedding_store,
-            session_factory=SessionLocal,
-            notifier=notifier,
-        )
-        if worker is not None:
-            worker.start()
-            app.state.ai_worker = worker
-            app.state.detection_state = worker.state
+        try:
+            worker = build_ai_worker(
+                app.state.manager, app.state.attendance, app.state.embedding_store,
+                session_factory=SessionLocal, notifier=notifier,
+                enroll_engine=app.state.face_engine,
+            )
+            if worker is not None:
+                worker.start()
+                app.state.ai_worker = worker
+                app.state.detection_state = worker.state
+        except Exception:
+            logger.exception("Live inference unavailable; attendance remains in review/manual mode")
+            app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])
     else:
         logger.info("AI отключён (AI_ENABLED=false)")
 
@@ -97,18 +102,33 @@ async def lifespan(app: FastAPI):
         ]
     for camera in saved_sources:
         app.state.manager.start(camera)
+    app.state.attendance_monitor = AttendanceMonitor(
+        app.state.attendance,
+        write_queue=app.state.ai_worker.write_queue if app.state.ai_worker is not None else None,
+        manager=app.state.manager, worker=app.state.ai_worker,
+    )
+    try:
+        app.state.attendance_monitor.startup()
+    except Exception:
+        logger.exception("Attendance restart coverage could not be persisted")
+        app.state.attendance.health.transition("monitor", ["PERSISTENCE_ERROR"])
+    app.state.attendance_monitor.start()
 
     logger.info(
         "Приложение запущено: http://localhost:%d (API docs: /docs)", settings.app_port
     )
-    yield
-    # shutdown: корректно останавливаем AI-воркер, ридеры и ffmpeg-процессы
-    if app.state.ai_worker is not None:
-        app.state.ai_worker.stop()
-    if app.state.telegram is not None:
-        app.state.telegram.stop()
-    app.state.manager.stop_all()
-    logger.info("Приложение остановлено")
+    try:
+        yield
+    finally:
+        # Join the sole producer first, then drain/persist its evidence and durable
+        # stop timestamp before stopping readers or notification delivery.
+        if app.state.ai_worker is not None:
+            app.state.ai_worker.stop()
+        app.state.attendance_monitor.stop()
+        if app.state.telegram is not None:
+            app.state.telegram.stop()
+        app.state.manager.stop_all()
+        logger.info("Приложение остановлено")
 
 
 app = FastAPI(title="Мониторинг", lifespan=lifespan)
