@@ -1,69 +1,52 @@
 {% extends "base.html" %}
 {% set active_page = 'employees' %}
-
 {% block title %}Сотрудники{% endblock %}
-
-{% block topbar_right %}
-  <button id="btn-add" class="btn primary">+ Добавить сотрудника</button>
-{% endblock %}
-
 {% block content %}
-  <main class="container">
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Сотрудники</h2>
-        <span id="summary" class="muted"></span>
-        <button id="btn-retry" type="button" class="btn" hidden>Повторить загрузку</button>
+  <main class="container employee-workspace">
+    <div class="page-heading">
+      <div><h1>Сотрудники <span id="employee-count" class="heading-count"></span></h1><p class="muted">Карточки, фотографии для распознавания и рабочие места.</p></div>
+      <a id="btn-add" class="btn primary" href="/employees/new">Добавить сотрудника</a>
+    </div>
+    <section class="panel" aria-label="Список сотрудников">
+      <form id="employee-filters" class="employee-filters" role="search">
+        <label class="field">Поиск
+          <input id="employee-search" type="search" placeholder="Фамилия, имя или внешний ID" autocomplete="off">
+        </label>
+        <label class="field">Рабочее место
+          <select id="workplace-filter"><option value="">Все рабочие места</option><option value="none">Без рабочего места</option></select>
+        </label>
+        <label class="field">Активность
+          <select id="activity-filter"><option value="all">Все сотрудники</option><option value="active">Активные</option><option value="inactive">Неактивные</option></select>
+        </label>
+      </form>
+      <div class="directory-summary">
+        <p id="summary" class="muted" role="status" aria-live="polite">Загружаем список…</p>
+        <button id="btn-refresh" type="button" class="btn ghost">Обновить</button>
       </div>
-      <ul id="employee-list" class="employee-list"></ul>
+      <div id="list-error" class="request-notice" hidden>
+        <p id="list-error-message" role="alert"></p>
+        <button id="btn-retry" type="button" class="btn">Повторить загрузку</button>
+      </div>
+      <ul id="employee-list" class="employee-list" aria-label="Сотрудники" aria-busy="true"></ul>
       <div id="empty" class="empty" hidden>
-        Сотрудников пока нет. Добавьте первого и загрузите несколько фотографий его лица.
+        <h2 id="empty-title">Добавьте первого сотрудника</h2>
+        <p id="empty-description">Укажите имя и фамилию и выберите от 1 до 15 фотографий. Рабочее место — необязательно.</p>
+        <a id="empty-create" class="btn primary" href="/employees/new">Добавить сотрудника</a>
+        <button id="clear-filters" type="button" class="btn" hidden>Сбросить фильтры</button>
       </div>
     </section>
   </main>
-
-  <dialog id="modal" class="modal" aria-labelledby="create-title">
-    <h2 id="create-title">Добавить сотрудника</h2>
-    <form id="employee-form" autocomplete="off">
-      <label class="field">Фамилия
-        <input name="last_name" required maxlength="74" autocomplete="family-name">
-      </label>
-      <label class="field">Имя
-        <input name="first_name" required maxlength="74" autocomplete="given-name">
-      </label>
-      <label class="field">Внешний ID (необязательно)
-        <input name="external_id" maxlength="64">
-      </label>
-      <label class="field">Рабочие места (необязательно; можно выбрать несколько)
-        <select name="workplace_ids" multiple size="3"></select>
-      </label>
-      <button id="btn-workplace" type="button" class="btn">Создать рабочее место</button>
-      <label class="field">Фотографии — от 1 до 15
-        <input id="create-files" type="file" accept="image/jpeg,image/png" multiple>
-      </label>
-      <p class="muted small">JPEG/PNG, до 15 МиБ и 20 миллионов пикселей на файл. Рекомендуем 3–5 разных ракурсов. Сохраняются только выровненные миниатюры и эмбеддинги, не оригиналы.</p>
-      <p id="draft-count" aria-live="polite">Выбрано: 0/15</p>
-      <div id="draft-photos" class="faces-grid"></div>
-      <p id="create-status" role="status" aria-live="polite"></p>
+  <dialog id="delete-dialog" class="modal" aria-labelledby="delete-title" aria-describedby="delete-description">
+    <h2 id="delete-title">Удалить сотрудника?</h2>
+    <p id="delete-description"></p>
+    <p class="muted">При наличии истории удаление запрещено. Вместо удаления отключите активность в карточке.</p>
+    <form id="delete-form">
+      <p id="delete-error" class="form-status" role="alert"></p>
       <div class="modal-actions">
-        <button type="button" id="btn-cancel" class="btn">Отмена</button>
-        <button type="submit" class="btn primary">Создать сотрудника</button>
-      </div>
-    </form>
-  </dialog>
-  <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">
-    <h2 id="workplace-title">Новое рабочее место</h2>
-    <form id="workplace-form">
-      <label class="field">Название<input name="name" required maxlength="150"></label>
-      <p id="workplace-error" role="alert"></p>
-      <div class="modal-actions">
-        <button id="workplace-cancel" type="button" class="btn">Отмена</button>
-        <button type="submit" class="btn primary">Создать</button>
+        <button type="button" class="btn" data-dialog-cancel autofocus>Отмена</button>
+        <button type="submit" class="btn danger">Удалить сотрудника</button>
       </div>
     </form>
   </dialog>
 {% endblock %}
-
-{% block scripts %}
-  <script src="/static/js/employees.js"></script>
-{% endblock %}
+{% block scripts %}<script src="/static/js/employees.js"></script>{% endblock %}

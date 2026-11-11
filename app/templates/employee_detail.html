@@ -4,65 +4,75 @@
 {% block title %}Сотрудник{% endblock %}
 
 {% block topbar_right %}
-  <span id="emp-title" class="muted">Сотрудник</span>
+  <span class="muted">Карточка сотрудника</span>
 {% endblock %}
 
 {% block content %}
-  <main class="container">
-    <!-- Данные сотрудника -->
-    <section class="panel">
-      <div class="panel-head"><h2>Данные сотрудника</h2></div>
-      <form id="emp-form" class="emp-form" autocomplete="off">
-        <div class="attendance-fields">
-          <label class="field grow">Фамилия
-            <input name="last_name" maxlength="74" autocomplete="family-name">
-          </label>
-          <label class="field grow">Имя
-            <input name="first_name" maxlength="74" autocomplete="given-name">
-          </label>
-          <label class="field grow">Внешний ID
-            <input name="external_id" maxlength="64" placeholder="—">
-          </label>
-          <label class="field checkbox-field">
-            <input type="checkbox" name="active" checked> Активен
-          </label>
-        </div>
-        <label class="field">Рабочие места (необязательно; можно выбрать несколько)
-          <select name="workplace_ids" multiple size="3"></select>
-        </label>
-        <button id="btn-workplace" type="button" class="btn">Создать рабочее место</button>
-        <p id="employee-remediation" class="muted"></p>
-        <p id="employee-status" role="status" aria-live="polite"></p>
-        <button id="reload-conflict" type="button" class="btn" hidden>Загрузить текущую версию, сохранив черновик</button>
-        <div class="modal-actions">
-          <span class="spacer"></span>
-          <button type="submit" class="btn primary">Сохранить</button>
-        </div>
-      </form>
-    </section>
+  <main class="container employee-workspace">
+    <a class="back-link" href="/employees">К списку сотрудников</a>
+    <div class="page-heading">
+      <div><h1 id="emp-title">Сотрудник</h1><p id="employee-remediation" class="muted"></p></div>
+    </div>
+    <nav class="profile-sections" aria-label="Разделы карточки">
+      <a href="#data">Данные</a><a href="#photos">Фотографии</a><a href="#work">Рабочее время</a><a href="#history">История</a>
+    </nav>
+    <div id="profile-load-error" class="request-notice" hidden>
+      <p id="profile-load-message" role="alert"></p>
+      <button id="profile-retry" type="button" class="btn">Повторить загрузку</button>
+    </div>
+    <div id="revision-conflict" class="request-notice" hidden>
+      <p role="alert">Карточка изменилась в другом окне. Загрузите текущую версию: ваши поля, выбранные файлы и удаления из набора останутся в черновике. Проверьте его и повторите сохранение.</p>
+      <button id="reload-conflict" type="button" class="btn">Загрузить версию и применить мой черновик</button>
+    </div>
+    <div id="profile-editor" aria-busy="true">
+      <section id="data" class="panel" aria-labelledby="data-title">
+        <div class="panel-head"><h2 id="data-title">Данные</h2></div>
+        <form id="emp-form" class="emp-form" autocomplete="off">
+          <fieldset id="metadata-fields" class="plain-fieldset" disabled>
+            <legend class="sr-only">Данные сотрудника</legend>
+            <div class="employee-metadata-fields">
+              <label class="field">Фамилия<input name="last_name" maxlength="74" autocomplete="family-name"></label>
+              <label class="field">Имя<input name="first_name" maxlength="74" autocomplete="given-name"></label>
+              <label class="field">Внешний ID <span class="muted">(необязательно)</span><input name="external_id" maxlength="64"></label>
+              <label class="field checkbox-field"><input type="checkbox" name="active" checked> Активен — участвует в распознавании</label>
+            </div>
+            <label class="field">Рабочие места <span class="muted">(необязательно)</span>
+              <select name="workplace_ids" multiple size="4" aria-describedby="places-help"></select>
+            </label>
+            <p id="places-help" class="field-help muted">Можно выбрать несколько: Ctrl / ⌘ + щелчок на компьютере. Архивные метки можно оставить или убрать; для новых назначений они недоступны.</p>
+            <button id="btn-workplace" type="button" class="btn ghost">Создать рабочее место</button>
+            <p id="places-status" class="form-status" role="status" aria-live="polite"></p>
+            <button id="places-retry" type="button" class="btn" hidden>Загрузить рабочие места</button>
+            <p id="employee-status" class="form-status" role="status" aria-live="polite">Загружаем карточку…</p>
+            <div class="form-actions"><button type="submit" class="btn primary">Сохранить данные</button></div>
+          </fieldset>
+        </form>
+      </section>
+      <section id="photos" class="panel" aria-labelledby="photos-title">
+        <div class="panel-head"><h2 id="photos-title">Фотографии</h2></div>
+        <p class="muted">Сохраните итоговый набор из 1–15 фото. Рекомендуем 3–5 разных ракурсов. Сохраняются только выровненные миниатюры лица и эмбеддинги — исходные фотографии не хранятся.</p>
+        <fieldset id="photo-fields" class="plain-fieldset" disabled>
+          <legend class="sr-only">Набор фотографий</legend>
+          <div id="photo-drop" class="photo-drop">
+            <label class="field">Выбрать новые фотографии
+              <input type="file" id="file-input" accept="image/jpeg,image/png" multiple aria-describedby="profile-photo-help">
+            </label>
+            <p class="muted">Или перетащите файлы сюда. Выбор и удаление меняют только черновик.</p>
+          </div>
+          <p id="profile-photo-help" class="field-help muted">JPEG/PNG, до 15 МиБ и 20 миллионов пикселей на файл. «Заменить» работает и для единственной фотографии, и при заполненном наборе.</p>
+          <p id="faces-count" class="photo-count" aria-live="polite"></p>
+          <div id="faces-grid" class="faces-grid"></div>
+          <p id="photo-status" class="form-status" role="status" aria-live="polite"></p>
+          <div class="form-actions">
+            <button id="save-photos" class="btn primary" type="button">Сохранить фотографии</button>
+            <button id="cancel-photos" class="btn" type="button">Отменить изменения</button>
+          </div>
+        </fieldset>
+      </section>
+    </div>
 
-    <!-- Фотографии лица -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Фотографии лица <span id="faces-count" class="muted"></span></h2>
-      </div>
-      <p class="muted small">
-        Сохраните итоговый набор из 1–15 фото. Рекомендуем 3–5 разных ракурсов.
-        Хранится только эмбеддинг и миниатюра лица — исходные фото не сохраняются.
-      </p>
-      <div class="upload-row">
-        <label class="field">Выбрать новые фотографии
-          <input type="file" id="file-input" accept="image/jpeg,image/png" multiple>
-        </label>
-        <button id="save-photos" class="btn primary" type="button">Сохранить фотографии</button>
-        <button id="cancel-photos" class="btn" type="button">Отменить изменения</button>
-      </div>
-      <p id="photo-status" role="status" aria-live="polite"></p>
-      <div id="faces-grid" class="faces-grid"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head"><h2>Рабочие интервалы</h2><a id="employee-report" class="btn" href="/presence#report">Отчёт по сотруднику</a></div>
+    <section id="work" class="panel" aria-labelledby="work-title">
+      <div class="panel-head"><h2 id="work-title">Рабочее время</h2><a id="employee-report" class="btn" href="/presence#report">Отчёт по сотруднику</a></div>
       <p class="muted">Время входа и выхода в UTC+05:00. Открытое время предварительное; спорные интервалы не считаются подтверждёнными часами.</p>
       <div id="work-error" class="test-result err" role="alert" hidden></div>
       <div class="table-wrap"><table class="table" id="work-table"><thead><tr><th>Вход</th><th>Выход</th><th>Подтверждено</th><th>Текущее</th><th>На проверке</th><th>Состояние / причины</th></tr></thead><tbody></tbody></table></div>
@@ -70,8 +80,9 @@
       <div id="work-pager" class="attendance-actions"></div>
       <a id="employee-events" href="/presence#events">Входы, выходы и исправления</a>
     </section>
-    <section class="panel">
-      <div class="panel-head"><h2>Архив наблюдений — не рабочее время</h2></div>
+    <section id="history" class="panel" aria-labelledby="history-title">
+      <div class="panel-head"><h2 id="history-title">История</h2></div>
+      <h3 class="section-subtitle">Архив наблюдений — не рабочее время</h3>
       <p class="muted">Старая история видимости на камерах сохранена только для чтения и не включается в отчёты о часах.</p>
       <div id="presence-error" class="test-result err" role="alert" hidden></div>
       <div class="table-wrap"><table class="table" id="presence-table"><thead><tr><th>Камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Сходство</th></tr></thead><tbody></tbody></table></div>
@@ -82,10 +93,10 @@
   <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">
     <h2 id="workplace-title">Новое рабочее место</h2>
     <form id="workplace-form">
-      <label class="field">Название<input name="name" required maxlength="150"></label>
-      <p id="workplace-error" role="alert"></p>
+      <label class="field">Название<input name="name" required maxlength="150" autofocus></label>
+      <p id="workplace-error" class="form-status" role="alert"></p>
       <div class="modal-actions">
-        <button id="workplace-cancel" type="button" class="btn">Отмена</button>
+        <button type="button" class="btn" data-dialog-cancel>Отмена</button>
         <button type="submit" class="btn primary">Создать</button>
       </div>
     </form>
@@ -94,5 +105,6 @@
 
 {% block scripts %}
   <script>window.EMPLOYEE_ID = {{ employee_id }};</script>
+  <script src="/static/js/employee_form.js"></script>
   <script src="/static/js/employee.js"></script>
 {% endblock %}

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% set active_page = 'employees' %}
+{% block title %}Новый сотрудник{% endblock %}
+{% block content %}
+  <main class="container employee-workspace">
+    <a class="back-link" href="/employees">К списку сотрудников</a>
+    <div class="page-heading"><div><h1>Новый сотрудник</h1><p class="muted">Данные и фотографии сохранятся вместе — только если весь набор пройдёт проверку.</p></div></div>
+    <form id="employee-form" class="employee-create-layout" data-employee-create autocomplete="off">
+      <section class="panel" aria-labelledby="data-title">
+        <h2 id="data-title">Данные</h2>
+        <label class="field">Фамилия
+          <input name="last_name" required maxlength="74" autocomplete="family-name">
+        </label>
+        <label class="field">Имя
+          <input name="first_name" required maxlength="74" autocomplete="given-name">
+        </label>
+        <label class="field">Внешний ID <span class="muted">(необязательно)</span>
+          <input name="external_id" maxlength="64" aria-describedby="external-help">
+        </label>
+        <p id="external-help" class="field-help muted">Номер или код сотрудника в вашей системе.</p>
+        <label class="field">Рабочие места <span class="muted">(необязательно)</span>
+          <select name="workplace_ids" multiple size="4" aria-describedby="places-help"></select>
+        </label>
+        <p id="places-help" class="field-help muted">Можно выбрать несколько: Ctrl / ⌘ + щелчок на компьютере. Это метки для удобства, а не график работы.</p>
+        <button id="btn-workplace" type="button" class="btn ghost">Создать рабочее место</button>
+        <p id="places-status" class="form-status" role="status" aria-live="polite"></p>
+        <button id="places-retry" type="button" class="btn" hidden>Загрузить рабочие места</button>
+      </section>
+      <section class="panel" aria-labelledby="photos-title">
+        <h2 id="photos-title">Фотографии</h2>
+        <p class="muted">От 1 до 15 фотографий с одним хорошо видимым лицом. Рекомендуем 3–5 разных ракурсов.</p>
+        <div id="photo-drop" class="photo-drop">
+          <label class="field">Выбрать фотографии
+            <input id="create-files" type="file" accept="image/jpeg,image/png" multiple aria-describedby="photo-help">
+          </label>
+          <p class="muted">Или перетащите файлы сюда. Выбор не начинает загрузку.</p>
+        </div>
+        <p id="photo-help" class="field-help muted">JPEG/PNG, до 15 МиБ и 20 миллионов пикселей на файл. Сохраняются только выровненные миниатюры лица и эмбеддинги, не оригиналы.</p>
+        <p id="draft-count" class="photo-count" aria-live="polite"></p>
+        <div id="draft-photos" class="faces-grid"></div>
+      </section>
+      <div class="create-submit">
+        <p id="create-status" class="form-status" role="status" aria-live="polite"></p>
+        <p class="muted small">Если хотя бы одно фото не пройдёт проверку, ничего не сохранится. Исправьте набор и отправьте его снова. Черновик доступен, пока открыта эта страница.</p>
+        <div class="form-actions"><a class="btn ghost" href="/employees">К списку</a><button type="submit" class="btn primary">Создать сотрудника</button></div>
+      </div>
+    </form>
+  </main>
+  <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">
+    <h2 id="workplace-title">Новое рабочее место</h2>
+    <form id="workplace-form">
+      <label class="field">Название<input name="name" required maxlength="150" autofocus></label>
+      <p id="workplace-error" class="form-status" role="alert"></p>
+      <div class="modal-actions"><button type="button" class="btn" data-dialog-cancel>Отмена</button><button type="submit" class="btn primary">Создать</button></div>
+    </form>
+  </dialog>
+{% endblock %}
+{% block scripts %}<script src="/static/js/employee_form.js"></script>{% endblock %}

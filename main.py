@@ -164,6 +164,11 @@ async def employees_page(request: Request):
     return templates.TemplateResponse(request, "employees.html", {})
 
 
+@app.get("/employees/new", include_in_schema=False)
+async def employee_new_page(request: Request):
+    return templates.TemplateResponse(request, "employee_new.html", {})
+
+
 @app.get("/employees/{employee_id}", include_in_schema=False)
 async def employee_page(request: Request, employee_id: int):
     return templates.TemplateResponse(

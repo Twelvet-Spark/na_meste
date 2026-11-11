@@ -1,176 +1,152 @@
-// Atomic employee profile; history below remains read-only and independent.
+// Atomic employee profile. Shared helpers own drafts; history stays independent.
 const employeeId = window.EMPLOYEE_ID;
 const $ = (id) => document.getElementById(id);
+const UI = window.OperatorUI;
+const api = UI.api;
 const form = $('emp-form');
 let current = null;
-let kept = new Set();
-let staged = [];
 let busy = false;
+let placesReady = false;
 let loadSequence = 0;
+const photos = new EmployeeForm.PhotoDraft({
+  input: $('file-input'), grid: $('faces-grid'), count: $('faces-count'),
+  drop: $('photo-drop'), status: $('photo-status'),
+});
+const picker = new EmployeeForm.WorkplacePicker({
+  select: form.elements.workplace_ids, trigger: $('btn-workplace'),
+  dialog: $('workplace-dialog'), form: $('workplace-form'), error: $('workplace-error'),
+  onChange: ({ created } = {}) => {
+    if (created) {
+      placesReady = true; form.elements.workplace_ids.disabled = false;
+      UI.message($('places-status'), 'Новое рабочее место выбрано. Сохраните данные, чтобы назначить его сотруднику.');
+    }
+  },
+});
+const revisionConflict = UI.conflict($('revision-conflict'), $('reload-conflict'), () => loadEmployee(true));
+photos.setBusy(true);
 
-function errorText(detail) {
-  if (typeof detail === 'string') return detail;
-  if (detail?.code === 'PHOTO_VALIDATION_FAILED') {
-    return 'Ничего не сохранено. ' + detail.files.map((file) => `${file.filename}: ${file.error}`).join('; ');
-  }
-  if (Array.isArray(detail)) return detail.map((error) => `${error.loc?.join('.') || ''}: ${error.msg}`).join('; ');
-  return 'Не удалось выполнить запрос. Повторите попытку.';
-}
-async function api(url, options = {}) {
-  const headers = { ...options.headers };
-  if (options.method && options.method !== 'GET') headers['X-Operator-Request'] = '1';
-  const response = await fetch(url, { ...options, headers });
-  const data = response.status === 204 ? null : await response.json();
-  if (!response.ok) {
-    const error = new Error(errorText(data?.detail)); error.status = response.status; throw error;
-  }
-  return data;
-}
 function status(message, error = null, photo = false) {
-  $(photo ? 'photo-status' : 'employee-status').textContent = message;
-  if (error?.status === 409) $('reload-conflict').hidden = false;
+  UI.message($(photo ? 'photo-status' : 'employee-status'), message, error ? 'error' : '');
+  revisionConflict.show(error);
 }
 function setBusy(value) {
   busy = value;
-  for (const element of form.elements) element.disabled = value;
-  for (const id of ['file-input', 'save-photos', 'cancel-photos']) $(id).disabled = value;
-  for (const button of $('faces-grid').querySelectorAll('button')) button.disabled = value;
-  form.setAttribute('aria-busy', String(value));
+  UI.setBusy($('profile-editor'), value);
+  photos.setBusy(value || !current);
+  if (!value) {
+    $('metadata-fields').disabled = !current;
+    $('photo-fields').disabled = !current;
+    form.elements.workplace_ids.disabled = !placesReady;
+  }
 }
 function updateSummary() {
   document.title = current.name; $('emp-title').textContent = current.name;
   $('employee-remediation').textContent = [
-    current.needs_name_completion ? 'Старое имя сохранено. Укажите имя и фамилию, когда сможете их уточнить.' : '',
-    current.needs_photo_remediation ? 'Нужно исправить набор фотографий до 1–15. До этого можно менять данные и отключать активность.' : '',
+    current.active ? 'Активен.' : 'Неактивен — распознавание отключено.',
+    current.needs_name_completion ? 'Старое имя сохранено. Уточните имя и фамилию вместе.' : '',
+    current.needs_photo_remediation ? 'Исправьте набор до 1–15 фотографий. Данные и активность можно менять уже сейчас.' : '',
   ].filter(Boolean).join(' ');
 }
-async function fillPlaces(selected) {
-  const places = await api('/api/workplaces');
-  const existing = new Set((current?.workplaces || []).map((place) => place.id));
-  const selectedSet = new Set(selected);
-  form.elements.workplace_ids.replaceChildren(...places.filter((place) => place.active || existing.has(place.id)).map((place) => {
-    const option = new Option(place.name + (place.active ? '' : ' (архив)'), place.id);
-    option.selected = selectedSet.has(place.id); return option;
-  }));
+async function loadPlaces() {
+  try {
+    await picker.load(null, current.workplaces);
+    placesReady = true; UI.message($('places-status'), ''); $('places-retry').hidden = true;
+  } catch (error) {
+    placesReady = false;
+    UI.message($('places-status'), 'Рабочие места не загружены. При сохранении их назначения не изменятся: ' + error.message, 'error');
+    $('places-retry').hidden = false;
+  }
 }
 async function loadEmployee(preserveDraft = false) {
+  if (busy) return false;
   const sequence = ++loadSequence;
+  setBusy(true);
   try {
     const employee = await api(`/api/employees/${employeeId}?faces=true`);
-    if (sequence !== loadSequence) return;
-    const omitted = new Set((current?.faces || []).filter((face) => !kept.has(face.id)).map((face) => face.id));
-    const selectedPlaces = preserveDraft
-      ? Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value))
-      : employee.workplaces.map((place) => place.id);
+    if (sequence !== loadSequence) return false;
+    const selected = preserveDraft ? picker.selected : employee.workplaces.map((place) => place.id);
     current = employee;
-    kept = new Set(employee.faces.filter((face) => !preserveDraft || !omitted.has(face.id)).map((face) => face.id));
+    photos.setAccepted(employee.faces, preserveDraft);
     if (!preserveDraft) {
       form.elements.first_name.value = employee.first_name || '';
       form.elements.last_name.value = employee.last_name || '';
       form.elements.external_id.value = employee.external_id || '';
       form.elements.active.checked = employee.active;
     }
-    updateSummary(); renderFaces();
-    await fillPlaces(selectedPlaces);
-    $('reload-conflict').hidden = true;
-    status(preserveDraft ? 'Текущая версия загружена. Черновик и новые файлы сохранены; проверьте данные и нажмите сохранение ещё раз.' : '');
+    // Keep existing archived tags visible even when the workplace request fails.
+    picker.existing = new Set(employee.workplaces.map((place) => place.id));
+    picker.places = Array.from(new Map([...picker.places, ...employee.workplaces].map((place) => [place.id, place])).values());
+    picker.render(selected);
+    await loadPlaces();
+    if (sequence !== loadSequence) return false;
+    updateSummary(); revisionConflict.clear(); $('profile-load-error').hidden = true;
+    status(preserveDraft ? 'Текущая версия загружена. Ваш черновик сохранён. Проверьте данные и повторите сохранение.' : '');
+    if (preserveDraft) status('Новые файлы и ваши удаления сохранены в черновике. Проверьте итоговый набор перед повторным сохранением.', null, true);
+    return true;
   } catch (error) {
-    status('Не удалось загрузить карточку: ' + error.message, error);
-    $('reload-conflict').hidden = false;
-  }
+    $('profile-load-error').hidden = false;
+    $('profile-load-message').textContent = 'Не удалось загрузить карточку: ' + error.message + (current ? ' Черновик оставлен без изменений.' : '');
+    status('Не удалось загрузить карточку.', error);
+    return false;
+  } finally { setBusy(false); }
 }
-form.onsubmit = async (event) => {
+form.addEventListener('submit', async (event) => {
   event.preventDefault(); if (busy || !current) return;
   const first = form.elements.first_name.value.trim(), last = form.elements.last_name.value.trim();
   if ((!first || !last) && !(current.needs_name_completion && !first && !last)) {
-    status('Укажите непустые имя и фамилию вместе.'); return;
+    status('Укажите непустые имя и фамилию вместе.', new Error()); return;
   }
   const payload = {
     expected_revision: current.revision, external_id: form.elements.external_id.value.trim() || null,
     active: form.elements.active.checked,
-    workplace_ids: Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value)),
   };
+  if (placesReady) payload.workplace_ids = picker.selected;
   if (first && last) Object.assign(payload, { first_name: first, last_name: last });
   setBusy(true); status('Сохраняем данные…');
   try {
     current = await api(`/api/employees/${employeeId}`, { method: 'PUT',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    updateSummary(); status('Данные сохранены.'); $('reload-conflict').hidden = true;
+    // A metadata save must not discard a separately staged photo edit.
+    photos.setAccepted(current.faces, true);
+    picker.existing = new Set(current.workplaces.map((place) => place.id));
+    picker.render(picker.selected);
+    updateSummary(); status('Данные сохранены.'); revisionConflict.clear();
   } catch (error) { status(error.message + ' Черновик оставлен без изменений.', error); }
   finally { setBusy(false); }
-};
-function renderFaces() {
-  if (!current) return;
-  $('faces-count').textContent = `· принято ${current.faces_count}/15 · в черновике ${kept.size} сохранённых + ${staged.length} новых`;
-  const entries = [
-    ...current.faces.filter((face) => kept.has(face.id)).map((face) => ({ face, url: face.thumbnail_url, label: `Фотография ${face.id}` })),
-    ...staged.map((entry) => ({ ...entry, label: entry.file.name })),
-  ];
-  $('faces-grid').replaceChildren(...entries.map((entry) => {
-    const cell = document.createElement('div'); cell.className = 'face-cell';
-    const image = document.createElement('img'); image.src = entry.url; image.alt = entry.label;
-    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn';
-    remove.textContent = 'Убрать'; remove.setAttribute('aria-label', `Убрать: ${entry.label}`); remove.disabled = busy;
-    remove.onclick = () => {
-      if (entry.face) kept.delete(entry.face.id);
-      else { URL.revokeObjectURL(entry.url); staged = staged.filter((item) => item.url !== entry.url); }
-      renderFaces(); $('file-input').focus();
-    };
-    cell.append(image, remove); return cell;
-  }));
-}
-$('file-input').onchange = () => {
-  const incoming = Array.from($('file-input').files);
-  if (kept.size + staged.length + incoming.length > 15) {
-    status('Максимум 15 фото в итоговом наборе. Для замены сначала уберите прежнее фото из черновика.', null, true);
-  } else {
-    staged.push(...incoming.map((file) => ({ file, url: URL.createObjectURL(file) })));
-    renderFaces(); status('Файлы выбраны, но ещё не сохранены.', null, true);
-  }
-  $('file-input').value = '';
-};
-$('save-photos').onclick = async () => {
+});
+$('save-photos').addEventListener('click', async () => {
   if (busy || !current) return;
-  const count = kept.size + staged.length;
-  if (count < 1 || count > 15) { status('В итоговом наборе должно быть 1–15 фотографий.', null, true); return; }
+  if (photos.total < 1 || photos.total > 15) {
+    status('В итоговом наборе должно быть 1–15 фотографий.', new Error(), true); return;
+  }
   const body = new FormData();
-  body.append('metadata', JSON.stringify({ expected_revision: current.revision, keep_face_ids: [...kept] }));
-  staged.forEach((entry) => body.append('files', entry.file));
+  body.append('metadata', JSON.stringify({ expected_revision: current.revision, keep_face_ids: [...photos.kept] }));
+  photos.files.forEach((file) => body.append('files', file));
   setBusy(true); status('Проверяем весь набор фотографий…', null, true);
   try {
     current = await api(`/api/employees/${employeeId}/faces`, { method: 'PUT', body });
-    staged.forEach((entry) => URL.revokeObjectURL(entry.url)); staged = [];
-    kept = new Set(current.faces.map((face) => face.id));
-    renderFaces(); updateSummary(); status('Фотографии сохранены одним набором.', null, true);
-    $('reload-conflict').hidden = true;
-  } catch (error) { status(error.message + ' Прежние фотографии и черновик не изменены.', error, true); }
-  finally { setBusy(false); }
-};
-$('cancel-photos').onclick = () => {
+    photos.setAccepted(current.faces);
+    updateSummary(); status('Фотографии сохранены одним набором.', null, true); revisionConflict.clear();
+  } catch (error) {
+    photos.setErrors(error.detail);
+    status(error.message + ' Прежние фотографии и черновик не изменены.', error, true);
+  } finally { setBusy(false); }
+});
+$('cancel-photos').addEventListener('click', () => {
   if (!current || busy) return;
-  staged.forEach((entry) => URL.revokeObjectURL(entry.url)); staged = [];
-  kept = new Set(current.faces.map((face) => face.id)); renderFaces();
-  status('Изменения фотографий отменены.', null, true);
-};
-$('reload-conflict').onclick = () => { if (!busy) loadEmployee(Boolean(current)); };
-$('btn-workplace').onclick = () => { $('workplace-error').textContent = ''; $('workplace-dialog').showModal(); };
-$('workplace-cancel').onclick = () => $('workplace-dialog').close();
-$('workplace-dialog').addEventListener('close', () => $('btn-workplace').focus());
-$('workplace-form').onsubmit = async (event) => {
-  event.preventDefault(); const placeForm = event.currentTarget;
-  const button = placeForm.querySelector('[type="submit"]'); button.disabled = true;
-  try {
-    const place = await api('/api/workplaces', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: placeForm.elements.name.value.trim() }) });
-    const selected = Array.from(form.elements.workplace_ids.selectedOptions, (option) => Number(option.value));
-    await fillPlaces([...selected, place.id]); placeForm.reset(); $('workplace-dialog').close();
-  } catch (error) { $('workplace-error').textContent = error.message; }
-  finally { button.disabled = false; }
-};
-window.addEventListener('pagehide', () => staged.forEach((entry) => URL.revokeObjectURL(entry.url)));
+  photos.reset(); status('Изменения фотографий отменены.', null, true); $('file-input').focus();
+});
+$('profile-retry').addEventListener('click', () => loadEmployee(Boolean(current)));
+$('places-retry').addEventListener('click', async () => {
+  if (busy || !current) return;
+  setBusy(true);
+  try { await loadPlaces(); }
+  finally { setBusy(false); }
+});
 
 // Work views use the server's explicit workplace offset, never browser-local time.
 const workOffsets = { work: 0, presence: 0 };
+const historySequence = { work: 0, presence: 0 };
 function fmtTime(iso) { return iso ? iso.replace('T', ' ') : '—'; }
 function workDuration(ms) {
   const seconds = Math.floor(Math.max(0, ms || 0) / 1000);
@@ -194,9 +170,11 @@ function historyPager(name, page) {
   target.append(count);
 }
 async function loadHistory(name) {
+  const sequence = ++historySequence[name];
   try {
     const path = name === 'work' ? '/api/attendance/sessions' : '/api/presence/legacy';
     const page = await api(`${path}?employee_id=${employeeId}&limit=50&offset=${workOffsets[name]}`);
+    if (sequence !== historySequence[name]) return;
     const target = $(`${name}-table`).querySelector('tbody');
     target.replaceChildren();
     $(`${name}-empty`).hidden = page.items.length > 0;
@@ -215,6 +193,7 @@ async function loadHistory(name) {
     }
     historyPager(name, page);
   } catch (error) {
+    if (sequence !== historySequence[name]) return;
     const message = $(`${name}-error`);
     message.textContent = `Не удалось загрузить историю. Повторите: ${error.message}`;
     message.hidden = false;

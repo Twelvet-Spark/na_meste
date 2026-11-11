@@ -10,26 +10,27 @@
   <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
-  <div class="bg-decor" aria-hidden="true">
-    <span class="blob blob-a"></span>
-    <span class="blob blob-b"></span>
-    <span class="blob blob-c"></span>
-  </div>
-
+  <a class="skip-link" href="#main-content">Перейти к содержимому</a>
   <header class="topbar">
-    <nav class="nav">
-      <a href="/" class="nav-link {{ 'active' if active_page == 'cameras' else '' }}">Камеры</a>
-      <a href="/employees" class="nav-link {{ 'active' if active_page == 'employees' else '' }}">Сотрудники</a>
-      <a href="/presence" class="nav-link {{ 'active' if active_page == 'presence' else '' }}">Рабочее время</a>
-      <a href="/global" class="nav-link {{ 'active' if active_page == 'global' else '' }}">Люди</a>
+    <a class="mobile-brand" href="/">На месте</a>
+    <button id="nav-toggle" type="button" class="btn nav-toggle" aria-expanded="false" aria-controls="app-nav">Меню</button>
+    <nav id="app-nav" class="nav" aria-label="Основная навигация">
+      <a class="app-brand" href="/">На месте</a>
+      <a href="/" class="nav-link {{ 'active' if active_page == 'cameras' else '' }}"{% if active_page == 'cameras' %} aria-current="page"{% endif %}>Камеры</a>
+      <a href="/employees" class="nav-link {{ 'active' if active_page == 'employees' else '' }}"{% if active_page == 'employees' %} aria-current="page"{% endif %}>Сотрудники</a>
+      <a href="/presence" class="nav-link {{ 'active' if active_page == 'presence' else '' }}"{% if active_page == 'presence' %} aria-current="page"{% endif %}>Рабочее время</a>
+      <div class="nav-secondary">
+        <a href="/global" class="nav-link {{ 'active' if active_page == 'global' else '' }}"{% if active_page == 'global' %} aria-current="page"{% endif %}>Архив наблюдений</a>
+      </div>
     </nav>
     <div class="topbar-right">
       {% block topbar_right %}{% endblock %}
     </div>
   </header>
-
-  {% block content %}{% endblock %}
-
+  <div id="main-content" class="app-content" tabindex="-1">
+    {% block content %}{% endblock %}
+  </div>
+  <script src="/static/js/ui.js"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
