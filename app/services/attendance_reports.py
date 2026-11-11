@@ -135,9 +135,12 @@ def build_report(db: Session, from_date: date, to_date: date, employee_id: int |
         start = milliseconds(session.started_at)
         end = min(milliseconds(session.ended_at) if session.ended_at is not None else as_of, as_of)
         evaluated[session.employee_id].append((session, view, start, end))
-        for blocker in applicable:
-            if overlaps(start, end, blocker, open_end=session.ended_at is None):
-                relevant_keys.add(blocker.key)
+        # Midnight closures also load for last_exit metadata. Only a candidate
+        # span with actual report overlap can propagate its out-of-range faults.
+        if max(start, lower) < min(end, upper):
+            for blocker in applicable:
+                if overlaps(start, end, blocker, open_end=session.ended_at is None):
+                    relevant_keys.add(blocker.key)
 
     employee_events = defaultdict(list)
     for item in events:

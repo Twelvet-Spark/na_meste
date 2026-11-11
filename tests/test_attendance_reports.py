@@ -520,6 +520,27 @@ def test_exit_at_midnight_is_reported_on_new_day_even_with_no_duration_there():
 
 
 @test
+def test_midnight_exit_metadata_does_not_carry_previous_days_finite_gap_into_report():
+    with database(commissioned=True) as (engine, service):
+        manual(service, "ENTRY", datetime(2026, 11, 11, 18))
+        manual(service, "EXIT", datetime(2026, 11, 11, 19))
+        gap(engine, datetime(2026, 11, 11, 18, 15), datetime(2026, 11, 11, 18, 20))
+        previous = report(engine)
+        assert row(previous)["review_ms"] == 3_600_000
+        assert previous["unreviewed_gaps"] == 1 and not previous["finalizable"]
+
+        following = report(engine, NEXT, NEXT)
+        item = row(following, "2026-11-12")
+        assert item["last_exit"] == "2026-11-12T00:00:00+05:00"
+        assert item["first_entry"] is None and item["visit_count"] == 0
+        assert item["confirmed_ms"] == item["running_ms"] == item["review_ms"] == 0
+        assert item["pending_count"] == 0 and item["coverage_reasons"] == []
+        assert item["status"] == "CONFIRMED"
+        assert following["unreviewed_gaps"] == following["unresolved_crossings"] == 0
+        assert following["finalizable"]
+
+
+@test
 def test_simultaneous_events_make_no_visits_or_duration_until_voided():
     with database(commissioned=True) as (engine, service):
         manual(service, "ENTRY", BASE)
