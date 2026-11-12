@@ -260,3 +260,4 @@ class SegmentRecorder:
             connection = db.get(RecordingConnection, self.connection_id)
             if connection.closed_at is None:
                 connection.closed_at = self.now()
+        self.storage.reclaim_connection_index(self.connection_id)

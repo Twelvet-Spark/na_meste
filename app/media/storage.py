@@ -214,12 +214,22 @@ class RecordingStorage:
             row = db.get(RecordingSegment, segment_id)
             row.state = "EXPIRED"
             connection_id = row.connection_id
-        with Session(self.engine) as db:
-            connection = db.get(RecordingConnection, connection_id)
-            remaining = db.query(RecordingSegment.id).filter(
-                RecordingSegment.connection_id == connection_id, RecordingSegment.state != "EXPIRED").first()
-            csv_key = f"{connection.directory}/closed.csv" if connection.closed_at and not remaining else None
-        if csv_key:
+        self.reclaim_connection_index(connection_id)
+
+    def reclaim_connection_index(self, connection_id):
+        """A finalized CSV is disposable only after every original has expired."""
+        with self.lock:
+            with Session(self.engine) as db:
+                connection = db.get(RecordingConnection, connection_id)
+                if connection is None or connection.closed_at is None:
+                    return
+                remaining = db.query(RecordingSegment.id).filter(
+                    RecordingSegment.connection_id == connection_id, RecordingSegment.state != "EXPIRED").first()
+                if remaining:
+                    return
+                csv_key = f"{connection.directory}/closed.csv"
+            if csv_key in self.leases or csv_key in self.open_keys:
+                return
             try:
                 self.path(csv_key).unlink()
             except (OSError, ValueError):

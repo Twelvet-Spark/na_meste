@@ -648,6 +648,31 @@ def test_expiration_respects_lease_then_keeps_expired_metadata():
 
 
 @test
+def test_last_segment_expiring_before_connection_closes_reclaims_owned_index():
+    with rig(policy={"recording_min_free_bytes": 0}) as r:
+        saved = start(r)
+        process = eventually(lambda: r.factory.processes and r.factory.processes[-1])
+        path = process.appear(duration=60)
+        eventually(lambda: rows(r.engine, "recording_segments"))
+        process.close_segment(start=17, end=77)
+        segment = eventually(lambda: next((row for row in rows(r.engine, "recording_segments")
+                                          if row["state"] == "READY"), None))
+        csv_path = path.parent / "closed.csv"
+        assert csv_path.exists()
+        assert rows(r.engine, "recording_connections")[0]["closed_at"] is None
+        storage = r.manager.storage
+        with storage.lock:
+            storage.max_bytes = 256 * 1024 * 1024 + csv_path.stat().st_size + 1
+            storage.enforce()
+            assert not path.exists()
+            assert rows(r.engine, "recording_segments")[0]["state"] == "EXPIRED"
+            assert csv_path.exists(), "An active connection still owns its CSV writer"
+        r.manager.stop(saved["id"])
+        assert not csv_path.exists(), "Finalization must reclaim an already-expired connection index"
+        assert rows(r.engine, "recording_segments")[0]["id"] == segment["id"]
+
+
+@test
 def test_retention_marks_deleting_before_unlink_and_restart_completes_it():
     with rig() as r:
         _saved, segment, path = ready_segment(r)
