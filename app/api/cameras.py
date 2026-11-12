@@ -161,8 +161,15 @@ def api_discover(
             raise HTTPException(404, "Camera not found")
     db.rollback()
     if not payload.password and not source:
-        return {"channels": [], "capabilities": {"channel_titles": False}, "error_code": "DEVICE_AUTH_FAILED"}
-    return _setup(request).discover(payload, source=source)
+        result = {"channels": [], "capabilities": {"channel_titles": False}, "error_code": "DEVICE_AUTH_FAILED"}
+    else:
+        result = _setup(request).discover(payload, source=source)
+    diagnostics = getattr(request.app.state, "diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.archive_result(camera_id=payload.camera_id,
+                                   channel_titles=result["capabilities"]["channel_titles"],
+                                   error_code=result["error_code"])
+    return result
 
 
 @router.post("/batch", status_code=201, dependencies=[Depends(require_operator_request)])

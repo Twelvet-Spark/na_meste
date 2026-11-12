@@ -1,10 +1,13 @@
-"""Конфигурация приложения (читается из .env в корне проекта)."""
+"""Deployment settings plus validated next-start operator overrides."""
 import os
 import shutil
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, field_validator
+from typing import Literal
+
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from app.operator_settings import normalize_camera_ids, read_document, settings_path, OverrideError
 
 # Корень проекта — папка, в которой лежит main.py
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -15,21 +18,27 @@ class Settings(BaseSettings):
         env_file=str(BASE_DIR / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,
+                                   dotenv_settings, file_secret_settings):
+        return env_settings, init_settings, dotenv_settings, file_secret_settings
 
     app_host: str = "0.0.0.0"
     app_port: int = 8000
 
     database_url: str = "sqlite:///./data/app.db"
 
-    rtsp_connect_timeout: int = 10          # сек, таймаут подключения к RTSP
-    rtsp_reconnect_max_delay: int = 30      # сек, потолок exponential backoff
+    rtsp_connect_timeout: int = Field(default=10, ge=1, le=60)
+    rtsp_reconnect_max_delay: int = Field(default=30, ge=1, le=300)
     default_rtsp_port: int = 554
 
     ffmpeg_path: str = ""                   # пусто — автоопределение
-    preview_fps: int = 10                   # ограничение FPS MJPEG-превью
+    preview_fps: int = Field(default=10, ge=1, le=30)
     frame_buffer_size: int = 2              # буфер кадров (drop old, keep latest)
-    frame_stall_timeout: int = 10           # сек без кадров → принудительный реконнект
+    frame_stall_timeout: int = Field(default=10, ge=1, le=120)
 
     # Manual video only. Deployment paths/reserve are not operator-editable.
     recording_root: Path = BASE_DIR / "data" / "recordings"
@@ -44,9 +53,9 @@ class Settings(BaseSettings):
 
     # --- AI (детекция людей, трекинг, распознавание лиц) ---
     ai_enabled: bool = True
-    ai_fps: float = 5.0                     # кадров/сек на камеру для AI (превью не ограничивается)
-    ai_cameras: str = ""                    # "1,3,5" — пусто = все камеры
-    ai_device: str = "auto"                 # auto | cpu | cuda
+    ai_fps: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False)
+    ai_cameras: str = ""                    # canonical sorted IDs; empty = all cameras
+    ai_device: Literal["auto", "cpu", "cuda"] = "auto"
     person_confidence: float = 0.35         # порог YOLO для человека
     tracker_new_track_threshold: float = 0.5  # score детекции, создающей НОВЫЙ трек
                                               # (ниже — детекция только продлевает существующий)
@@ -80,7 +89,7 @@ class Settings(BaseSettings):
 
     # --- Telegram ---
     telegram_enabled: bool = True
-    telegram_bot_token: str = ""
+    telegram_bot_token: str = Field(default="", repr=False)
     telegram_chat_id: str = ""              # пусто — авто-определение по /start в группе
     telegram_notify_presence: bool = True   # сотрудник пришёл / ушёл
     telegram_notify_global_transition: bool = True  # человек перешёл между камерами (с фото)
@@ -105,20 +114,35 @@ class Settings(BaseSettings):
     w_aspect: float = 0.05
     w_face: float = 0.10
 
+    @field_validator("ai_cameras", mode="before")
+    @classmethod
+    def validate_camera_ids(cls, value):
+        return normalize_camera_ids(value)
+
+    @model_validator(mode="after")
+    def attendance_window(self):
+        if self.attendance_face_interval > self.attendance_face_window:
+            raise ValueError("ATTENDANCE_INTERVAL_EXCEEDS_WINDOW")
+        return self
+
     def ai_camera_ids(self) -> set[int] | None:
         """Идентификаторы камер для AI; None = все."""
-        raw = self.ai_cameras.strip()
-        if not raw:
-            return None
-        ids = set()
-        for part in raw.replace(";", ",").split(","):
-            part = part.strip()
-            if part.isdigit():
-                ids.add(int(part))
-        return ids or None
+        return {int(part) for part in self.ai_cameras.split(",")} if self.ai_cameras else None
 
 
-settings = Settings()
+def load_settings(*, path=None, env_file=BASE_DIR / ".env"):
+    values, _version = read_document(settings_path() if path is None else path, Settings)
+    try:
+        return Settings(_env_file=env_file, **values)
+    except Exception:
+        # Pydantic errors can contain complete secret-bearing inputs. Startup must
+        # fail before service initialization, with no chained validation traceback.
+        raise OverrideError(
+            "OPERATOR_SETTINGS_INVALID_EFFECTIVE_CONFIG: проверьте окружение, JSON и .env"
+        ) from None
+
+
+settings = load_settings()
 
 
 def _exe(name: str) -> str:

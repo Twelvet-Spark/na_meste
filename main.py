@@ -25,6 +25,8 @@ from app.api.workplaces import router as workplaces_router
 from app.api.global_persons import router as global_persons_router
 from app.api.presence import router as presence_router
 from app.api.recordings import router as recordings_router
+from app.api.settings import router as settings_router
+from app.api.debug import router as debug_router
 from app.config import BASE_DIR, settings
 from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
@@ -37,12 +39,22 @@ from app.services.telegram_service import TelegramNotifier
 from app.media.process_guard import MediaProcessGuard
 from app.services.recording_service import RecordingManager
 from app.media.playback import PlaybackManager
+from app.services.settings_service import SettingsService
+from app.services.diagnostics_service import DiagnosticsService, SafeLogFilter
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 logger = logging.getLogger("app")
+
+# Sanitize before server handlers format messages/tracebacks. The support ring
+# separately projects codes and never retains a LogRecord or its exception context.
+_safe_log_filter = SafeLogFilter()
+for _log in (logging.getLogger(), logging.getLogger("uvicorn"),
+             logging.getLogger("uvicorn.error"), logging.getLogger("uvicorn.access")):
+    for _handler in _log.handlers:
+        _handler.addFilter(_safe_log_filter)
 
 
 @asynccontextmanager
@@ -52,6 +64,8 @@ async def lifespan(app: FastAPI):
     MediaProcessGuard.initialize()
     # Initialize persisted revisions before publishing any camera frames.
     init_db()
+    app.state.settings_service = SettingsService(settings, engine)
+    app.state.diagnostics = DiagnosticsService(app.state, engine, settings)
     app.state.manager = ReaderManager()
     app.state.recordings = None
     app.state.recording_error = None
@@ -147,6 +161,8 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Приложение запущено: http://localhost:%d (API docs: /docs)", settings.app_port
     )
+    diagnostic_logger = logging.getLogger("app")
+    diagnostic_logger.addHandler(app.state.diagnostics.ring)
     try:
         yield
     finally:
@@ -170,6 +186,8 @@ async def lifespan(app: FastAPI):
             app.state.telegram.stop()
         app.state.manager.stop_all()
         logger.info("Приложение остановлено")
+        diagnostic_logger.removeHandler(app.state.diagnostics.ring)
+        app.state.diagnostics.ring.close()
 
 
 app = FastAPI(title="Мониторинг", lifespan=lifespan)
@@ -184,6 +202,8 @@ app.include_router(presence_router)
 app.include_router(global_persons_router)
 app.include_router(attendance_router)
 app.include_router(recordings_router)
+app.include_router(settings_router)
+app.include_router(debug_router)
 
 
 @app.get("/", include_in_schema=False)
@@ -222,6 +242,18 @@ async def employee_page(request: Request, employee_id: int):
 @app.get("/recordings", include_in_schema=False)
 async def recordings_page(request: Request):
     return templates.TemplateResponse(request, "recordings.html", {})
+
+
+@app.get("/settings", include_in_schema=False)
+async def settings_page(request: Request):
+    return templates.TemplateResponse(request, "settings.html", {},
+                                      headers={"Cache-Control": "no-store"})
+
+
+@app.get("/debug", include_in_schema=False)
+async def debug_page(request: Request):
+    return templates.TemplateResponse(request, "debug.html", {},
+                                      headers={"Cache-Control": "no-store"})
 
 
 @app.get("/presence", include_in_schema=False)

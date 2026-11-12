@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% set active_page = 'settings' %}
+{% block title %}Настройки — На месте{% endblock %}
+{% block content %}
+<main class="container settings-workspace">
+  <header class="page-heading">
+    <div><h1>Настройки</h1><p class="muted">Изменения применятся только после обычного перезапуска приложения. Текущая работа камер и записи не прерывается при сохранении.</p></div>
+    <a class="btn" href="/debug">Открыть диагностику</a>
+  </header>
+  <p id="settings-connection" class="muted small" role="status" aria-live="polite">Загрузка настроек…</p>
+  <div id="settings-restart" class="request-notice" role="status" hidden>
+    <strong>Сохранено. Требуется перезапуск</strong>
+    <p>Попросите администратора выполнить обычный перезапуск приложения. Здесь нет команды перезапуска. Локальная запись после запуска сама не возобновляется.</p>
+  </div>
+  <section id="settings-diff-panel" class="panel" hidden aria-labelledby="settings-diff-heading">
+    <h2 id="settings-diff-heading">Сейчас и после перезапуска</h2>
+    <ul id="settings-diff" class="settings-diff"></ul>
+  </section>
+  <div id="settings-conflict" class="request-notice" hidden>
+    <p>На сервере появилась другая версия настроек. Ваш черновик и исходная версия сохранены в этой вкладке. Перед повторной отправкой сверьте изменения.</p>
+    <button type="button" class="btn" id="settings-review">Сверить с сервером</button>
+    <div id="settings-review-panel" hidden>
+      <ul id="settings-review-list" class="settings-diff"></ul>
+      <button type="button" class="btn" id="settings-rebase">Применить мой черновик к новой версии</button>
+    </div>
+  </div>
+  <form id="settings-form" autocomplete="off">
+    <fieldset id="settings-controls" class="plain-fieldset" disabled>
+      <section class="panel" aria-labelledby="streams-heading"><h2 id="streams-heading">Потоки и превью</h2><div id="settings-streams" class="settings-grid"></div></section>
+      <section class="panel" aria-labelledby="ai-heading">
+        <h2 id="ai-heading">Распознавание</h2>
+        <p class="muted">Отключение AI блокирует автоматический учёт рабочего времени. Пустой список камер означает все камеры; используйте существующие номера через запятую.</p>
+        <div id="settings-ai" class="settings-grid"></div>
+      </section>
+      <section class="panel" aria-labelledby="attendance-heading">
+        <h2 id="attendance-heading">Учёт рабочего времени</h2>
+        <p id="settings-offset" class="muted"></p>
+        <details><summary>Расширенные пороги распознавания</summary>
+          <p class="request-notice">Изменение порогов требует повторного ввода системы в эксплуатацию после перезапуска. Существующие отметки и исторические рабочие дни не пересчитываются.</p>
+          <div id="settings-attendance" class="settings-grid"></div>
+        </details>
+      </section>
+      <section class="panel" aria-labelledby="notifications-heading">
+        <h2 id="notifications-heading">Уведомления Telegram</h2>
+        <p class="muted">Токен не возвращается в браузер. Пустое поле оставляет его без изменений. Отправка тестовых сообщений здесь не выполняется.</p>
+        <div id="settings-notifications" class="settings-grid"></div>
+        <p id="settings-token-state" class="muted small"></p>
+        <button type="button" class="btn" id="settings-clear-token">Очистить токен после перезапуска</button>
+      </section>
+      <section class="panel" aria-labelledby="video-heading">
+        <h2 id="video-heading">Локальное видео</h2>
+        <p class="muted">Только ручная запись, максимум 24 часа за один запрос. Срок хранения может сократиться при заполнении лимита. Оригиналы и кеш просмотра учитываются вместе.</p>
+        <div id="settings-video" class="settings-grid"></div>
+        <p id="settings-reserve" class="muted small"></p>
+      </section>
+      <section class="panel" aria-labelledby="diagnostic-settings-heading"><h2 id="diagnostic-settings-heading">Отладочные сообщения</h2><div id="settings-diagnostics" class="settings-grid"></div></section>
+      <div class="settings-save panel">
+        <p class="muted">Поля с источником «Окружение» заблокированы администратором. «Сбросить переопределение» удаляет только выбранное значение из операторского файла, возвращая настройку развёртывания или значение по умолчанию.</p>
+        <div class="form-actions"><button class="btn primary" type="submit" id="settings-save">Сохранить для следующего запуска</button><button class="btn" type="button" id="settings-cancel">Отменить черновик</button></div>
+      </div>
+    </fieldset>
+  </form>
+  <p id="settings-message" class="form-status" role="status" aria-live="polite"></p>
+  <button type="button" class="btn" id="settings-retry" hidden>Повторить загрузку</button>
+  <section class="panel" aria-labelledby="workplaces-heading">
+    <div class="panel-head"><h2 id="workplaces-heading">Рабочие места</h2><button type="button" class="btn" id="workplace-add">Добавить рабочее место</button></div>
+    <p class="muted">Необязательные метки магазинов и офисов, не геозоны и не правила учёта. Архивирование не удаляет существующие связи с сотрудниками или историю.</p>
+    <ul id="settings-workplaces" class="settings-workplaces"></ul>
+    <p id="workplace-status" class="form-status" role="status" aria-live="polite">Загрузка рабочих мест…</p>
+    <button type="button" class="btn" id="workplace-retry" hidden>Повторить загрузку рабочих мест</button>
+  </section>
+  <dialog id="token-clear-dialog" class="modal">
+    <h2>Очистить токен Telegram?</h2><p>После сохранения и обычного перезапуска уведомления не смогут отправляться с этим токеном. Сейчас ничего не меняется.</p>
+    <div class="form-actions"><button class="btn" type="button" data-dialog-cancel>Отмена</button><button class="btn primary" type="button" id="token-clear-confirm">Добавить очистку в черновик</button></div>
+  </dialog>
+  <dialog id="workplace-dialog" class="modal">
+    <h2 id="workplace-dialog-heading">Рабочее место</h2>
+    <form id="workplace-form"><label class="field" for="workplace-name">Название<input id="workplace-name" maxlength="150" required autofocus></label>
+      <label class="setup-check"><input id="workplace-active" type="checkbox" checked><span>Активное — доступно для новых назначений сотрудникам</span></label>
+      <p id="workplace-dialog-status" class="form-status" role="status" aria-live="polite"></p>
+      <div class="form-actions"><button class="btn" type="button" data-dialog-cancel>Отмена</button><button class="btn primary" type="submit">Сохранить рабочее место</button></div>
+    </form>
+  </dialog>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/static/js/settings.js"></script>{% endblock %}

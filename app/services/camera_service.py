@@ -21,7 +21,7 @@ from app.database.models import (
     GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSession,
 )
 from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraSource
-from app.rtsp.dahua import build_rtsp_url, mask_url, normalize_host
+from app.rtsp.dahua import build_rtsp_url, normalize_host
 from app.rtsp.reader import parse_frame_rate
 from app.media.process_guard import MediaProcessGuard
 
@@ -220,13 +220,8 @@ def test_rtsp_connection(
         )
 
     if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", "replace").strip()
-        # подробности — только в лог, с маскировкой пароля
-        logger.warning(
-            "Проверка подключения не удалась (%s:%s ch%d): %s",
-            nvr_host, rtsp_port, channel,
-            mask_url(stderr.splitlines()[-1] if stderr else "unknown error"),
-        )
+        # External stderr may contain credentials outside a URL. Do not log it.
+        logger.warning("STREAM_UNAVAILABLE")
         return ConnectionTestResult(
             success=False, error="Unable to connect to RTSP stream."
         )

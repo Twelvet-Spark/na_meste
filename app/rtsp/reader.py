@@ -10,6 +10,7 @@ FrameBuffer дополнительно заберёт детектор прис�
 """
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -22,7 +23,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from app.rtsp.dahua import mask_url
+from app.services.diagnostics_service import number, safe_code
 from app.time_utils import utcnow
 from app.media.process_guard import MediaProcessGuard
 
@@ -212,8 +213,8 @@ class RTSPReader:
             return
         if not self._ffmpeg or not self._ffprobe:
             self._set_status(CameraStatus.ERROR)
-            self.last_error = "FFmpeg/ffprobe не найден — установите FFmpeg (см. README)"
-            logger.error("[%s] %s", self.name, self.last_error)
+            self.last_error = "FFMPEG_UNAVAILABLE"
+            logger.error("FFMPEG_UNAVAILABLE", extra={"camera_id": self.camera_id})
             return
 
         self._stop_event.clear()
@@ -274,12 +275,13 @@ class RTSPReader:
                 if self.last_frame_at else None
             ),
             "seconds_since_last_frame": seconds_since,
-            "current_fps": round(self.current_fps, 1) if self.current_fps else None,
-            "resolution": self.resolution,
-            "codec": self.codec,
-            "stream_fps": self.stream_fps,
-            "reconnect_count": self.reconnect_count,
-            "error": self.last_error,
+            "current_fps": number(round(self.current_fps, 1)) if self.current_fps is not None else None,
+            "resolution": self.resolution if isinstance(self.resolution, str) and (
+                re.fullmatch(r"[0-9]{1,5}x[0-9]{1,5}", self.resolution)) else None,
+            "codec": self.codec if self.codec in {"h264", "hevc", "mjpeg", "mpeg4", "vp8", "vp9", "av1"} else None,
+            "stream_fps": number(self.stream_fps),
+            "reconnect_count": number(self.reconnect_count, integer=True),
+            "error": safe_code(self.last_error, "STREAM_UNAVAILABLE") if self.last_error else None,
         }
 
     # ----------------------------------------------------------- внутреннее
@@ -289,7 +291,7 @@ class RTSPReader:
             self._status = status
 
     def _run(self) -> None:
-        logger.info("[%s] ридер запущен: %s", self.name, mask_url(self.rtsp_url))
+        logger.info("Camera #%d reader started", self.camera_id)
         backoff = Backoff(self._max_reconnect_delay)
         first_attempt = True
         while not self._stop_event.is_set():
@@ -305,6 +307,7 @@ class RTSPReader:
                 self.last_error = "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE" if (
                     getattr(exc, "detail", None) == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE"
                 ) else "STREAM_UNAVAILABLE"
+                logger.warning(self.last_error, extra={"camera_id": self.camera_id})
             if self._stop_event.is_set():
                 break
 
@@ -316,14 +319,14 @@ class RTSPReader:
             self._set_status(CameraStatus.RECONNECTING)
             self._attempt_started_mono = None  # ждём backoff — watchdog не активен
             logger.warning(
-                "[%s] соединение потеряно, повтор через %.0f сек (реконнект №%d)",
-                self.name, delay, self.reconnect_count,
+                "Camera #%d reconnect in %.0f seconds (attempt %d)",
+                self.camera_id, delay, self.reconnect_count,
             )
             if self._stop_event.wait(delay):
                 break
 
         self._set_status(CameraStatus.OFFLINE)
-        logger.info("[%s] ридер остановлен", self.name)
+        logger.info("Camera #%d reader stopped", self.camera_id)
 
     def _connect_and_read(self) -> bool:
         """Подключается к потоку и читает кадры до разрыва.
@@ -358,7 +361,7 @@ class RTSPReader:
         with self._proc_lock:
             if self._stop_event.is_set():
                 raise StopRequested()
-            logger.debug("[%s] ffmpeg: %s", self.name, " ".join(mask_url(c) for c in cmd))
+            logger.debug("Camera #%d launching live decoder", self.camera_id)
             MediaProcessGuard.require()
             proc = subprocess.Popen(
                 cmd,
@@ -434,9 +437,7 @@ class RTSPReader:
                 f"ffprobe: нет ответа за {self._connect_timeout + 5} сек"
             ) from exc
         if result.returncode != 0:
-            err = result.stderr.decode("utf-8", "replace").strip()
-            detail = err.splitlines()[-1] if err else "ffprobe завершился с ошибкой"
-            raise ConnectionLost(mask_url(detail))
+            raise ConnectionLost("STREAM_UNAVAILABLE")
         try:
             data = json.loads(result.stdout.decode("utf-8", "replace"))
             stream = data["streams"][0]
@@ -481,8 +482,8 @@ class RTSPReader:
                 last = self._last_frame_mono
                 if last is not None and time.monotonic() - last > self._stall_timeout:
                     logger.warning(
-                        "[%s] нет кадров %d сек — принудительный реконнект",
-                        self.name, self._stall_timeout,
+                        "Camera #%d frame stalled for %d seconds",
+                        self.camera_id, self._stall_timeout,
                     )
                     with self._proc_lock:
                         # чтение разблокируется по EOF → цикл реконнекта
@@ -491,8 +492,8 @@ class RTSPReader:
                 started = self._attempt_started_mono
                 if started is not None and time.monotonic() - started > first_frame_timeout:
                     logger.warning(
-                        "[%s] первый кадр не получен за %d сек — переподключение",
-                        self.name, first_frame_timeout,
+                        "Camera #%d first frame timeout after %d seconds",
+                        self.camera_id, first_frame_timeout,
                     )
                     with self._proc_lock:
                         self._terminate_process()
@@ -519,12 +520,12 @@ class RTSPReader:
 
     @staticmethod
     def _drain_stderr(pipe, sink: deque) -> None:
-        """Сливает stderr ffmpeg, сохраняя последние строки (с маскировкой пароля)."""
+        """Drain external stderr; only a safe code may enter the bounded buffer."""
         try:
             for raw in iter(pipe.readline, b""):
                 line = raw.decode("utf-8", "replace").strip()
                 if line:
-                    sink.append(mask_url(line))
+                    sink.append("STREAM_UNAVAILABLE")
         except Exception:
             pass
         finally:

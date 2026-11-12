@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set active_page = 'debug' %}
+{% block title %}Диагностика — На месте{% endblock %}
+{% block content %}
+<main class="container diagnostics-workspace">
+  <header class="page-heading"><div><h1>Диагностика</h1><p class="muted">Состояние текущего запуска. Ошибка одного модуля не скрывает остальные. Секреты, адреса потоков и аргументы процессов не включаются в отчёт.</p></div>
+    <div class="form-actions"><a class="btn" href="/settings">Настройки</a><a class="btn primary" href="/api/debug/export" download="operator-support.json">Скачать отчёт поддержки</a></div>
+  </header>
+  <div class="directory-summary"><p id="debug-updated" class="muted small" role="status" aria-live="polite">Загрузка состояния…</p><button type="button" id="debug-refresh" class="btn">Обновить сейчас</button></div>
+  <p id="debug-error" class="form-status" role="status" aria-live="polite"></p>
+  <section class="panel" aria-labelledby="debug-attendance-heading"><h2 id="debug-attendance-heading">Готовность учёта рабочего времени</h2>
+    <p id="debug-readiness">Загрузка…</p><ul id="debug-reasons" class="diagnostic-reasons"></ul>
+    <dl id="debug-attendance" class="attendance-facts"></dl>
+    <div id="debug-roles" class="diagnostic-rows"></div>
+    <a class="back-link" href="/presence">Рабочее время и ввод в эксплуатацию</a>
+  </section>
+  <section class="panel" aria-labelledby="debug-tools-heading"><h2 id="debug-tools-heading">Инструменты и модели AI</h2>
+    <dl id="debug-tools" class="attendance-facts"></dl><div id="debug-providers" class="diagnostic-rows"></div>
+    <p class="muted small">Перечислены только фактически загруженные провайдеры. Наличие CPU или CUDA само по себе не означает готовность автоматического учёта.</p>
+  </section>
+  <section class="panel" aria-labelledby="debug-cameras-heading"><h2 id="debug-cameras-heading">Камеры</h2>
+    <p id="debug-cameras-message" class="muted">Загрузка…</p><div id="debug-cameras" class="diagnostic-rows"></div>
+    <a class="back-link" href="/">Подключить или проверить камеру</a>
+  </section>
+  <section class="panel" aria-labelledby="debug-media-heading"><h2 id="debug-media-heading">Запись, процессы и хранилище</h2>
+    <p id="debug-media-message"></p><dl id="debug-storage" class="attendance-facts"></dl>
+    <div id="debug-sessions" class="diagnostic-rows"></div><div id="debug-processes" class="diagnostic-rows"></div>
+    <p class="muted small">Время локального видео — приблизительное серверное время записи. Квота может сокращать срок хранения; открытые и используемые файлы не удаляются.</p>
+    <a class="back-link" href="/recordings">Открыть записи</a>
+  </section>
+  <section class="panel" aria-labelledby="debug-archive-heading"><h2 id="debug-archive-heading">Последняя проверка архива Dahua</h2>
+    <dl id="debug-archive" class="attendance-facts"></dl>
+    <p class="muted small">Это результат последнего запроса текущего запуска, не постоянный мониторинг регистратора. Часовой пояс устройства подтверждается отдельно в настройках камеры.</p>
+  </section>
+  <section class="panel" aria-labelledby="debug-events-heading"><h2 id="debug-events-heading">Последние диагностические события</h2>
+    <p class="muted small">До 200 записей в памяти текущего запуска. Только безопасные коды и номера камер; произвольные сообщения исключены до сохранения в буфер.</p>
+    <p id="debug-events-status" class="muted" role="status" aria-live="polite">Загрузка…</p>
+    <ol id="debug-events" class="diagnostic-events"></ol>
+  </section>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/static/js/debug.js"></script>{% endblock %}

@@ -80,10 +80,19 @@ def get_playback_manager(request: Request):
 
 
 @router.get("/timeline")
-def timeline(camera_id: int = Query(gt=0), source: Literal["local", "dahua"] = Query(),
+def timeline(request: Request, camera_id: int = Query(gt=0), source: Literal["local", "dahua"] = Query(),
              start: str = Query(alias="from"), end: str = Query(alias="to"),
              manager=Depends(get_playback_manager)):
-    return manager.timeline(camera_id, source, start, end)
+    diagnostics = getattr(request.app.state, "diagnostics", None)
+    try:
+        result = manager.timeline(camera_id, source, start, end)
+    except HTTPException as exc:
+        if source == "dahua" and diagnostics is not None:
+            diagnostics.archive_result(camera_id=camera_id, search=False, error_code=exc.detail)
+        raise
+    if source == "dahua" and diagnostics is not None:
+        diagnostics.archive_result(camera_id=camera_id, search=True)
+    return result
 
 
 @router.post("/playbacks", status_code=202, dependencies=[Depends(require_operator_request)])
