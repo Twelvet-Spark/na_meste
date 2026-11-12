@@ -167,7 +167,7 @@ def initialize_attendance_schema(engine: Engine) -> None:
                 existing = _catalog(connection)
                 if "employees" not in existing:
                     operator_schema.create_legacy_employees(connection)
-                excluded = operator_schema.TABLES | operator_schema.FUTURE_TABLES | {"employees"}
+                excluded = operator_schema.TABLES | {"employees"}
                 for table in Base.metadata.sorted_tables:
                     if table.name not in excluded and table.name not in existing:
                         table.create(connection)

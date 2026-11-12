@@ -23,6 +23,7 @@ from app.database.models import (
 from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraSource
 from app.rtsp.dahua import build_rtsp_url, mask_url, normalize_host
 from app.rtsp.reader import parse_frame_rate
+from app.media.process_guard import MediaProcessGuard
 
 logger = logging.getLogger("app.services.cameras")
 
@@ -189,6 +190,10 @@ def test_rtsp_connection(
     Ошибки наружу отдаются generic-текстом: без пароля, без URL, без
     деталей stderr (они могут содержать URL с учётными данными).
     """
+    try:
+        MediaProcessGuard.require()
+    except HTTPException:
+        return ConnectionTestResult(success=False, error="MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE")
     if not ffprobe_path:
         return ConnectionTestResult(
             success=False, error="FFmpeg/ffprobe не найден на сервере"
@@ -208,7 +213,7 @@ def test_rtsp_connection(
         nvr_host, rtsp_port, channel, stream_type,
     )
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout + 5, close_fds=True)
     except subprocess.TimeoutExpired:
         return ConnectionTestResult(
             success=False, error="Unable to connect to RTSP stream (timeout)"
@@ -405,6 +410,7 @@ def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
     db.rollback()
     try:
         with immediate_session(bind) as writer:
+            from app.database.models import RecordingSession, RecordingSegment
             current = writer.get(Camera, camera_id)
             if current is None:
                 raise HTTPException(status_code=404, detail="Camera not found")
@@ -414,6 +420,8 @@ def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
             payload = case((func.json_valid(GlobalEvent.payload), GlobalEvent.payload), else_="{}")
             history = (
                 writer.query(PresenceSession.id).filter_by(camera_id=camera_id).first()
+                or writer.query(RecordingSession.id).filter_by(camera_id=camera_id).first()
+                or writer.query(RecordingSegment.id).filter_by(camera_id=camera_id).first()
                 or writer.query(AttendanceEvent.id).filter_by(camera_id=camera_id).first()
                 or writer.query(GlobalPerson.id).filter_by(last_camera_id=camera_id).first()
                 or writer.query(GlobalObservation.id).filter_by(camera_id=camera_id).first()

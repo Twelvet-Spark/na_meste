@@ -144,6 +144,7 @@ def test_complete_receipt_gets_new_connection_uuid_and_disconnect_clears():
         return seq
 
     with patch.object(value, "_probe", return_value=(2, 2, "h264", 15.0)), \
+            patch("app.media.process_guard.MediaProcessGuard.require"), \
             patch("app.rtsp.reader.subprocess.Popen", side_effect=lambda *a, **k: Process()), \
             patch.object(value.buffer, "put", side_effect=capture), \
             patch("app.rtsp.reader.time.monotonic", return_value=123.5), \

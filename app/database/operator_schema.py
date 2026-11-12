@@ -1,11 +1,11 @@
 """Frozen additive operator schemas; attendance's writer owns commit/backup.
 
 Validate each committed predecessor against its own DDL before upgrading.
-Recording/media tables are not installed by version 2.
+Recording metadata is installed explicitly by version 3, never via create_all.
 """
 from app.time_utils import utcnow
 
-VERSION = 2
+VERSION = 3
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -74,10 +74,66 @@ V2_TABLES = {
         FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
     )""",
 }
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES}
-TABLES = frozenset(V2_TABLES)
-FUTURE_TABLES = frozenset({"recording_sessions", "recording_segments",
-                           "recording_connections", "recording_gaps"})
+V3_TABLES = {
+    **V2_TABLES,
+    "recording_sessions": """CREATE TABLE recording_sessions (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        camera_id INTEGER NOT NULL,
+        camera_name VARCHAR(100) NOT NULL,
+        source_revision INTEGER NOT NULL,
+        requested_at DATETIME NOT NULL,
+        started_at DATETIME,
+        deadline_at DATETIME NOT NULL,
+        ended_at DATETIME,
+        status VARCHAR(20) NOT NULL CHECK (status IN ('STARTING','RECORDING','RECONNECTING','STOPPING','STOPPED','COMPLETED','FAILED','INTERRUPTED')),
+        reason_code VARCHAR(64),
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+    "recording_connections": """CREATE TABLE recording_connections (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        directory VARCHAR(200) NOT NULL UNIQUE,
+        source_revision INTEGER NOT NULL,
+        created_at DATETIME NOT NULL,
+        anchor_utc DATETIME,
+        media_origin_seconds FLOAT,
+        closed_at DATETIME,
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT
+    )""",
+    "recording_segments": """CREATE TABLE recording_segments (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        connection_id VARCHAR(36) NOT NULL,
+        camera_id INTEGER NOT NULL,
+        source_revision INTEGER NOT NULL,
+        storage_key VARCHAR(250) NOT NULL UNIQUE,
+        started_at DATETIME,
+        ended_at DATETIME,
+        duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        bytes INTEGER NOT NULL DEFAULT 0 CHECK (bytes >= 0),
+        codec VARCHAR(32),
+        state VARCHAR(20) NOT NULL CHECK (state IN ('READY','EXPIRED','MISSING','CORRUPT','DELETING','UNINDEXED')),
+        CHECK (state != 'READY' OR (started_at IS NOT NULL AND ended_at IS NOT NULL AND duration_ms > 0)),
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT,
+        FOREIGN KEY(connection_id) REFERENCES recording_connections (id) ON DELETE RESTRICT,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+    "recording_gaps": """CREATE TABLE recording_gaps (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        started_at DATETIME NOT NULL,
+        ended_at DATETIME,
+        reason_code VARCHAR(64) NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT
+    )""",
+}
+V3_INDEXES = {
+    "uq_recording_active_camera": """CREATE UNIQUE INDEX uq_recording_active_camera
+        ON recording_sessions (camera_id)
+        WHERE status IN ('STARTING','RECORDING','RECONNECTING','STOPPING')""",
+}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES}
+TABLES = frozenset(V3_TABLES)
 
 
 def _refuse(detail):
@@ -89,7 +145,7 @@ def preflight(connection):
 
     catalog = _catalog(connection)
     owned = {name for name, (_kind, _sql, table) in catalog.items()
-             if table in TABLES | FUTURE_TABLES or name.startswith("operator_")}
+             if table in TABLES or name.startswith("operator_")}
     installed = 0
     if owned:
         if "operator_schema" not in catalog:
@@ -102,12 +158,17 @@ def preflight(connection):
             raise _refuse("unknown or uncommitted version")
         installed = versions[0][1]
         expected_tables = SCHEMAS[installed]
-        if owned != set(expected_tables):
+        expected_indexes = V3_INDEXES if installed == 3 else {}
+        if owned != set(expected_tables) | set(expected_indexes):
             raise _refuse("partial or unexpected operator objects")
         for name, expected in expected_tables.items():
             stored = catalog.get(name)
             if stored is None or stored[0] != "table" or _sql_key(stored[1] or "") != _sql_key(expected):
                 raise _refuse(f"table {name} differs from committed version {installed}")
+        for name, expected in expected_indexes.items():
+            stored = catalog.get(name)
+            if stored is None or stored[0] != "index" or _sql_key(stored[1] or "") != _sql_key(expected):
+                raise _refuse(f"index {name} differs from committed version {installed}")
     employee = catalog.get("employees")
     if employee is None:
         if installed:
@@ -142,3 +203,12 @@ def install(connection, installed=0):
         connection.exec_driver_sql(V2_TABLES["camera_archives"])
         connection.exec_driver_sql(
             "UPDATE operator_schema SET version=2,updated_at=? WHERE id=1", (utcnow(),))
+        installed = 2
+    if installed == 2:
+        for name, ddl in V3_TABLES.items():
+            if name not in V2_TABLES:
+                connection.exec_driver_sql(ddl)
+        for ddl in V3_INDEXES.values():
+            connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql(
+            "UPDATE operator_schema SET version=3,updated_at=? WHERE id=1", (utcnow(),))

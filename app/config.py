@@ -3,7 +3,7 @@ import os
 import shutil
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Корень проекта — папка, в которой лежит main.py
@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     preview_fps: int = 10                   # ограничение FPS MJPEG-превью
     frame_buffer_size: int = 2              # буфер кадров (drop old, keep latest)
     frame_stall_timeout: int = 10           # сек без кадров → принудительный реконнект
+
+    # Manual video only. Deployment paths/reserve are not operator-editable.
+    recording_root: Path = BASE_DIR / "data" / "recordings"
+    recording_retention_days: int = Field(default=14, ge=1, le=365)
+    recording_max_bytes: int = Field(default=150000000000, ge=10000000000, le=100000000000000)
+    recording_min_free_bytes: int = Field(default=2000000000, ge=0)
+
+    @field_validator("recording_root", mode="after")
+    @classmethod
+    def resolve_recording_root(cls, value: Path) -> Path:
+        return value if value.is_absolute() else BASE_DIR / value
 
     # --- AI (детекция людей, трекинг, распознавание лиц) ---
     ai_enabled: bool = True

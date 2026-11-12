@@ -12,7 +12,7 @@
     <header class="camera-page-heading">
       <a class="back-link" href="/">Все камеры</a>
       <h1 id="camera-title">Камера</h1>
-      <nav class="profile-sections" aria-label="Разделы камеры"><a href="#camera-live">Живое видео</a><a href="#camera-archive">Архив регистратора</a><a href="#calibration-heading">Учёт и разметка</a></nav>
+      <nav class="profile-sections" aria-label="Разделы камеры"><a href="#camera-live">Живое видео</a><a href="#camera-recording">Локальная запись</a><a href="#camera-archive">Архив регистратора</a><a href="#calibration-heading">Учёт и разметка</a></nav>
       <p id="camera-connection" class="muted"></p>
     </header>
     <section id="camera-live" class="video-panel" aria-label="Живое видео">
@@ -38,6 +38,33 @@
       </dl>
       <p class="muted small">RTSP → FFmpeg → MJPEG + AI (YOLO → трекинг → лица). Статус обновляется каждые 2 сек.</p>
     </aside>
+
+    <section id="camera-recording" class="panel calibration-panel" aria-labelledby="recording-heading">
+      <div class="panel-head"><h2 id="recording-heading">Локальная запись</h2></div>
+      <p class="muted">Только по вашему запросу, до 24 часов. Сохраняется видео без звука; расписания и автоматического возобновления нет.</p>
+      <p class="muted small">Время записи — приблизительное серверное время, не время экспозиции камеры и не доказательство отметок рабочего времени. Границы фрагментов зависят от ключевых кадров.</p>
+      <p id="recording-state" role="status" aria-live="polite">Загрузка состояния записи…</p>
+      <dl class="stats">
+        <div><dt>Начало</dt><dd id="recording-started">—</dd></div>
+        <div><dt>Прошло</dt><dd id="recording-elapsed">—</dd></div>
+        <div><dt>Остановка не позднее</dt><dd id="recording-deadline">—</dd></div>
+        <div><dt>Сохранено</dt><dd id="recording-bytes">—</dd></div>
+        <div><dt>Самая ранняя доступная запись</dt><dd id="recording-oldest">—</dd></div>
+      </dl>
+      <p id="recording-policy" class="muted">Загрузка политики хранения…</p>
+      <form id="recording-form">
+        <label class="field" for="recording-duration">Длительность, минуты (1–1440)
+          <input id="recording-duration" name="duration" type="number" min="1" max="1440" step="1" value="1440" required>
+        </label>
+        <label class="setup-check"><input id="recording-consent" type="checkbox" required>Подтверждаю политику хранения: старые записи удаляются автоматически, а при нехватке места запись остановится.</label>
+        <div class="calibration-actions"><button id="recording-start" class="btn primary" type="submit" disabled>Начать запись</button></div>
+      </form>
+      <div class="calibration-actions">
+        <button id="recording-stop" class="btn danger" type="button" disabled>Остановить запись</button>
+        <button id="recording-retry" class="btn" type="button" hidden>Обновить состояние</button>
+      </div>
+      <p id="recording-message" class="form-status" role="status" aria-live="polite"></p>
+    </section>
 
     <section id="camera-archive" class="panel calibration-panel" aria-labelledby="camera-archive-heading">
       <div class="panel-head"><h2 id="camera-archive-heading">Архив регистратора</h2></div>
@@ -101,4 +128,5 @@
   <script>window.CAMERA_ID = {{ camera_id }};</script>
   <script src="/static/js/camera_setup.js"></script>
   <script src="/static/js/camera.js"></script>
+  <script src="/static/js/camera_recording.js"></script>
 {% endblock %}

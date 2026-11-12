@@ -11,7 +11,7 @@ import threading
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -24,6 +24,7 @@ from app.api.employees import router as employees_router
 from app.api.workplaces import router as workplaces_router
 from app.api.global_persons import router as global_persons_router
 from app.api.presence import router as presence_router
+from app.api.recordings import router as recordings_router
 from app.config import BASE_DIR, settings
 from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
@@ -33,6 +34,8 @@ from app.services.attendance_service import AttendanceService
 from app.services.attendance_monitor import AttendanceMonitor
 from app.time_utils import utcnow
 from app.services.telegram_service import TelegramNotifier
+from app.media.process_guard import MediaProcessGuard
+from app.services.recording_service import RecordingManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,9 +46,23 @@ logger = logging.getLogger("app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Self-containing job must precede even incumbent live-reader/probe children.
+    # Its sole handle intentionally survives lifespan teardown until process death.
+    MediaProcessGuard.initialize()
     # Initialize persisted revisions before publishing any camera frames.
     init_db()
     app.state.manager = ReaderManager()
+    app.state.recordings = None
+    app.state.recording_error = None
+    try:
+        app.state.recordings = RecordingManager(
+            engine, settings.recording_root, app.state.manager.ffmpeg, app.state.manager.ffprobe)
+    except HTTPException as exc:
+        app.state.recording_error = exc.detail
+        logger.warning("Manual recording unavailable: %s", exc.detail)
+    except Exception:
+        app.state.recording_error = "MEDIA_STORAGE_UNAVAILABLE"
+        logger.warning("Manual recording unavailable: MEDIA_STORAGE_UNAVAILABLE")
 
     # --- Telegram-уведомления ---
     app.state.telegram = None
@@ -123,6 +140,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Independent media stops first; preserve the existing evidence-drain order below.
+        if app.state.recordings is not None:
+            try:
+                app.state.recordings.shutdown()
+            except Exception:
+                logger.warning("Manual recording shutdown incomplete: MEDIA_STOP_PENDING")
         # Join the sole producer first, then drain/persist its evidence and durable
         # stop timestamp before stopping readers or notification delivery.
         if app.state.ai_worker is not None:
@@ -145,6 +168,7 @@ app.include_router(workplaces_router)
 app.include_router(presence_router)
 app.include_router(global_persons_router)
 app.include_router(attendance_router)
+app.include_router(recordings_router)
 
 
 @app.get("/", include_in_schema=False)

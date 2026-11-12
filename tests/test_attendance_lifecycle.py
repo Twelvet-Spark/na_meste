@@ -822,6 +822,8 @@ def test_lifespan_restores_enabled_frozen_sources_and_keeps_manual_access_when_a
         # initialized fixture, camera process/thread launch and real model loading.
         with patch.object(main, "init_db"), patch.object(main, "SessionLocal", factory), \
                 patch.object(main, "engine", engine), \
+                patch.object(settings, "recording_root", Path(engine.url.database).parent / "recordings"), \
+                patch("app.media.process_guard.MediaProcessGuard.initialize", return_value=True), \
                 patch.object(main, "build_enroll_engine", return_value=None), \
                 patch.object(settings, "ai_enabled", False), \
                 patch.object(settings, "telegram_enabled", False), \
@@ -1088,6 +1090,8 @@ def test_lifespan_model_initialization_exception_keeps_real_manual_accounting_av
 
         with patch.object(main, "init_db"), patch.object(main, "engine", engine), \
                 patch.object(main, "SessionLocal", sessionmaker(bind=engine)), \
+                patch.object(settings, "recording_root", Path(engine.url.database).parent / "recordings"), \
+                patch("app.media.process_guard.MediaProcessGuard.initialize", return_value=True), \
                 patch.object(main, "build_enroll_engine", return_value=None), \
                 patch.object(main, "build_ai_worker", side_effect=RuntimeError("ONNX provider load failed")), \
                 patch.object(settings, "ai_enabled", True), \

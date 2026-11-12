@@ -1,4 +1,4 @@
-"""Additive operator-v1/v2 storage contracts; controller executes RED/GREEN.
+"""Additive operator-v1/v2/v3 storage contracts; controller executes RED/GREEN.
 
 Run: .venv/Scripts/python.exe tests/test_operator_storage.py
 All databases and backups are temporary. Legacy employees use pinned old DDL,
@@ -46,8 +46,9 @@ ATTENDANCE_TABLES = frozenset({
     "attendance_commissions", "attendance_requests",
 })
 OPERATOR_V1_TABLES = {"operator_schema", "workplaces", "employee_workplaces", "operator_requests"}
-OPERATOR_TABLES = OPERATOR_V1_TABLES | {"camera_archives"}
-FUTURE_TABLES = {"recording_sessions", "recording_segments", "recording_connections", "recording_gaps"}
+OPERATOR_V2_TABLES = OPERATOR_V1_TABLES | {"camera_archives"}
+MEDIA_TABLES = {"recording_sessions", "recording_segments", "recording_connections", "recording_gaps"}
+OPERATOR_TABLES = OPERATOR_V2_TABLES | MEDIA_TABLES
 STAMP = datetime(2026, 11, 11, 4, 5, 6, 123456)
 
 # Genuine committed-v1 fixtures are pinned independently of the implementation
@@ -85,6 +86,17 @@ COMMITTED_V1_TABLE_DDL = (
         created_at DATETIME NOT NULL
     )""",
 )
+
+# Pinned predecessor: never obtain v2 fixtures by running the latest initializer.
+COMMITTED_V2_ARCHIVE_DDL = """CREATE TABLE camera_archives (
+    camera_id INTEGER NOT NULL PRIMARY KEY,
+    http_scheme VARCHAR(5) NOT NULL CHECK (http_scheme IN ('http', 'https')),
+    http_port INTEGER NOT NULL CHECK (http_port BETWEEN 1 AND 65535),
+    utc_offset_minutes INTEGER NOT NULL CHECK (utc_offset_minutes BETWEEN -720 AND 840),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    updated_at DATETIME NOT NULL,
+    FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+)"""
 
 
 def test(fn):
@@ -165,6 +177,16 @@ def committed_v1(engine, *, populated=True):
                 "VALUES ('old-request','employee.create',?, '{\"id\":41}',?)", ("a" * 64, STAMP))
 
 
+def committed_v2(engine, *, populated=True):
+    committed_v1(engine, populated=populated)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(COMMITTED_V2_ARCHIVE_DDL)
+        connection.exec_driver_sql("UPDATE operator_schema SET version=2 WHERE id=1")
+        if populated:
+            connection.exec_driver_sql(
+                "INSERT INTO camera_archives VALUES (12,'https',443,300,4,?)", (STAMP,))
+
+
 def catalog(engine, names=None):
     with engine.connect() as connection:
         rows = connection.exec_driver_sql(
@@ -178,12 +200,11 @@ def dump(engine):
         return tuple(connection.connection.driver_connection.iterdump())
 
 
-def assert_operator_v2(engine):
+def assert_operator_v3(engine):
     tables = set(inspect(engine).get_table_names())
-    assert OPERATOR_TABLES <= tables, f"Missing additive operator-v2 tables: {OPERATOR_TABLES - tables}"
-    assert not FUTURE_TABLES & tables, "Task 3 must not install recording/media schemas"
+    assert OPERATOR_TABLES <= tables, f"Missing additive operator-v3 tables: {OPERATOR_TABLES - tables}"
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 2)]
+        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 3)]
         assert connection.exec_driver_sql("SELECT schema_version FROM attendance_runtime").scalar_one() == 1
     columns = {column["name"]: column for column in inspect(engine).get_columns("employees")}
     assert {"first_name", "last_name", "revision"} <= columns.keys()
@@ -211,7 +232,7 @@ def test_populated_legacy_upgrade_backs_up_once_and_preserves_ids_and_names():
         legacy(engine)
         before = dump(engine)
         schema.initialize_attendance_schema(engine)
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
         backups = list((root / "backups").glob("*.db"))
         assert len(backups) == 1
         with closing(sqlite3.connect(backups[0])) as backup:
@@ -237,7 +258,7 @@ def test_attendance_v1_upgrade_preserves_exact_ddl_and_all_historical_snapshots(
         attendance_sql = catalog(engine, ATTENDANCE_TABLES)
         before = dump(engine)
         schema.initialize_attendance_schema(engine)
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
         assert catalog(engine, ATTENDANCE_TABLES) == attendance_sql
         with Session(engine) as db:
             assert db.get(AttendanceEvent, "old-entry").employee_name == "Снимок события"
@@ -251,14 +272,14 @@ def test_attendance_v1_upgrade_preserves_exact_ddl_and_all_historical_snapshots(
 
 
 @test
-def test_fresh_and_legacy_installations_converge_without_future_tables():
+def test_fresh_and_legacy_installations_converge_on_version_three():
     with database() as (fresh, root), database() as (upgraded, _other):
         schema.initialize_attendance_schema(fresh)
-        assert_operator_v2(fresh)
+        assert_operator_v3(fresh)
         assert not list((root / "backups").glob("*.db"))
         legacy(upgraded, attendance=True, populated=False)
         schema.initialize_attendance_schema(upgraded)
-        assert_operator_v2(upgraded)
+        assert_operator_v3(upgraded)
         normalized = lambda engine: tuple((kind, name, table, schema._sql_key(sql or ""))
                                           for kind, name, table, sql in catalog(engine))
         assert normalized(fresh) == normalized(upgraded), "Fresh install must take the same pinned employee ALTER path"
@@ -296,7 +317,7 @@ def test_malformed_legacy_employee_shape_refused_before_any_ddl():
 def test_unknown_committed_operator_version_refused_without_fixed_version_check():
     with database() as (engine, _root):
         schema.initialize_attendance_schema(engine)
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
         with engine.begin() as connection:
             # Higher nonnegative versions must be representable, but this binary refuses them.
             connection.exec_driver_sql("UPDATE operator_schema SET version=42 WHERE id=1")
@@ -362,7 +383,7 @@ def test_operator_ddl_failure_rolls_back_employee_alters_and_version_marker():
         assert dump(engine) == before
         assert len(list((root / "backups").glob("*.db"))) == 1
         schema.initialize_attendance_schema(engine)
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
 
 
 @test
@@ -392,7 +413,7 @@ def test_bad_attendance_preflight_never_installs_operator_objects():
 
 
 @test
-def test_genuine_committed_v1_upgrades_only_archive_schema_after_verified_backup():
+def test_genuine_committed_v1_upgrades_only_additions_after_verified_backup():
     with database() as (engine, root):
         committed_v1(engine)
         before, attendance_sql = dump(engine), catalog(engine, ATTENDANCE_TABLES)
@@ -414,7 +435,7 @@ def test_genuine_committed_v1_upgrades_only_archive_schema_after_verified_backup
         finally:
             event.remove(engine, "before_cursor_execute", observe_archive_ddl)
         assert attempted, "Committed v1 must be explicitly migrated, not silently treated as latest"
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
         assert catalog(engine, ATTENDANCE_TABLES) == attendance_sql
         assert catalog(engine, OPERATOR_V1_TABLES | {"employees"}) == v1_sql
         with engine.connect() as connection:
@@ -450,12 +471,12 @@ def test_committed_v1_archive_ddl_failure_rolls_back_and_retry_converges_with_fr
         assert attempted, "v1→v2 must attempt additive archive DDL"
         assert dump(engine) == before and len(list((root / "backups").glob("*.db"))) == 1
         schema.initialize_attendance_schema(engine)
-        assert_operator_v2(engine)
+        assert_operator_v3(engine)
         normalized = lambda db: tuple((kind, name, table, schema._sql_key(sql or ""))
                                       for kind, name, table, sql in catalog(db))
         with database() as (fresh, _other):
             schema.initialize_attendance_schema(fresh)
-            assert_operator_v2(fresh)
+            assert_operator_v3(fresh)
             assert normalized(engine) == normalized(fresh)
 
 
@@ -492,12 +513,115 @@ def test_committed_v2_archive_default_fk_constraints_and_extra_objects_fail_clos
         "CREATE INDEX unrecognized_archive_index ON camera_archives (http_port)",
     ):
         with database() as (engine, _root):
-            schema.initialize_attendance_schema(engine)
-            assert_operator_v2(engine)
+            committed_v2(engine)
             with engine.begin() as connection:
                 connection.exec_driver_sql("PRAGMA writable_schema=ON")
                 connection.exec_driver_sql(mutation)
                 connection.exec_driver_sql("PRAGMA writable_schema=OFF")
+            refused_without_mutation(engine)
+
+
+@test
+def test_committed_v2_upgrades_media_after_backup_without_rewriting_predecessors():
+    with database() as (engine, root):
+        committed_v2(engine)
+        before = dump(engine)
+        old_sql = catalog(engine, ATTENDANCE_TABLES | OPERATOR_V2_TABLES | {"employees"})
+        attempted = []
+
+        def observe(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("CREATE TABLE") and "recording_" in statement:
+                backups = list((root / "backups").glob("*.db"))
+                assert len(backups) == 1, "Backup must precede every v3 DDL"
+                with closing(sqlite3.connect(backups[0])) as backup:
+                    assert tuple(backup.iterdump()) == before
+                    assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                attempted.append(statement)
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            schema.initialize_attendance_schema(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert_operator_v3(engine)
+        assert len(attempted) == 4
+        assert catalog(engine, ATTENDANCE_TABLES | OPERATOR_V2_TABLES | {"employees"}) == old_sql
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT camera_id,http_scheme,http_port,utc_offset_minutes,revision FROM camera_archives"
+            ).all() == [(12, "https", 443, 300, 4)]
+        installed = dump(engine)
+        schema.initialize_attendance_schema(engine)
+        assert dump(engine) == installed
+        assert len(list((root / "backups").glob("*.db"))) == 1
+
+
+@test
+def test_v3_failure_rolls_back_all_media_ddl_and_keeps_committed_v2():
+    with database() as (engine, root):
+        committed_v2(engine)
+        before, attempted = dump(engine), []
+
+        def fail(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("CREATE TABLE") and "recording_segments" in statement:
+                attempted.append(statement)
+                raise OperationalError(statement, parameters, RuntimeError("injected v3 DDL failure"))
+
+        event.listen(engine, "before_cursor_execute", fail)
+        try:
+            try:
+                schema.initialize_attendance_schema(engine)
+            except (RuntimeError, OperationalError):
+                pass
+        finally:
+            event.remove(engine, "before_cursor_execute", fail)
+        assert attempted, "v2 must explicitly attempt v3 DDL"
+        assert dump(engine) == before
+        assert len(list((root / "backups").glob("*.db"))) == 1
+        schema.initialize_attendance_schema(engine)
+        assert_operator_v3(engine)
+
+
+@test
+def test_v2_failed_backup_and_unversioned_media_are_refused_before_recovery():
+    with database() as (engine, root):
+        committed_v2(engine)
+        (root / "backups").write_text("not a directory", encoding="utf-8")
+        refused_without_mutation(engine)
+    for table in sorted(MEDIA_TABLES):
+        with database() as (engine, root):
+            committed_v2(engine)
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
+            refused_without_mutation(engine)
+            assert not list((root / "backups").glob("*.db"))
+
+
+@test
+def test_v3_preflight_rejects_missing_active_index_changed_ready_check_and_fk():
+    for mutation in ("index", "ready", "fk"):
+        with database() as (engine, _root):
+            schema.initialize_attendance_schema(engine)
+            assert_operator_v3(engine)
+            with engine.begin() as connection:
+                if mutation == "index":
+                    rows = connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='index' "
+                        "AND tbl_name='recording_sessions' AND sql LIKE '%WHERE%'").all()
+                    assert len(rows) == 1, "Exactly one partial active-camera uniqueness index is required"
+                    name = rows[0][0].replace('"', '""')
+                    connection.exec_driver_sql(f'DROP INDEX "{name}"')
+                else:
+                    connection.exec_driver_sql("PRAGMA writable_schema=ON")
+                    if mutation == "ready":
+                        connection.exec_driver_sql(
+                            "UPDATE sqlite_master SET sql=replace(sql, 'READY', 'BROKEN') "
+                            "WHERE name='recording_segments'")
+                    else:
+                        connection.exec_driver_sql(
+                            "UPDATE sqlite_master SET sql=replace(sql, 'RESTRICT', 'CASCADE') "
+                            "WHERE name='recording_connections'")
+                    connection.exec_driver_sql("PRAGMA writable_schema=OFF")
             refused_without_mutation(engine)
 
 

@@ -51,7 +51,9 @@
     card.status.className = `status ${Object.hasOwn(states, camera.status) ? camera.status.toLowerCase() : 'offline'}`;
     card.meta.textContent = `${camera.nvr_host} · канал ${camera.channel} · ${camera.stream_type === 'sub' ? 'дополнительный' : 'основной'}${camera.resolution ? ` · ${camera.resolution}` : ''}`;
     card.people.textContent = `В кадре: ${camera.people_count || 0} · сотрудники: ${camera.known_count || 0} · неизвестные: ${camera.unknown_count || 0}`;
-    card.recording.textContent = camera.recording_status ? `Запись: ${camera.recording_status}` : 'Запись не ведётся';
+    const recordingStates = { STARTING: 'Запись запускается', RECORDING: 'Идёт запись', RECONNECTING: 'Запись: переподключение', STOPPING: 'Запись завершается' };
+    card.recording.textContent = camera.recording_available === false ? 'Запись: состояние недоступно'
+      : recordingStates[camera.recording?.status] || 'Запись не ведётся';
     card.image.alt = `Предпросмотр: ${camera.name}`;
     if (camera.enabled && camera.status === 'ONLINE' && Date.now() - card.previewAt >= 10000) {
       card.previewAt = Date.now(); card.image.src = `/api/cameras/${camera.id}/snapshot?t=${card.previewAt}`;

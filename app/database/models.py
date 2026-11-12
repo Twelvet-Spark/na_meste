@@ -61,6 +61,67 @@ class CameraArchive(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class RecordingSession(Base):
+    __tablename__ = "recording_sessions"
+    __table_args__ = (
+        CheckConstraint("status IN ('STARTING','RECORDING','RECONNECTING','STOPPING','STOPPED','COMPLETED','FAILED','INTERRUPTED')"),
+        Index("uq_recording_active_camera", "camera_id", unique=True,
+              sqlite_where=text("status IN ('STARTING','RECORDING','RECONNECTING','STOPPING')")),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    camera_name: Mapped[str] = mapped_column(String(100))
+    source_revision: Mapped[int] = mapped_column(Integer)
+    requested_at: Mapped[datetime] = mapped_column(DateTime)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(20))
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class RecordingConnection(Base):
+    __tablename__ = "recording_connections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("recording_sessions.id", ondelete="RESTRICT"))
+    directory: Mapped[str] = mapped_column(String(200), unique=True)
+    source_revision: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    anchor_utc: Mapped[datetime | None] = mapped_column(DateTime)
+    media_origin_seconds: Mapped[float | None] = mapped_column(Float)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class RecordingSegment(Base):
+    __tablename__ = "recording_segments"
+    __table_args__ = (
+        CheckConstraint("state IN ('READY','EXPIRED','MISSING','CORRUPT','DELETING','UNINDEXED')"),
+        CheckConstraint("state != 'READY' OR (started_at IS NOT NULL AND ended_at IS NOT NULL AND duration_ms > 0)"),
+        CheckConstraint("duration_ms >= 0"), CheckConstraint("bytes >= 0"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("recording_sessions.id", ondelete="RESTRICT"))
+    connection_id: Mapped[str] = mapped_column(ForeignKey("recording_connections.id", ondelete="RESTRICT"))
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    source_revision: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str] = mapped_column(String(250), unique=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    bytes: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    codec: Mapped[str | None] = mapped_column(String(32))
+    state: Mapped[str] = mapped_column(String(20))
+
+
+class RecordingGap(Base):
+    __tablename__ = "recording_gaps"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("recording_sessions.id", ondelete="RESTRICT"))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reason_code: Mapped[str] = mapped_column(String(64))
+
+
 class Employee(Base):
     __tablename__ = "employees"
 

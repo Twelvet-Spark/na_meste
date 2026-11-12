@@ -97,7 +97,17 @@ def _camera_response(camera, manager: ReaderManager, request: Request, db: Sessi
         data["unknown_count"] = unknown
     else:
         data["people_count"] = data["known_count"] = data["unknown_count"] = 0
+    recordings = getattr(request.app.state, "recordings", None)
+    sessions = recordings.list_sessions(camera_id=camera.id, limit=1) if recordings is not None else []
+    data["recording"] = sessions[0].model_dump(mode="json") if sessions else None
+    data["recording_available"] = recordings is not None
     return data
+
+
+def _publish_recording_source(request: Request, source) -> None:
+    recordings = getattr(request.app.state, "recordings", None)
+    if recordings is not None:
+        recordings.source_changed(source)
 
 
 # -------------------------------------------------------------- проверка
@@ -120,7 +130,7 @@ def api_test_unsaved(
     if not password:
         return {"success": False, "error": "Укажите пароль для проверки подключения"}
 
-    return service.test_rtsp_connection(
+    result = service.test_rtsp_connection(
         nvr_host=payload.nvr_host,
         rtsp_port=payload.rtsp_port,
         username=payload.username,
@@ -130,6 +140,9 @@ def api_test_unsaved(
         ffprobe_path=manager.ffprobe,
         timeout=settings.rtsp_connect_timeout,
     )
+    if result.error == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE":
+        raise HTTPException(503, result.error)
+    return result
 
 
 @router.post("/discover", dependencies=[Depends(require_operator_request)])
@@ -159,6 +172,7 @@ def api_create_batch(
     result, sources, _replay = service.create_camera_batch(db, payload)
     for source in sources:
         _setup(request).source_changed(source)
+        _publish_recording_source(request, source)
         if source.enabled:
             manager.start(source)
     return result
@@ -184,6 +198,7 @@ def api_create_camera(
 ):
     camera = service.create_camera(db, payload)
     _setup(request).source_changed(camera)
+    _publish_recording_source(request, camera)
     if camera.enabled:
         manager.start(camera)
     return _camera_response(camera, manager, request, db)
@@ -211,6 +226,7 @@ def api_update_camera(
     camera = _camera_or_404(db, camera_id)
     camera, changed = service.update_camera(db, camera, payload)
     _setup(request).source_changed(camera)
+    _publish_recording_source(request, camera)
     manager.sync(camera, changed)
     return _camera_response(camera, manager, request, db)
 
@@ -239,7 +255,7 @@ def api_test_camera(
     manager: ReaderManager = Depends(get_manager),
 ):
     camera = _camera_or_404(db, camera_id)
-    return service.test_rtsp_connection(
+    result = service.test_rtsp_connection(
         nvr_host=camera.nvr_host,
         rtsp_port=camera.rtsp_port,
         username=camera.username,
@@ -249,6 +265,9 @@ def api_test_camera(
         ffprobe_path=manager.ffprobe,
         timeout=settings.rtsp_connect_timeout,
     )
+    if result.error == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE":
+        raise HTTPException(503, result.error)
+    return result
 
 
 @router.get("/{camera_id}/status")

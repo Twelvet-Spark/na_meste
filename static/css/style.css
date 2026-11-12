@@ -840,7 +840,7 @@ main > .panel + .panel { margin-top: 20px; }
 .camera-page-heading p { margin-bottom: 0; overflow-wrap: anywhere; }
 .camera-workspace .profile-sections { margin-block: 12px; }
 .camera-workspace .stats dd { min-width: 0; overflow-wrap: anywhere; }
-.camera-workspace #camera-archive, .camera-workspace #camera-live, .camera-workspace #calibration-heading { scroll-margin-top: 110px; }
+.camera-workspace #camera-archive, .camera-workspace #camera-live, .camera-workspace #camera-recording, .camera-workspace #calibration-heading { scroll-margin-top: 110px; }
 .camera-setup { width: 880px; background: var(--md-surface); border: 1px solid var(--md-outline-variant); border-radius: 16px; padding: 24px; max-height: 92vh; max-height: 92dvh; }
 .camera-setup p { max-width: 75ch; overflow-wrap: anywhere; }
 .camera-setup input, .camera-setup select { caret-color: var(--md-primary); font-variant-numeric: tabular-nums; }

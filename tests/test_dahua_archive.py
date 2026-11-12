@@ -392,7 +392,8 @@ def test_cgi_permission_failure_does_not_prevent_independent_live_probe_or_save(
     ]}).encode(), stderr=b"")
     with api() as (client, _engine, _manager, _root), device() as peer:
         assert_discovery_failure(discover(client, peer, password="wrong"), "DEVICE_AUTH_FAILED")
-        with patch("app.services.camera_service.subprocess.run", return_value=completed):
+        with patch("app.services.camera_service.subprocess.run", return_value=completed), \
+                patch("app.media.process_guard.MediaProcessGuard.require"):
             live = client.json("POST", "/api/cameras/test", connection())
         assert live["success"] and live["codec"] == "h264" and live["resolution"] == "1920x1080"
         saved = create(client)

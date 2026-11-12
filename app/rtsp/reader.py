@@ -24,6 +24,7 @@ import numpy as np
 
 from app.rtsp.dahua import mask_url
 from app.time_utils import utcnow
+from app.media.process_guard import MediaProcessGuard
 
 logger = logging.getLogger("app.rtsp.reader")
 
@@ -301,7 +302,9 @@ class RTSPReader:
             except StopRequested:
                 break
             except Exception as exc:
-                self.last_error = str(exc) or exc.__class__.__name__
+                self.last_error = "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE" if (
+                    getattr(exc, "detail", None) == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE"
+                ) else "STREAM_UNAVAILABLE"
             if self._stop_event.is_set():
                 break
 
@@ -356,10 +359,12 @@ class RTSPReader:
             if self._stop_event.is_set():
                 raise StopRequested()
             logger.debug("[%s] ffmpeg: %s", self.name, " ".join(mask_url(c) for c in cmd))
+            MediaProcessGuard.require()
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                close_fds=True,
             )
             self._proc = proc
         stream_id = str(uuid4())
@@ -420,8 +425,9 @@ class RTSPReader:
             self.rtsp_url,
         ]
         try:
+            MediaProcessGuard.require()
             result = subprocess.run(
-                cmd, capture_output=True, timeout=self._connect_timeout + 5
+                cmd, capture_output=True, timeout=self._connect_timeout + 5, close_fds=True
             )
         except subprocess.TimeoutExpired as exc:
             raise ConnectionLost(

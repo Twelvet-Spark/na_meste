@@ -29,6 +29,10 @@ class ReaderManager:
             )
 
     @property
+    def ffmpeg(self) -> Optional[str]:
+        return self._ffmpeg
+
+    @property
     def ffprobe(self) -> Optional[str]:
         return self._ffprobe
 
