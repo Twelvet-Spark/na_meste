@@ -197,6 +197,7 @@ async def index(request: Request):
 async def camera_page(request: Request, camera_id: int):
     return templates.TemplateResponse(
         request, "camera.html", {"camera_id": camera_id,
+                                  "recordings_at": utcnow().isoformat(timespec="milliseconds") + "+00:00",
                                   "workplace_utc_offset_minutes": settings.attendance_utc_offset_minutes}
     )
 

@@ -62,7 +62,7 @@
       <div class="calibration-actions">
         <button id="recording-stop" class="btn danger" type="button" disabled>Остановить запись</button>
         <button id="recording-retry" class="btn" type="button" hidden>Обновить состояние</button>
-        <a class="btn" href="/recordings?camera_id={{ camera_id }}&amp;source=local">Смотреть локальные записи</a>
+        <a class="btn" href="/recordings?camera_id={{ camera_id }}&amp;source=local&amp;at={{ recordings_at | urlencode }}">Смотреть локальные записи</a>
       </div>
       <p id="recording-message" class="form-status" role="status" aria-live="polite"></p>
     </section>
@@ -72,7 +72,7 @@
       <p id="camera-archive-state" class="muted" role="status">Загрузка параметров архива…</p>
       <p class="muted">Живое видео и архив используют разные разрешения устройства. Настроенные HTTP-параметры не подтверждают наличие записей; часы регистратора автоматически не меняются.</p>
       <button id="camera-edit-archive" class="btn" type="button">Настроить подключение и архив</button>
-      <a class="btn" href="/recordings?camera_id={{ camera_id }}&amp;source=dahua">Смотреть архив регистратора</a>
+      <a class="btn" href="/recordings?camera_id={{ camera_id }}&amp;source=dahua&amp;at={{ recordings_at | urlencode }}">Смотреть архив регистратора</a>
     </section>
 
     <section class="panel calibration-panel" aria-labelledby="calibration-heading">

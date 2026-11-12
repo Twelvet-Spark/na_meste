@@ -972,6 +972,85 @@ def test_finder_empty_is_success_only_after_find_and_timezone_crosses_date_bound
         assert finder.actions[-2:] == ["close", "destroy"]
 
 
+class FinderBudgetTransport:
+    """Socket-timeout model; real request/parser/finally code owns the lifecycle."""
+    def __init__(self, clock, mode, client):
+        self.clock, self.mode, self.client = clock, mode, client
+        self.actions, self.responses = [], []
+        self.pages = 0
+
+    def open(self, request, timeout):
+        action = parse_qs(urlsplit(request.full_url).query)["action"][0]
+        self.actions.append(action)
+        cleanup = action in ("close", "destroy")
+        # Headers consume part of the socket budget. A cleanup body then stalls;
+        # reusing the original socket timeout would exceed the request deadline.
+        latency = 3. if cleanup else 7. if action == "findNextFile" else 0.
+        self.clock[0] += min(latency, timeout)
+        if latency >= timeout:
+            raise TimeoutError("fixture network deadline")
+        if action == "factory.create":
+            body = b"result=08137\r\n"
+        elif action == "findNextFile":
+            self.pages += 1
+            body = finder_page()
+            if self.mode == "failure" and self.pages == 3:
+                body = b"invalid finder response"
+            elif self.mode == "cancelled" and self.pages == 3:
+                self.client.cancel()
+            elif self.mode == "success" and self.pages == 5:
+                body = b"found=0\r\n"
+        else:
+            body = b"OK\r\n"
+        response = self.Response(self.clock, body, timeout, cleanup)
+        self.responses.append(response)
+        return response
+
+    class Response:
+        status = 200
+
+        def __init__(self, clock, body, timeout, stalled):
+            self.clock, self.body, self.timeout, self.stalled = clock, body, timeout, stalled
+            self.headers = {"Content-Length": str(len(body))}
+            self.closed = False
+            self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=self))
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def read1(self, count):
+            if self.stalled:
+                self.clock[0] += self.timeout
+                raise TimeoutError("fixture stalled response body")
+            result, self.body = self.body[:count], self.body[count:]
+            return result
+
+        def close(self):
+            self.closed = True
+
+
+@test
+def test_finder_whole_lifecycle_reserves_both_stalled_cleanup_attempts_within_sixty_seconds():
+    for mode, error_code in (("limit", "SEARCH_LIMIT"), ("success", None),
+                             ("failure", "DEVICE_PROTOCOL_ERROR"), ("cancelled", "SOURCE_CHANGED")):
+        with finder_rig(FinderPeer()) as (client, _peer, module):
+            clock = [100.]
+            transport = FinderBudgetTransport(clock, mode, client)
+            # Substitute only network opening/socket waits and the monotonic
+            # clock. The cleanup client, request loop and error mapping are real.
+            with patch.object(client, "_opener", transport), \
+                    patch.object(module, "build_opener", return_value=transport), \
+                    patch.object(module, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+                if error_code is None:
+                    result = client.list_recordings(SEARCH_FROM, SEARCH_TO)
+                    assert len(result) == 1 and result[0].start_utc == SEARCH_FROM
+                else:
+                    search_error(module, error_code, lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+            assert transport.actions[-2:] == ["close", "destroy"], (mode, transport.actions)
+            assert all(response.closed for response in transport.responses)
+            assert clock[0] - 100. <= 60., (mode, "finder plus cleanup exceeded 60 seconds", clock[0] - 100.)
+
+
 if __name__ == "__main__":
     failures = 0
     for case in TESTS:

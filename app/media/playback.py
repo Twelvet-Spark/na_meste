@@ -344,12 +344,17 @@ class PlaybackManager:
             else:
                 entries = self._remote_intervals(captured, at, at + timedelta(days=1))
                 interval = next((item for _id, item in entries if item.start_utc.replace(tzinfo=None) <= at < item.end_utc.replace(tzinfo=None)), None)
-                next_at = min((item.start_utc.replace(tzinfo=None) for _id, item in entries if item.start_utc.replace(tzinfo=None) > at), default=None)
                 if interval is None:
+                    next_at = min((item.start_utc.replace(tzinfo=None) for _id, item in entries
+                                   if item.start_utc.replace(tzinfo=None) > at), default=None)
                     raise HTTPException(409, {"code": "NO_RECORDING_AT_TIME", "next_at": iso(next_at)})
                 end = min(interval.end_utc.replace(tzinfo=None), at + timedelta(hours=1))
-                if end < interval.end_utc.replace(tzinfo=None):
-                    next_at = end
+                # Continue from this clip's endpoint, not from another file's
+                # start inside footage the caller is about to watch.
+                next_at = (end if any(item.start_utc.replace(tzinfo=None) <= end < item.end_utc.replace(tzinfo=None)
+                                      for _id, item in entries)
+                           else min((item.start_utc.replace(tzinfo=None) for _id, item in entries
+                                     if item.start_utc.replace(tzinfo=None) > end), default=None))
             self._encoder()
             if not self.storage.enforce():
                 raise HTTPException(503, "STORAGE_FULL")

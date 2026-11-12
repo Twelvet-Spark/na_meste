@@ -268,6 +268,7 @@
       if (token !== searchGeneration) return;
       renderTimeline(data);
       ui.message($('recordings-search-status'), `Найдено фрагментов: ${data.intervals.length}. Разрывов: ${data.gaps.length}.`);
+      return token;
     } catch (error) {
       if (token === searchGeneration) {
         ui.message($('recordings-search-status'), `${errorText(error)} ${intervalData ? 'Показан предыдущий результат. ' : ''}Нажмите «Найти записи», чтобы повторить.`, 'error');
@@ -383,6 +384,8 @@
   }
   $('recordings-cameras-retry').onclick = async () => { if (await loadCameras()) await search(); };
   async function initialize() {
+    const initialPlayerGeneration = generation;
+    const initialSource = source;
     const at = query.get('at') ? new Date(query.get('at')) : new Date();
     const initial = Number.isFinite(at.getTime()) ? at : new Date();
     const start = new Date(initial); start.setHours(0, 0, 0, 0);
@@ -392,8 +395,12 @@
     $('recordings-zone').textContent = `Ввод и отображение: часовой пояс браузера (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Период — не больше 24 часов. Сервер получает время с явным UTC-смещением.`;
     sourceView();
     if (await loadCameras()) {
-      await search();
-      if (query.has('at') && Number.isFinite(at.getTime())) requestAt(at.getTime());
+      const initialCamera = $('recordings-camera').value;
+      const initialSearchGeneration = await search();
+      if (initialSearchGeneration === searchGeneration &&
+          initialPlayerGeneration === generation && initialSource === source &&
+          initialCamera === $('recordings-camera').value &&
+          query.has('at') && Number.isFinite(at.getTime())) requestAt(at.getTime());
     }
   }
   initialize();

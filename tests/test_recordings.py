@@ -1988,6 +1988,96 @@ def test_explicit_reconnect_gap_bounds_playback_even_when_buffered_segment_time_
         assert utc(next_playback["to"]) == BASE + timedelta(seconds=120)
 
 
+@test
+def test_remote_overlapping_intervals_continue_at_selected_endpoint_without_rewind():
+    from test_dahua_archive import finder_page
+    for second_start in ("2026-11-12 13:00:30", "2026-11-12 13:00:00"):
+        with remote_playback_rig() as r:
+            r.finder.pages = [
+                finder_page(),
+                finder_page(path="/mnt/dvr/longer.mp4", start=second_start,
+                            end="2026-11-12 13:02:00", kind="mp4"),
+                b"found=0\r\n",
+            ]
+            first = play(r, source="dahua")
+            assert utc(first["to"]) == BASE + timedelta(seconds=60)
+            assert first["next_at"] == first["to"], "Continuation must be after this clip, not an overlapping file's earlier start"
+            process = eventually(lambda: r.encoder.processes and r.encoder.processes[0])
+            r.client.json("DELETE", f'/api/recordings/playbacks/{first["id"]}')
+            assert process.poll() is not None
+            # A new query has a new range key; the recorder returns its real
+            # overlapping files again, rather than pre-filtering for the app.
+            r.finder.page = 0
+            following = play(r, source="dahua", at=first["next_at"])
+            assert following["id"] != first["id"]
+            assert following["from"] == first["to"]
+            assert utc(following["to"]) == BASE + timedelta(seconds=120)
+            assert following["next_at"] is None
+            assert_media_private(following)
+
+
+@test
+def test_local_hourly_continuation_remains_available_after_cancel_and_new_request():
+    with playback_rig(duration=60) as r:
+        append_local_segment(r, start_seconds=60, duration=7140)
+        first = play(r)
+        assert utc(first["to"]) == BASE + timedelta(seconds=3610)
+        assert first["next_at"] == first["to"]
+        process = eventually(lambda: r.encoder.processes and r.encoder.processes[0])
+        r.client.json("DELETE", f'/api/recordings/playbacks/{first["id"]}')
+        assert process.poll() is not None
+        following = play(r, at=first["next_at"])
+        assert following["id"] != first["id"]
+        assert following["from"] == first["to"]
+        assert utc(following["to"]) == BASE + timedelta(seconds=7200)
+        assert following["next_at"] is None
+        assert rows(r.engine, "recording_segments")[0]["state"] == "READY"
+
+
+@test
+def test_playback_cache_only_exhaustion_stops_worker_with_response_leased_outputs_intact():
+    with playback_rig(policy={"recording_min_free_bytes": 0, "recording_max_bytes": 10_000_000_000}) as r:
+        first = play(r)
+        process = eventually(lambda: r.encoder.processes and r.encoder.processes[0])
+        process.publish(2)
+        await_playback(r, first["id"], {"READY"})
+        storage = r.manager.storage
+        total, free, reserve = storage.usage()
+        assert total + reserve < storage.max_bytes and free > storage.min_free_bytes + reserve
+        assert storage.enforce(), "Aggregate storage pressure must not cause this regression"
+        paths = tuple(process.paths)
+        budget = paths[0].stat().st_size - 1
+        enforce_cache = storage.enforce_cache
+
+        async def hold_response(message):
+            if message["type"] != "http.response.start":
+                return
+            assert message["status"] == 206
+            # Scale only the existing cache-policy argument; run its actual
+            # eviction/lease implementation. Aggregate limits stay healthy.
+            with patch.object(storage, "enforce_cache", side_effect=lambda _maximum: enforce_cache(budget)):
+                failed = await asyncio.to_thread(await_playback, r, first["id"], {"FAILED"})
+                assert failed["error_code"] == "STORAGE_FULL", failed
+                assert process.poll() is not None
+                assert storage.enforce(), "The aggregate enforcer is not the cause of failure"
+                # Sequence 1 had only its listed-output lease during pressure;
+                # sequence 0 additionally has this still-in-flight response.
+                assert all(path.exists() for path in paths), "Cache pressure deleted a listed TS before worker stop"
+                assert r.input_path.exists(), "Cache-only pressure must not consume original footage"
+                # Terminal outputs are now unused except for sequence 0. Even a
+                # further eviction pass cannot remove the held response's file.
+                assert not enforce_cache(budget), "The held response alone exceeds the cache budget"
+                assert paths[0].exists(), "Cache pressure removed an in-flight response"
+
+        status, _headers, body = asyncio.run(media_request(
+            r, f'/api/recordings/playbacks/{first["id"]}/segments/0.ts',
+            range_header="bytes=0-9", on_send=hold_response))
+        assert status == 206 and len(body) == 10
+        r.clock.advance(121)
+        storage.enforce()
+        assert all(not path.exists() for path in paths), "Completed responses leaked their cache leases"
+
+
 if __name__ == "__main__":
     if "--owned-parent" in sys.argv:
         owned_parent(sys.argv[2], sys.argv[3])

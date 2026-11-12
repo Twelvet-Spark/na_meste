@@ -69,8 +69,10 @@ class DahuaClient:
     def _check(self, deadline):
         if self._cancelled.is_set():
             raise DahuaError("SOURCE_CHANGED")
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise DahuaError("DEVICE_TIMEOUT")
+        return remaining
 
     def _channel_config(self):
         return self._request("/cgi-bin/configManager.cgi?" + urlencode(
@@ -82,8 +84,8 @@ class DahuaClient:
         deadline = min(deadline, time.monotonic() + TIMEOUT_SECONDS) if deadline is not None else time.monotonic() + TIMEOUT_SECONDS
         response = None
         try:
-            self._check(deadline)
-            response = self._opener.open(request, timeout=max(.001, deadline - time.monotonic()))
+            remaining = self._check(deadline)
+            response = self._opener.open(request, timeout=remaining)
             with self._lock:
                 self._response = response
             self._check(deadline)
@@ -94,7 +96,12 @@ class DahuaClient:
                 raise DahuaError("DEVICE_PROTOCOL_ERROR")
             chunks, total = [], 0
             while True:
-                self._check(deadline)
+                remaining = self._check(deadline)
+                # read1 avoids buffered read(n)'s repeated data receives;
+                # headers and earlier chunks must not restart the socket timeout.
+                # The stdlib clears fp when a length-delimited body reaches EOF.
+                if response.fp is not None:
+                    response.fp.raw._sock.settimeout(remaining)
                 chunk = response.read1(min(64 * 1024, MAX_RESPONSE_BYTES + 1 - total))
                 self._check(deadline)
                 if not chunk:
@@ -279,7 +286,10 @@ class DahuaArchiveClient(DahuaClient):
             end = end_utc.astimezone(self.zone).strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, OverflowError, AttributeError):
             raise DahuaError("DEVICE_PROTOCOL_ERROR") from None
-        deadline = time.monotonic() + 60
+        overall_deadline = time.monotonic() + 60
+        # The complete finder lifecycle includes two cancellation-insensitive
+        # cleanup attempts: 40 s work, up to 10 s close, up to 10 s destroy.
+        deadline = overall_deadline - 20
         handle = None
         try:
             text = self._finder("factory.create", deadline=deadline).strip()
@@ -314,9 +324,10 @@ class DahuaArchiveClient(DahuaClient):
                 cleanup = DahuaClient(host=self.source.host, http_scheme=self.source.http_scheme,
                                       http_port=self.source.http_port, username=self.source.username,
                                       password=self.source.password)
-                for action in ("close", "destroy"):
+                for action, reserved_after in (("close", 10), ("destroy", 0)):
                     try:
                         cleanup._request("/cgi-bin/mediaFileFind.cgi?" + urlencode(
-                            {"action": action, "object": handle}, quote_via=quote))
+                            {"action": action, "object": handle}, quote_via=quote),
+                            deadline=overall_deadline - reserved_after)
                     except DahuaError:
                         pass
