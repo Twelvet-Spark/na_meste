@@ -27,7 +27,67 @@ from app.rtsp.dahua import build_rtsp_url
 SEGMENT_NAME = re.compile(r"segment-[0-9]{6}\.mkv\Z")
 
 
-def probe_video(path, ffprobe):
+def _packet_duration(path, ffprobe):
+    """Read actual packets: an interrupted Matroska header can retain source duration."""
+    MediaProcessGuard.require()
+    process = subprocess.Popen([
+        ffprobe, "-v", "error", "-select_streams", "v:0", "-show_packets",
+        "-show_entries", "packet=pts_time,duration_time", "-of", "compact=p=0:nk=0", str(path),
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+    timed_out, errors = threading.Event(), threading.Event()
+
+    def expire():
+        if process.poll() is None:
+            timed_out.set()
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def drain_errors():
+        try:
+            while process.stderr.read(8192):
+                errors.set()
+        except (OSError, ValueError):
+            errors.set()
+
+    timer = threading.Timer(10, expire)
+    timer.daemon = True
+    drainer = threading.Thread(target=drain_errors, daemon=True, name="media-packet-probe")
+    timer.start()
+    drainer.start()
+    first = last = None
+    try:
+        while line := process.stdout.readline(512):
+            if len(line) >= 512:
+                return None
+            fields = dict(item.split("=", 1) for item in line.decode("ascii").strip().split("|") if "=" in item)
+            if "pts_time" not in fields:
+                continue
+            timestamp = float(fields["pts_time"])
+            duration = float(fields.get("duration_time", 0))
+            if not math.isfinite(timestamp) or not math.isfinite(duration) or duration < 0:
+                return None
+            first = timestamp if first is None else min(first, timestamp)
+            end = timestamp + duration
+            last = end if last is None else max(last, end)
+        result = process.wait(timeout=2)
+        drainer.join(timeout=2)
+        if result or timed_out.is_set() or errors.is_set() or first is None or last is None:
+            return None
+        duration = last - first
+        return duration if 0 < duration <= 86400 else None
+    finally:
+        timer.cancel()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+        drainer.join(timeout=2)
+        for pipe in (process.stdout, process.stderr):
+            pipe.close()
+
+
+def probe_video(path, ffprobe, *, require_packet_duration=False):
     MediaProcessGuard.require()
     try:
         result = subprocess.run([
@@ -39,12 +99,16 @@ def probe_video(path, ffprobe):
         data = json.loads(result.stdout)
         stream = data["streams"][0]
         duration = float(data.get("format", {}).get("duration", stream.get("duration", 0)))
+        if require_packet_duration:
+            duration = _packet_duration(path, ffprobe)
+            if duration is None:
+                return None
         if (stream.get("codec_name") not in ("h264", "hevc") or not math.isfinite(duration)
                 or duration <= 0 or duration > 86400 or int(stream.get("width", 0)) <= 0
                 or int(stream.get("height", 0)) <= 0):
             return None
         return max(1, round(duration * 1000)), stream["codec_name"]
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError, UnicodeError):
         return None
 
 
@@ -206,7 +270,8 @@ class SegmentRecorder:
                                 and connection.media_origin_seconds is not None):
                             end = connection.anchor_utc + timedelta(
                                 seconds=closed[path.name][1] - connection.media_origin_seconds)
-                        self.pending[key] = (self.executor.submit(probe_video, path, self.ffprobe), start, end)
+                        self.pending[key] = (self.executor.submit(
+                            probe_video, path, self.ffprobe, require_packet_duration=path.name not in closed), start, end)
         self._publish(wait=final)
         if recovering:
             present = {key for key, _path, _size in paths}

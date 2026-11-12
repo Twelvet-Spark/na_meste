@@ -108,6 +108,9 @@ def _publish_recording_source(request: Request, source) -> None:
     recordings = getattr(request.app.state, "recordings", None)
     if recordings is not None:
         recordings.source_changed(source)
+    playbacks = getattr(request.app.state, "playbacks", None)
+    if playbacks is not None:
+        playbacks.source_changed(source)
 
 
 # -------------------------------------------------------------- проверка
@@ -242,6 +245,9 @@ def api_delete_camera(
     service.delete_camera(db, camera)
     if request is not None:
         _setup(request).deleted(camera_id)
+        playbacks = getattr(request.app.state, "playbacks", None)
+        if playbacks is not None:
+            playbacks.deleted(camera_id)
     manager.stop(camera_id)
     return None
 

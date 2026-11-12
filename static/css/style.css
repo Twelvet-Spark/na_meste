@@ -877,3 +877,47 @@ main > .panel + .panel { margin-top: 20px; }
   .setup-manual .field { flex-basis: 100%; }
   .setup-manual .btn { flex: 1 1 130px; }
 }
+
+/* Archive playback is an operator tool, not an attendance/biometric search. */
+.recordings-workspace { overflow-wrap: anywhere; }
+.recordings-workspace [hidden] { display: none !important; }
+.recordings-workspace h1 { margin: 0; font-size: 28px; font-weight: 500; }
+.recordings-workspace h2 { margin: 0 0 16px; font-size: 21px; font-weight: 500; }
+.recordings-workspace p { max-width: 75ch; }
+.recordings-workspace .btn { white-space: normal; max-width: 100%; text-align: center; }
+.recordings-workspace input, .recordings-workspace select { min-width: 0; max-width: 100%; caret-color: var(--md-primary); font-variant-numeric: tabular-nums; }
+.recordings-filters { display: grid; grid-template-columns: minmax(160px, 1fr) repeat(2, minmax(200px, 1fr)) auto; gap: 16px; align-items: end; }
+.recordings-filters .field { min-width: 0; margin: 0; }
+.recordings-source { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 20px; }
+.recordings-source [aria-selected="true"] { background: var(--md-primary); color: var(--md-on-primary); }
+.recordings-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); gap: 24px; align-items: start; }
+.recordings-player { min-width: 0; }
+.recordings-player video { display: block; width: 100%; aspect-ratio: 16 / 9; background: var(--md-inverse-surface); border-radius: 8px; }
+.recordings-clock { font-variant-numeric: tabular-nums; font-size: 18px; margin-block: 16px 8px; }
+.recordings-seek { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin-block: 16px; }
+.recordings-seek .field { flex: 1 1 220px; margin: 0; }
+.recordings-seek .btn { flex: 0 1 auto; }
+.recordings-timeline { margin-top: 28px; }
+.recordings-track { position: relative; height: 16px; border: 1px solid var(--md-outline); border-radius: 4px; background: var(--md-surface-container); overflow: hidden; }
+.recordings-track span { position: absolute; inset-block: 0; background: var(--md-primary); }
+.recordings-track .recordings-unavailable { background: var(--st-offline-bg); }
+.recordings-track .recordings-gap { z-index: 1; background: var(--st-error-bg); border-inline: 1px solid var(--md-error); }
+.recordings-timeline input[type="range"] { width: 100%; min-height: 44px; accent-color: var(--md-primary); cursor: pointer; }
+.recordings-time-labels { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.recordings-intervals { max-height: 600px; overflow: auto; list-style: none; padding: 0; margin: 0; }
+.recordings-intervals li { padding-block: 14px; border-bottom: 1px solid var(--md-outline-variant); }
+.recordings-intervals p { margin: 0 0 8px; font-variant-numeric: tabular-nums; }
+.recordings-intervals .btn { width: 100%; justify-content: flex-start; text-align: left; }
+.recordings-legend { font-size: 13px; color: var(--md-on-surface-variant); }
+@media (max-width: 1150px) {
+  .recordings-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .recordings-layout { grid-template-columns: minmax(0, 1fr); }
+  .recordings-intervals { max-height: 360px; }
+}
+@media (max-width: 600px) {
+  .recordings-filters { grid-template-columns: minmax(0, 1fr); }
+  .recordings-source .btn { flex: 1 1 140px; }
+  .recordings-seek .field { flex-basis: 100%; }
+  .recordings-seek .btn { flex: 1 1 auto; }
+  .recordings-workspace h1 { font-size: 26px; }
+}

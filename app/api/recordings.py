@@ -1,11 +1,14 @@
-"""Manual local recording API. No automatic/scheduled recording or raw paths."""
+"""Manual recording, bounded archive timelines and process-local browser playback."""
+from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from app.api.operator_security import require_operator_request
 from app.services.recording_service import RecordingManager, SessionView
+from app.media.playback import timestamp
 
 router = APIRouter(prefix="/api/recordings", tags=["recordings"])
 
@@ -54,3 +57,58 @@ def get_session(session_id: UUID, manager=Depends(get_manager)):
              dependencies=[Depends(require_operator_request)])
 def stop_session(session_id: UUID, manager=Depends(get_manager)):
     return manager.stop(session_id)
+
+
+class PlaybackStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    camera_id: StrictInt = Field(gt=0)
+    source: Literal["local", "dahua"]
+    at: datetime
+    request_id: UUID
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def explicit_timestamp(cls, value):
+        return timestamp(value).replace(tzinfo=timezone.utc)
+
+
+def get_playback_manager(request: Request):
+    manager = getattr(request.app.state, "playbacks", None)
+    if manager is None:
+        raise HTTPException(503, getattr(request.app.state, "playback_error", None) or "PLAYBACK_UNAVAILABLE")
+    return manager
+
+
+@router.get("/timeline")
+def timeline(camera_id: int = Query(gt=0), source: Literal["local", "dahua"] = Query(),
+             start: str = Query(alias="from"), end: str = Query(alias="to"),
+             manager=Depends(get_playback_manager)):
+    return manager.timeline(camera_id, source, start, end)
+
+
+@router.post("/playbacks", status_code=202, dependencies=[Depends(require_operator_request)])
+def create_playback(payload: PlaybackStart, manager=Depends(get_playback_manager)):
+    return manager.create(payload.camera_id, payload.source, payload.at, payload.request_id)
+
+
+@router.get("/playbacks/{playback_id}")
+def get_playback(playback_id: UUID, manager=Depends(get_playback_manager)):
+    return manager.get(playback_id)
+
+
+@router.delete("/playbacks/{playback_id}", dependencies=[Depends(require_operator_request)])
+def cancel_playback(playback_id: UUID, manager=Depends(get_playback_manager)):
+    return manager.cancel(playback_id)
+
+
+@router.get("/playbacks/{playback_id}/manifest.m3u8")
+def playback_manifest(playback_id: UUID, manager=Depends(get_playback_manager)):
+    return Response(manager.manifest(playback_id), media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store"})
+
+
+@router.get("/playbacks/{playback_id}/segments/{sequence}.ts")
+def playback_segment(playback_id: UUID, sequence: int, manager=Depends(get_playback_manager)):
+    if sequence < 0:
+        raise HTTPException(404, "PLAYBACK_SEGMENT_NOT_FOUND")
+    return manager.segment(playback_id, sequence)

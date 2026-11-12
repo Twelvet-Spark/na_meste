@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% set active_page = 'recordings' %}
+{% block title %}Записи — На месте{% endblock %}
+{% block content %}
+<main class="container recordings-workspace">
+  <header class="page-heading">
+    <div><h1>Записи</h1><p class="muted">Видео выбранной камеры. Архив регистратора и локальные записи независимы; поиск по сотрудникам и лицам здесь не выполняется.</p></div>
+  </header>
+  <section class="panel" aria-label="Поиск записей">
+    <div class="recordings-source" role="tablist" aria-label="Источник видео">
+      <button type="button" class="btn" id="source-local" role="tab" aria-selected="true" aria-controls="recordings-results" data-source="local">Локальные записи</button>
+      <button type="button" class="btn" id="source-dahua" role="tab" aria-selected="false" aria-controls="recordings-results" tabindex="-1" data-source="dahua">Архив Dahua</button>
+    </div>
+    <form id="recordings-search" class="recordings-filters">
+      <label class="field" for="recordings-camera">Камера<select id="recordings-camera" required><option value="">Загрузка камер…</option></select></label>
+      <label class="field" for="recordings-from">Начало периода<input id="recordings-from" type="datetime-local" step="1" required></label>
+      <label class="field" for="recordings-to">Конец периода<input id="recordings-to" type="datetime-local" step="1" required></label>
+      <button type="submit" class="btn primary" id="recordings-find">Найти записи</button>
+    </form>
+    <p class="muted small" id="recordings-zone"></p>
+    <p class="muted small" id="recordings-basis">Локальное видео: приблизительное серверное время записи, не время экспозиции камеры и не доказательство отметок рабочего времени.</p>
+    <p id="recordings-search-status" class="form-status" role="status" aria-live="polite"></p>
+    <button id="recordings-cameras-retry" type="button" class="btn" hidden>Повторить загрузку камер</button>
+    <a id="recordings-camera-link" class="back-link" href="/">Подключение и ручная запись камеры</a>
+  </section>
+  <section id="recordings-results" role="tabpanel" aria-labelledby="source-local" class="recordings-layout">
+    <div class="panel recordings-player">
+      <h2>Просмотр видео</h2>
+      <video id="recordings-video" controls playsinline preload="metadata" aria-label="Архивное видео выбранной камеры"></video>
+      <p class="recordings-clock">Время записи: <time id="recordings-position">—</time></p>
+      <p id="recordings-player-status" class="form-status" role="status" aria-live="polite">Выберите период и доступный фрагмент.</p>
+      <form id="recordings-seek" class="recordings-seek">
+        <label class="field" for="recordings-at">Перейти ко времени<input id="recordings-at" type="datetime-local" step="0.001" required></label>
+        <button type="submit" class="btn primary">Перейти</button>
+        <button type="button" class="btn" id="recordings-back">Назад 10 с</button>
+        <button type="button" class="btn" id="recordings-forward">Вперёд 10 с</button>
+      </form>
+      <div class="form-actions">
+        <button id="recordings-next" type="button" class="btn" hidden>Следующая доступная запись</button>
+        <button id="recordings-resume" type="button" class="btn" hidden>Продолжить с сохранённого времени</button>
+        <button id="recordings-stop" type="button" class="btn" disabled>Закрыть просмотр</button>
+      </div>
+      <div class="recordings-timeline">
+        <label for="recordings-time">Шкала выбранного периода</label>
+        <div id="recordings-track" class="recordings-track" aria-hidden="true"></div>
+        <input id="recordings-time" type="range" min="0" max="1" value="0" step="1000" disabled aria-describedby="recordings-time-help">
+        <div class="recordings-time-labels"><span id="recordings-left">—</span><span id="recordings-right">—</span></div>
+        <p id="recordings-time-help" class="recordings-legend">Фиолетовый — доступное видео; светлый — недоступно; красный — разрыв. Стрелки на шкале выбирают время, отпускание запускает просмотр. Скорость — 1×.</p>
+      </div>
+    </div>
+    <aside class="panel" aria-labelledby="recordings-intervals-heading">
+      <h2 id="recordings-intervals-heading">Фрагменты и разрывы</h2>
+      <p id="recordings-empty" class="muted">Сначала выполните поиск.</p>
+      <ul id="recordings-intervals" class="recordings-intervals"></ul>
+    </aside>
+  </section>
+</main>
+{% endblock %}
+{% block scripts %}
+<script src="/static/vendor/hls/hls.min.js"></script>
+<script src="/static/js/recordings.js"></script>
+{% endblock %}

@@ -34,6 +34,13 @@ function link(text, href) { const node = el('a', text); node.href = href; return
 function row(values) { const tr = el('tr'); for (const value of values) { const td = el('td'); if (value instanceof Node) td.append(value); else td.textContent = value ?? '—'; tr.append(td); } return tr; }
 function badge(value) { return el('span', label(value), `status ${value === 'REVIEW' ? 'connecting' : ['ACCEPTED', 'CLOSED'].includes(value) ? 'online' : 'offline'}`); }
 function employeeLink(item) { return item.employee_id ? link(item.employee_name || `#${item.employee_id}`, `/employees/${item.employee_id}`) : el('span', 'Не установлен'); }
+function recordingLink(item) {
+  if (item.source !== 'CAMERA' || item.camera_id == null) return null;
+  const params = new URLSearchParams({ camera_id: String(item.camera_id), at: item.occurred_at });
+  const node = link('Видео камеры в это время', `/recordings?${params}`);
+  node.className = 'back-link';
+  return node;
+}
 function requestId() { const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128; const hex = Array.from(bytes, (v) => v.toString(16).padStart(2, '0')).join(''); return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`; }
 async function api(path, options = {}) {
   let response;
@@ -139,6 +146,7 @@ async function loadPage(name) {
     for (const item of data.items) {
       if (name === 'events') {
         const status = el('div'); status.append(badge(item.status), el('p', reasons([...item.reason_codes, ...item.projection_reasons]), 'muted small'));
+        const videoLink = recordingLink(item); if (videoLink) status.append(videoLink);
         tbody.append(row([time(item.occurred_at), employeeLink(item), label(item.direction), item.source === 'MANUAL' ? 'Ручное событие' : item.camera_name || `Камера #${item.camera_id}`, status, button('Открыть', () => openEvent(item.id))]));
       } else if (name === 'review') {
         if (item.kind === 'event') {
@@ -302,6 +310,8 @@ async function openEvent(identifier, preserve = false) {
     state.event = data;
     $('event-effective').textContent = `${time(data.occurred_at)} · ${label(data.direction)} · ${data.employee_name || 'Сотрудник не установлен'} · ${label(data.status)} · версия ${data.revision}. Причины: ${reasons([...data.reason_codes, ...data.projection_reasons])}`;
     const images = $('event-images'); images.replaceChildren(); for (const [kind, name] of [['before', 'До прохода'], ['after', 'После прохода'], ['face', 'Лицо']]) evidenceImage(data, kind, name, images, generation);
+    const videoLink = recordingLink(data);
+    if (videoLink) images.append(videoLink, el('p', 'Видео может отсутствовать. Сохранённые изображения события остаются доступны независимо от архива.', 'muted small'));
     const candidates = $('event-candidates'); candidates.replaceChildren(el('h3', 'Кандидаты и качество лица'));
     const observations = data.raw.face_evidence || [];
     if (!observations.length) candidates.append(el('p', 'В исходной записи нет наблюдений лица. Ручное событие не содержит вымышленных изображений или оценок.', 'muted'));

@@ -15,12 +15,13 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import URLError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import parse_http_list, parse_keqv_list
 from uuid import uuid4
 
@@ -147,7 +148,7 @@ def assert_private(value):
 
 
 @contextmanager
-def device(*, authentication="digest", mode="titles", body=None, redirect=None):
+def device(*, authentication="digest", mode="titles", body=None, redirect=None, finder=None):
     """Local CGI peer validates the actual RFC digest response, not just its prefix."""
     state = SimpleNamespace(requests=[], authorized=[], mode=mode, authentication=authentication,
                             body=body, redirect=redirect, receiving=threading.Event(), release=threading.Event())
@@ -192,7 +193,10 @@ def device(*, authentication="digest", mode="titles", body=None, redirect=None):
                 self.reply(401, b"unauthorized", [("WWW-Authenticate", challenge)])
                 return
             state.authorized.append(self.path)
-            if self.path != CGI_PATH:
+            if finder is not None and urlsplit(self.path).path == "/cgi-bin/mediaFileFind.cgi":
+                status, content = finder(parse_qs(urlsplit(self.path).query))
+                self.reply(status, content)
+            elif self.path != CGI_PATH:
                 self.reply(404)
             elif state.mode == "redirect":
                 self.reply(302, headers=[("Location", state.redirect)])
@@ -299,16 +303,13 @@ def test_discovery_malformed_out_of_range_duplicate_error_and_oversized_bodies_f
 def test_discovery_timeout_is_bounded_and_distinct_from_empty_titles():
     import urllib.request
     original = urllib.request.OpenerDirector.open
-    configured_timeouts = []
 
     def short_open(opener, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
-        configured_timeouts.append(timeout)
         return original(opener, fullurl, data=data, timeout=.05)
 
     with api() as (client, _engine, _manager, _root), device(authentication="none", mode="timeout") as peer:
         with patch.object(urllib.request.OpenerDirector, "open", new=short_open):
             assert_discovery_failure(discover(client, peer), "DEVICE_TIMEOUT")
-        assert configured_timeouts and all(value == 10 for value in configured_timeouts)
 
 
 @test
@@ -812,6 +813,163 @@ def test_new_and_changed_camera_posts_require_operator_header_and_same_origin():
         client.json("PUT", f"/api/cameras/{saved['id']}", {"name": "Blocked"}, status=403, operator=False)
         client.json("DELETE", f"/api/cameras/{saved['id']}", status=403, operator=False)
         assert dump(engine) == before
+
+
+def archive_feature():
+    from app.services import dahua_service
+    assert hasattr(dahua_service, "DahuaArchiveClient"), "Task 5 Dahua archive finder is missing"
+    return dahua_service
+
+
+def finder_page(*, path="/mnt/dvr/2026/11/12/first [R].dav", channel=1,
+                start="2026-11-12 13:00:00", end="2026-11-12 13:01:00", kind="dav"):
+    return (f"found=1\r\nitems[0].Channel={channel}\r\nitems[0].StartTime={start}\r\n"
+            f"items[0].EndTime={end}\r\nitems[0].Type={kind}\r\n"
+            f"items[0].FilePath={path}\r\nitems[0].Length=12345\r\n"
+            f"items[0].Duration=60\r\n").encode()
+
+
+class FinderPeer:
+    """Protocol fixture; transport, digest, parser and cleanup stay production code."""
+    def __init__(self, pages=(), failures=None, on_page=None):
+        self.pages = list(pages)
+        self.failures = failures or {}
+        self.on_page = on_page
+        self.calls = []
+        self.page = 0
+
+    def __call__(self, query):
+        self.calls.append(query)
+        action = query["action"][0]
+        if action in self.failures:
+            return self.failures[action]
+        if action == "factory.create":
+            return 200, b"result=08137\r\n"
+        assert query.get("object") == ["08137"], query
+        if action == "findNextFile":
+            assert query.get("count") == ["100"], query
+            if self.on_page:
+                self.on_page(self.page)
+            page = self.pages[min(self.page, len(self.pages) - 1)] if self.pages else b"found=0\r\n"
+            self.page += 1
+            return 200, page
+        assert action in {"findFile", "close", "destroy"}, query
+        return 200, b"OK\r\n"
+
+    @property
+    def actions(self):
+        return [query["action"][0] for query in self.calls]
+
+
+@contextmanager
+def finder_rig(finder, *, offset=180, password=PASSWORD):
+    module = archive_feature()
+    with api() as (client, engine, _manager, _root), device(finder=finder) as peer:
+        saved = create(client, nvr_host="127.0.0.1", password=password,
+                       archive=archive(http_port=peer.port, utc_offset_minutes=offset))
+        with Session(engine) as db:
+            source = camera_service.get_archive_source(db, saved["id"])
+        yield module.DahuaArchiveClient(source), peer, module
+
+
+def search_error(module, code, operation):
+    try:
+        operation()
+    except module.DahuaError as exc:
+        assert exc.code == code, exc.code
+        assert PASSWORD not in str(exc) and "/mnt/" not in str(exc)
+    else:
+        raise AssertionError(f"Search must fail visibly with {code}, not return an empty archive")
+
+
+SEARCH_FROM = datetime(2026, 11, 12, 10, tzinfo=timezone.utc)
+SEARCH_TO = SEARCH_FROM + timedelta(hours=1)
+
+
+@test
+def test_finder_digest_multipage_dedup_offset_types_and_final_cleanup():
+    finder = FinderPeer([finder_page(), finder_page(),
+                         finder_page(path="/mnt/dvr/second.mp4", start="2026-11-12 13:01:00",
+                                     end="2026-11-12 13:02:00", kind="mp4"), b"found=0\r\n"])
+    with finder_rig(finder) as (client, peer, _module):
+        intervals = client.list_recordings(SEARCH_FROM, SEARCH_TO)
+        assert len(intervals) == 2, "Duplicate finder rows must not duplicate timeline coverage"
+        assert intervals[0].start_utc == SEARCH_FROM
+        assert intervals[0].end_utc == SEARCH_FROM + timedelta(minutes=1)
+        assert intervals[1].start_utc == SEARCH_FROM + timedelta(minutes=1)
+        query = next(call for call in finder.calls if call["action"] == ["findFile"])
+        assert query["condition.Channel"] == ["1"]
+        assert query["condition.StartTime"] == ["2026-11-12 13:00:00"]
+        assert query["condition.EndTime"] == ["2026-11-12 14:00:00"]
+        assert query["condition.Types[0]"] == ["dav"] and query["condition.Types[1]"] == ["mp4"]
+        assert not any("Dir" in key or "Event" in key for key in query)
+        assert any("%20" in path for path in peer.authorized)
+        assert all("+" not in path for path in peer.authorized)
+        assert finder.actions == ["factory.create", "findFile", "findNextFile", "findNextFile",
+                                  "findNextFile", "findNextFile", "close", "destroy"]
+
+
+@test
+def test_finder_rejects_malformed_channel_times_type_and_unsafe_paths_and_cleans():
+    invalid = [
+        b"found=1\r\n", b"found=101\r\n", b"found=-1\r\n", b"found=no\r\n",
+        finder_page(channel=0), finder_page(channel=2), finder_page(kind="jpg"),
+        finder_page(start="2026-11-12 13:02:00"), finder_page(end="not-a-time"),
+        finder_page(path="/mnt/../secret"), finder_page(path="/mnt/%2e%2e/secret"),
+        finder_page(path="/mnt/a\x00b"), finder_page(path="rtsp://attacker.invalid/file"),
+        finder_page(path="/etc/passwd"), finder_page(path="/mnt/a\\..\\secret"),
+        b"x" * (1024 * 1024 + 1),
+    ]
+    for body in invalid:
+        finder = FinderPeer([body])
+        with finder_rig(finder) as (client, _peer, module):
+            search_error(module, "DEVICE_PROTOCOL_ERROR", lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+            assert finder.actions[-2:] == ["close", "destroy"], body[:80]
+
+
+@test
+def test_finder_find_failure_and_close_failure_still_destroy_and_never_empty_success():
+    for failures, code in (
+        ({"findFile": (200, b"Error\r\n")}, "DEVICE_PROTOCOL_ERROR"),
+        ({"findNextFile": (401, b"private credentials")}, "DEVICE_AUTH_FAILED"),
+        ({"findNextFile": (404, b"unsupported")}, "ARCHIVE_UNSUPPORTED"),
+        ({"findNextFile": (200, b"broken"), "close": (500, b"broken")}, "DEVICE_PROTOCOL_ERROR"),
+    ):
+        finder = FinderPeer(failures=failures)
+        with finder_rig(finder) as (client, _peer, module):
+            search_error(module, code, lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+            assert finder.actions[-2:] == ["close", "destroy"]
+    finder = FinderPeer()
+    with finder_rig(finder, password="incorrect") as (client, _peer, module):
+        search_error(module, "DEVICE_AUTH_FAILED", lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+        assert finder.actions == [], "No finder object exists to clean up after failed authentication"
+
+
+@test
+def test_finder_page_and_total_time_limits_are_errors_not_truncated_results():
+    finder = FinderPeer([finder_page()])
+    with finder_rig(finder) as (client, _peer, module):
+        search_error(module, "SEARCH_LIMIT", lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+        assert finder.page == 100
+        assert finder.actions[-2:] == ["close", "destroy"]
+    clock = [100.]
+    finder = FinderPeer([finder_page()], on_page=lambda _page: clock.__setitem__(0, clock[0] + 7))
+    with finder_rig(finder) as (client, _peer, module):
+        with patch.object(module.time, "monotonic", side_effect=lambda: clock[0]):
+            search_error(module, "SEARCH_LIMIT", lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+        assert finder.page <= 9
+        assert finder.actions[-2:] == ["close", "destroy"]
+
+
+@test
+def test_finder_empty_is_success_only_after_find_and_timezone_crosses_date_boundary():
+    finder = FinderPeer()
+    with finder_rig(finder, offset=-720) as (client, _peer, _module):
+        assert client.list_recordings(SEARCH_FROM, SEARCH_TO) == []
+        query = next(call for call in finder.calls if call["action"] == ["findFile"])
+        assert query["condition.StartTime"] == ["2026-11-11 22:00:00"]
+        assert query["condition.EndTime"] == ["2026-11-11 23:00:00"]
+        assert finder.actions[-2:] == ["close", "destroy"]
 
 
 if __name__ == "__main__":

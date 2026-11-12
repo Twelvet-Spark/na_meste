@@ -36,6 +36,7 @@ from app.time_utils import utcnow
 from app.services.telegram_service import TelegramNotifier
 from app.media.process_guard import MediaProcessGuard
 from app.services.recording_service import RecordingManager
+from app.media.playback import PlaybackManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +64,15 @@ async def lifespan(app: FastAPI):
     except Exception:
         app.state.recording_error = "MEDIA_STORAGE_UNAVAILABLE"
         logger.warning("Manual recording unavailable: MEDIA_STORAGE_UNAVAILABLE")
+    app.state.playbacks = None
+    app.state.playback_error = None
+    if app.state.recordings is not None:
+        try:
+            app.state.playbacks = PlaybackManager(
+                engine, app.state.recordings.storage, app.state.manager.ffmpeg, app.state.manager.ffprobe)
+        except Exception:
+            app.state.playback_error = "PLAYBACK_STORAGE_UNAVAILABLE"
+            logger.warning("Archive playback unavailable: PLAYBACK_STORAGE_UNAVAILABLE")
 
     # --- Telegram-уведомления ---
     app.state.telegram = None
@@ -141,6 +151,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # Independent media stops first; preserve the existing evidence-drain order below.
+        if app.state.playbacks is not None:
+            try:
+                app.state.playbacks.shutdown()
+            except Exception:
+                logger.warning("Archive playback shutdown incomplete: MEDIA_STOP_PENDING")
         if app.state.recordings is not None:
             try:
                 app.state.recordings.shutdown()
@@ -201,6 +216,11 @@ async def employee_page(request: Request, employee_id: int):
     return templates.TemplateResponse(
         request, "employee_detail.html", {"employee_id": employee_id}
     )
+
+
+@app.get("/recordings", include_in_schema=False)
+async def recordings_page(request: Request):
+    return templates.TemplateResponse(request, "recordings.html", {})
 
 
 @app.get("/presence", include_in_schema=False)

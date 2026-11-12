@@ -2,7 +2,7 @@
 
 Only internal CGI operations are exposed. No browser-supplied path, proxy,
 redirect, unverified TLS, preemptive Basic credentials, or raw device error is
-returned. Search/playback is intentionally not implemented here.
+returned. Archive finder paths remain private to the server-side playback adapter.
 """
 import re
 import socket
@@ -10,9 +10,11 @@ import ssl
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPException as HTTPProtocolError
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode
 from urllib.request import (
     HTTPBasicAuthHandler, HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm,
     HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener,
@@ -71,15 +73,17 @@ class DahuaClient:
             raise DahuaError("DEVICE_TIMEOUT")
 
     def _channel_config(self):
-        # The operation/path is internal, not an arbitrary URL transport API.
-        query = urlencode({"action": "getConfig", "name": "ChannelTitle"})
-        request = Request(self._base + "/cgi-bin/configManager.cgi?" + query,
+        return self._request("/cgi-bin/configManager.cgi?" + urlencode(
+            {"action": "getConfig", "name": "ChannelTitle"}))
+
+    def _request(self, operation, *, deadline=None):
+        request = Request(self._base + operation,
                           headers={"Accept": "text/plain", "Accept-Encoding": "identity"})
-        deadline = time.monotonic() + TIMEOUT_SECONDS
+        deadline = min(deadline, time.monotonic() + TIMEOUT_SECONDS) if deadline is not None else time.monotonic() + TIMEOUT_SECONDS
         response = None
         try:
             self._check(deadline)
-            response = self._opener.open(request, timeout=TIMEOUT_SECONDS)
+            response = self._opener.open(request, timeout=max(.001, deadline - time.monotonic()))
             with self._lock:
                 self._response = response
             self._check(deadline)
@@ -197,3 +201,122 @@ class DahuaSetup:
             return {"channels": channels, "capabilities": {"channel_titles": True}, "error_code": None}
         except DahuaError as exc:
             return {"channels": [], "capabilities": {"channel_titles": False}, "error_code": exc.code}
+
+
+@dataclass(frozen=True)
+class ArchiveInterval:
+    start_utc: datetime
+    end_utc: datetime
+    path: str = field(repr=False)
+    channel: int
+
+
+def archive_path(value):
+    """Only manufacturer-documented absolute media paths, never URLs or traversal."""
+    decoded = unquote(value)
+    if (not value.startswith("/mnt/") or not decoded.startswith("/mnt/")
+            or "\\" in decoded or "%" in decoded
+            or any(ord(char) < 32 or ord(char) == 127 for char in decoded)
+            or any(part in ("", ".", "..") for part in decoded.split("/")[1:])):
+        raise DahuaError("DEVICE_PROTOCOL_ERROR")
+    return decoded
+
+
+class DahuaArchiveClient(DahuaClient):
+    def __init__(self, source):
+        super().__init__(host=source.host, http_scheme=source.http_scheme, http_port=source.http_port,
+                         username=source.username, password=source.password)
+        self.source = source
+        self.zone = timezone(timedelta(minutes=source.utc_offset_minutes))
+
+    def _finder(self, action, *, deadline=None, **fields):
+        query = urlencode({"action": action, **fields}, quote_via=quote)
+        return self._request("/cgi-bin/mediaFileFind.cgi?" + query, deadline=deadline)
+
+    def _page(self, text):
+        fields = {}
+        for line in text.splitlines():
+            if not line:
+                continue
+            if "=" not in line:
+                raise DahuaError("DEVICE_PROTOCOL_ERROR")
+            key, value = line.split("=", 1)
+            if key in fields:
+                raise DahuaError("DEVICE_PROTOCOL_ERROR")
+            fields[key] = value
+        found = fields.pop("found", "")
+        if not found.isdecimal() or len(found) > 3 or int(found) > 100:
+            raise DahuaError("DEVICE_PROTOCOL_ERROR")
+        count = int(found)
+        for key in fields:
+            match = re.fullmatch(r"items\[(\d+)\]\.[A-Za-z][A-Za-z0-9]*", key)
+            if match is None or int(match[1]) >= count:
+                raise DahuaError("DEVICE_PROTOCOL_ERROR")
+        result = []
+        try:
+            for index in range(count):
+                prefix = f"items[{index}]."
+                channel = int(fields[prefix + "Channel"])
+                if channel != self.source.channel or fields[prefix + "Type"].lower() not in ("dav", "mp4"):
+                    raise ValueError
+                start = datetime.strptime(fields[prefix + "StartTime"], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=self.zone).astimezone(timezone.utc)
+                end = datetime.strptime(fields[prefix + "EndTime"], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=self.zone).astimezone(timezone.utc)
+                if end <= start:
+                    raise ValueError
+                result.append(ArchiveInterval(start, end, archive_path(fields[prefix + "FilePath"]), channel))
+        except (ValueError, KeyError, OverflowError):
+            raise DahuaError("DEVICE_PROTOCOL_ERROR") from None
+        return result
+
+    def list_recordings(self, start_utc, end_utc):
+        try:
+            if (start_utc.utcoffset() is None or end_utc.utcoffset() is None
+                    or not timedelta(0) < end_utc - start_utc <= timedelta(days=1)):
+                raise ValueError
+            start = start_utc.astimezone(self.zone).strftime("%Y-%m-%d %H:%M:%S")
+            end = end_utc.astimezone(self.zone).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, AttributeError):
+            raise DahuaError("DEVICE_PROTOCOL_ERROR") from None
+        deadline = time.monotonic() + 60
+        handle = None
+        try:
+            text = self._finder("factory.create", deadline=deadline).strip()
+            match = re.fullmatch(r"result=([0-9]{1,32})", text)
+            if match is None:
+                raise DahuaError("DEVICE_PROTOCOL_ERROR")
+            handle = match[1]
+            response = self._finder("findFile", deadline=deadline, object=handle, **{
+                "condition.Channel": self.source.channel, "condition.StartTime": start,
+                "condition.EndTime": end, "condition.Types[0]": "dav", "condition.Types[1]": "mp4"})
+            if response.strip() != "OK":
+                raise DahuaError("DEVICE_PROTOCOL_ERROR")
+            intervals = {}
+            for _page in range(100):
+                if time.monotonic() >= deadline:
+                    raise DahuaError("SEARCH_LIMIT")
+                entries = self._page(self._finder("findNextFile", deadline=deadline, object=handle, count=100))
+                if time.monotonic() >= deadline:
+                    raise DahuaError("SEARCH_LIMIT")
+                if not entries:
+                    return sorted(intervals.values(), key=lambda row: (row.start_utc, row.end_utc))
+                for interval in entries:
+                    intervals[(interval.path, interval.start_utc, interval.end_utc)] = interval
+            raise DahuaError("SEARCH_LIMIT")
+        except DahuaError as exc:
+            if time.monotonic() >= deadline:
+                raise DahuaError("SEARCH_LIMIT") from None
+            raise exc
+        finally:
+            if handle is not None:
+                # Cancellation must not suppress either server-side cleanup operation.
+                cleanup = DahuaClient(host=self.source.host, http_scheme=self.source.http_scheme,
+                                      http_port=self.source.http_port, username=self.source.username,
+                                      password=self.source.password)
+                for action in ("close", "destroy"):
+                    try:
+                        cleanup._request("/cgi-bin/mediaFileFind.cgi?" + urlencode(
+                            {"action": action, "object": handle}, quote_via=quote))
+                    except DahuaError:
+                        pass

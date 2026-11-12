@@ -235,6 +235,35 @@ class RecordingStorage:
             except (OSError, ValueError):
                 pass  # Index metadata survives; never delete unknown neighbouring files.
 
+    def enforce_cache(self, maximum_bytes):
+        """Apply the playback-only cap, evicting unused known cache before refusing writes."""
+        with self.lock:
+            root = self.path("cache", directory=True)
+            total = 0
+            for directory in root.iterdir():
+                try:
+                    ordinary(directory, directory=True)
+                    for path in directory.iterdir():
+                        total += ordinary(path).st_size
+                except (OSError, ValueError):
+                    continue
+            for key, _expiry in sorted(self.cache.items(), key=lambda item: item[1]):
+                if total <= maximum_bytes:
+                    break
+                if key in self.leases or key in self.open_keys:
+                    continue
+                try:
+                    path = self.path(key)
+                    size = path.stat().st_size
+                    path.unlink()
+                    total -= size
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError):
+                    continue
+                del self.cache[key]
+            return total <= maximum_bytes
+
     def enforce(self):
         """Evict safe unused objects and return whether a new writer can be admitted."""
         with self.lock:
