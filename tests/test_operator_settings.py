@@ -788,6 +788,90 @@ def test_real_uvicorn_error_formatter_discards_exception_and_cached_rendering_co
     no_secrets(vars(record))
 
 
+def startup_logging_output(mode):
+    """Run real entrypoint/Config ordering, replacing only server socket serving."""
+    import io
+    import runpy
+    import uvicorn
+    from contextlib import redirect_stdout, redirect_stderr
+    from app.database import database as database_module
+    output, errors = io.StringIO(), io.StringIO()
+    observed = []
+
+    def emit_requests(server=None, *args, **kwargs):
+        if server is not None:
+            server.started = True  # The network boundary has been replaced, not Config.
+        logging.getLogger("uvicorn.error").info(
+            "Started server process [%d]", 73129,
+            extra={"color_message": "Started server process [\033[36m%d\033[0m]"})
+        access = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:54321", "GET",
+             "/api/debug/status?token=" + TOKEN + "&authorization=" + AUTH + "&cookie=" + COOKIE,
+             "1.1", 206), None)
+        access.headers = {"Authorization": "Bearer " + AUTH, "Cookie": COOKIE}
+        access.body = {"password": PASSWORD}
+        logging.getLogger("uvicorn.access").handle(access)
+        observed.append(access)
+        try:
+            raise RuntimeError(URL + " Authorization: " + AUTH)
+        except RuntimeError as exc:
+            failure = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1,
+                "ASGI failure: %s", (exc,), sys.exc_info())
+            failure.color_message = "Failure %s " + TOKEN
+            failure.headers = {"Cookie": COOKIE}
+            logging.getLogger("uvicorn.error").handle(failure)
+            observed.append(failure)
+
+    with database() as (engine, root), ExitStack() as stack:
+        stack.enter_context(patch.dict(os.environ, {
+            "DATABASE_URL": f"sqlite:///{(root / 'startup.db').as_posix()}",
+            "OPERATOR_SETTINGS_PATH": str(root / "operator-settings.json"),
+            "RECORDING_ROOT": str(root / "recordings"),
+            "AI_ENABLED": "false", "TELEGRAM_ENABLED": "false",
+        }, clear=True))
+        active = config.Settings(_env_file=None, app_host="127.0.0.1", app_port=0)
+        stack.enter_context(patch.object(config, "settings", active))
+        stack.enter_context(patch.object(database_module, "engine", engine))
+        # Fresh process-equivalent handler state; restore caller's logging afterwards.
+        for name in ("", "uvicorn", "uvicorn.error", "uvicorn.access", "app"):
+            logger = logging.getLogger(name)
+            for key, value in (("handlers", []), ("filters", []), ("level", logging.NOTSET),
+                               ("propagate", True), ("disabled", False)):
+                stack.enter_context(patch.object(logger, key, value))
+        stack.enter_context(redirect_stdout(output))
+        stack.enter_context(redirect_stderr(errors))
+        if mode == "programmatic":
+            stack.enter_context(patch.object(uvicorn.Server, "run", emit_requests))
+            runpy.run_path(str(config.BASE_DIR / "main.py"), run_name="__main__")
+        else:
+            # Config precedes application import in the supported CLI path.
+            stack.enter_context(patch.dict(sys.modules))
+            sys.modules.pop("main", None)
+            server_config = uvicorn.Config("main:app", host="127.0.0.1", port=0,
+                                           lifespan="off", use_colors=True)
+            server_config.load_app()
+            emit_requests()
+    rendered = output.getvalue() + errors.getvalue()
+    assert "--- Logging error ---" not in rendered
+    assert "GET" in rendered and "/api/debug/status" in rendered and "206" in rendered
+    assert "73129" in rendered and "%d" not in rendered
+    no_secrets(rendered)
+    assert "UNEXPECTED_ERROR" in rendered and "Traceback (most recent call last)" not in rendered
+    for record in observed:
+        no_secrets(vars(record))
+
+
+@test
+def test_programmatic_main_startup_preserves_sanitized_logging_after_real_uvicorn_config():
+    startup_logging_output("programmatic")
+
+
+@test
+def test_uvicorn_import_startup_preserves_sanitized_logging_after_real_config_load_app():
+    startup_logging_output("import")
+
+
 if __name__ == "__main__":
     failures = 0
     for case in TESTS:

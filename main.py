@@ -274,4 +274,7 @@ async def global_person_page(request: Request, global_id: int):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=settings.app_host, port=settings.app_port)
+    # This module already owns and sanitizes the handlers. Uvicorn's default
+    # dictConfig would replace them after import and bypass the filtered root.
+    # CLI startup configures Uvicorn before importing this module instead.
+    uvicorn.run(app, host=settings.app_host, port=settings.app_port, log_config=None)
