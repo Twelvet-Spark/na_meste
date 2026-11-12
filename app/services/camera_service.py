@@ -20,7 +20,7 @@ from app.database.models import (
     AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, CameraArchive,
     GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSession,
 )
-from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraSource
+from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraDeletion, CameraSource
 from app.rtsp.dahua import build_rtsp_url, normalize_host
 from app.rtsp.reader import parse_frame_rate
 from app.media.process_guard import MediaProcessGuard
@@ -296,7 +296,8 @@ def _create_camera(writer: Session, data: CameraCreate) -> CameraSource:
         writer.add(archive)
     writer.flush()
     return CameraSource.from_camera(camera, source_revision=config.source_revision,
-                                    publication_sequence=next(_publication_sequences), archive=archive)
+                                    publication_sequence=next(_publication_sequences), archive=archive,
+                                    is_creation=True)
 
 
 def create_camera(db: Session, data: CameraCreate) -> CameraSource:
@@ -398,8 +399,8 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
         raise HTTPException(503, "Database unavailable; camera was not changed") from exc
 
 
-def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
-    """Retain every historical/ever-assigned camera, even when disabled."""
+def delete_camera(db: Session, camera: Camera | CameraSource) -> CameraDeletion:
+    """Delete without history loss and capture the ordered publication tombstone."""
     camera_id, name = camera.id, camera.name
     bind = db.get_bind().engine
     db.rollback()
@@ -438,7 +439,9 @@ def delete_camera(db: Session, camera: Camera | CameraSource) -> None:
                 writer.delete(archive)
                 writer.flush()
             writer.delete(current)
+            deletion = CameraDeletion(camera_id, next(_publication_sequences))
         db.expire_all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     logger.info("Удалена камера #%d «%s»", camera_id, name)
+    return deletion

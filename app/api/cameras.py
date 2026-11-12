@@ -249,13 +249,13 @@ def api_delete_camera(
     request: Request = None,
 ):
     camera = _camera_or_404(db, camera_id)
-    service.delete_camera(db, camera)
+    deletion = service.delete_camera(db, camera)
     if request is not None:
         _setup(request).deleted(camera_id)
         playbacks = getattr(request.app.state, "playbacks", None)
         if playbacks is not None:
             playbacks.deleted(camera_id)
-    manager.stop(camera_id)
+    manager.stop(deletion)
     return None
 
 

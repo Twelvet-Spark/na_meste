@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -36,7 +37,7 @@ from app.ai.tracker import TrackLifecycle
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import get_db
-from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime
+from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime, Camera
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
 from app.services import camera_service
@@ -1138,6 +1139,167 @@ def test_superseded_start_and_sync_cannot_restart_a_newer_disabled_source():
                     assert published == [("source-a", 2)]
                 finally:
                     manager.stop_all()
+
+
+@contextmanager
+def reader_publication_app():
+    """Real API, SQLite, manager and readers; only external reader startup is isolated."""
+    with calibration_app() as fixture:
+        with patch("app.rtsp.manager.resolve_ffmpeg", return_value=("unused", "unused")):
+            manager = ReaderManager()
+        fixture.app.state.manager = fixture.manager = manager
+        fixture.started = []
+
+        def start_without_external_process(reader):
+            fixture.started.append(reader)
+            reader._set_status(CameraStatus.ONLINE)
+
+        def same_creation_time(_mapper, _connection, camera):
+            # SQLite can reuse the highest deleted ID. Timestamp/revision equality
+            # must not make two such incarnations indistinguishable.
+            camera.created_at = camera.updated_at = STAMP
+
+        event.listen(Camera, "before_insert", same_creation_time)
+        try:
+            with patch.object(RTSPReader, "start", autospec=True,
+                              side_effect=start_without_external_process):
+                yield fixture
+        finally:
+            manager.stop_all()
+            event.remove(Camera, "before_insert", same_creation_time)
+
+
+def reader_batch(host):
+    return {"request_id": str(uuid4()), "nvr_host": host,
+            "username": "operator", "password": "secret",
+            "channels": [{"channel": 1, "name": host, "enabled": True}]}
+
+
+@contextmanager
+def held_camera_publication(fixture, service_name, method, path, payload=None):
+    """Pause only after the real writer commits, before its API publishes."""
+    committed, release = threading.Event(), threading.Event()
+    original = getattr(camera_service, service_name)
+    held = SimpleNamespace(captured=None, response=None, errors=[])
+
+    def commit_then_hold(*args, **kwargs):
+        held.captured = original(*args, **kwargs)
+        committed.set()
+        if not release.wait(10):
+            raise AssertionError("Committed camera publication was not released")
+        return held.captured
+
+    def send_request():
+        try:
+            held.response = request(fixture, method, path, payload)
+        except BaseException as exc:
+            held.errors.append(exc)
+
+    with patch.object(camera_service, service_name, side_effect=commit_then_hold):
+        worker = threading.Thread(target=send_request, name="held-camera-publication", daemon=True)
+        worker.start()
+        try:
+            assert committed.wait(10), held.errors
+            yield held
+        finally:
+            release.set()
+            worker.join(10)
+            assert not worker.is_alive(), "Held camera request did not finish"
+            assert not held.errors, held.errors
+
+
+@test
+def test_deleted_batch_source_cannot_start_or_sync_after_delayed_publication():
+    with reader_publication_app() as fixture:
+        with held_camera_publication(fixture, "create_camera_batch", "POST",
+                                     "/api/cameras/batch", reader_batch("deleted-source")) as held:
+            source = held.captured[1][0]
+            with Session(fixture.engine) as db:
+                assert db.get(Camera, source.id) is not None
+            assert request(fixture, "DELETE", f"/api/cameras/{source.id}") == (204, None)
+            with Session(fixture.engine) as db:
+                assert db.get(Camera, source.id) is None
+                assert db.get(AttendanceCamera, source.id) is None
+        assert held.response[0] == 201, held.response
+        assert fixture.manager.get(source.id) is None, "Deleted batch publication restarted a reader"
+        assert source.id not in fixture.manager.reader_ids()
+        assert fixture.started == [], "Deleted camera reached the external reader startup boundary"
+        fixture.manager.sync(source, {"nvr_host"})
+        assert fixture.manager.start(source) is None
+        assert fixture.manager.get(source.id) is None
+        assert fixture.started == []
+
+
+@test
+def test_reused_camera_id_starts_new_incarnation_after_published_delete():
+    with reader_publication_app() as fixture:
+        status, body = request(fixture, "POST", "/api/cameras/batch", reader_batch("old-source"))
+        assert status == 201, body
+        old = body["cameras"][0]
+        old_reader = fixture.manager.get(old["id"])
+        assert old_reader.status() == CameraStatus.ONLINE
+        assert request(fixture, "DELETE", f"/api/cameras/{old['id']}") == (204, None)
+        assert old_reader.status() == CameraStatus.OFFLINE
+        assert fixture.manager.get(old["id"]) is None
+        status, body = request(fixture, "POST", "/api/cameras/batch", reader_batch("new-source"))
+        assert status == 201, body
+        new = body["cameras"][0]
+        assert new["id"] == old["id"] and new["created_at"] == old["created_at"]
+        reader = fixture.manager.get(new["id"])
+        assert reader is not None and reader is not old_reader
+        assert reader.source_revision == old_reader.source_revision == 1
+        assert urlsplit(reader.rtsp_url).hostname == "new-source"
+        assert reader.status() == CameraStatus.ONLINE
+        assert len(fixture.started) == 2
+
+
+@test
+def test_delayed_old_delete_cannot_stop_reused_id_new_incarnation():
+    with reader_publication_app() as fixture:
+        status, body = request(fixture, "POST", "/api/cameras/batch", reader_batch("old-source"))
+        assert status == 201, body
+        old = body["cameras"][0]
+        old_reader = fixture.manager.get(old["id"])
+        with held_camera_publication(fixture, "delete_camera", "DELETE",
+                                     f"/api/cameras/{old['id']}") as held:
+            with Session(fixture.engine) as db:
+                assert db.get(Camera, old["id"]) is None
+            status, body = request(fixture, "POST", "/api/cameras/batch", reader_batch("new-source"))
+            assert status == 201, body
+            new = body["cameras"][0]
+            assert new["id"] == old["id"] and new["created_at"] == old["created_at"]
+            reader = fixture.manager.get(new["id"])
+            assert reader is not None and reader is not old_reader
+            assert reader.source_revision == old_reader.source_revision == 1
+            assert urlsplit(reader.rtsp_url).hostname == "new-source"
+        assert held.response == (204, None), held.response
+        assert fixture.manager.get(new["id"]) is reader, "An old deletion stopped the new incarnation"
+        assert reader.status() == CameraStatus.ONLINE
+        assert old_reader.status() == CameraStatus.OFFLINE
+        assert fixture.manager.reader_ids() == [new["id"]]
+        assert len(fixture.started) == 2
+        with Session(fixture.engine) as db:
+            assert db.get(Camera, new["id"]).nvr_host == "new-source"
+
+
+@test
+def test_history_delete_rejection_preserves_real_reader_and_database():
+    with reader_publication_app() as fixture:
+        status, body = request(fixture, "POST", "/api/cameras/batch", reader_batch("retained-source"))
+        assert status == 201, body
+        camera_id = body["cameras"][0]["id"]
+        reader = fixture.manager.get(camera_id)
+        with Session(fixture.engine) as db:
+            db.get(AttendanceCamera, camera_id).role = "ENTRY"
+            db.commit()
+        status, body = request(fixture, "DELETE", f"/api/cameras/{camera_id}")
+        assert status == 409 and body["detail"] == "Camera has history; disable instead"
+        assert fixture.manager.get(camera_id) is reader
+        assert reader.status() == CameraStatus.ONLINE
+        assert len(fixture.started) == 1
+        with Session(fixture.engine) as db:
+            assert db.get(Camera, camera_id) is not None
+            assert db.get(AttendanceCamera, camera_id).role == "ENTRY"
 
 
 @test

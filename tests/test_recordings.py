@@ -290,7 +290,7 @@ def rig(*, start_manager=True, policy=None):
         app.include_router(cameras_router)
         app.state.manager = SimpleNamespace(
             ffprobe="ffprobe-fixture", status=lambda _id: {"status": "OFFLINE"},
-            start=lambda _source: None, sync=lambda _source, _changed: None, stop=lambda _id: None)
+            start=lambda _source: None, sync=lambda _source, _changed: None, stop=lambda _deletion: None)
 
         def isolated_db():
             with Session(engine) as db:
@@ -1738,6 +1738,21 @@ def test_remote_timeline_caches_both_revisions_and_never_reports_device_errors_a
         timeline(r, "dahua")
         assert r.finder.actions.count("factory.create") == 4
         assert_media_private(first)
+
+
+@test
+def test_remote_timeline_overlong_finder_index_returns_safe_502_and_cleans():
+    from test_dahua_archive import PASSWORD, finder_page
+    with remote_playback_rig() as r:
+        r.finder.pages = [finder_page() + b"items[" + b"9" * 5000 + b"].Length=12345\r\n"]
+        try:
+            result = timeline(r, "dahua", status=502)
+            assert result == {"detail": "DEVICE_PROTOCOL_ERROR"}, result
+            assert_media_private(result)
+            assert PASSWORD not in json.dumps(result)
+        finally:
+            assert r.finder.actions == [
+                "factory.create", "findFile", "findNextFile", "close", "destroy"]
 
 
 @test

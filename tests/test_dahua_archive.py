@@ -80,8 +80,8 @@ class Publications:
     def sync(self, source, changed_fields):
         self.synced.append((source, frozenset(changed_fields)))
 
-    def stop(self, camera_id):
-        self.stopped.append(camera_id)
+    def stop(self, deletion):
+        self.stopped.append(deletion.id)
 
 
 @contextmanager
@@ -925,6 +925,35 @@ def test_finder_rejects_malformed_channel_times_type_and_unsafe_paths_and_cleans
         with finder_rig(finder) as (client, _peer, module):
             search_error(module, "DEVICE_PROTOCOL_ERROR", lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
             assert finder.actions[-2:] == ["close", "destroy"], body[:80]
+
+
+@test
+def test_finder_rejects_overlong_item_indices_and_cleans_digest_search():
+    # A padded zero would otherwise alias a valid row and be silently ignored.
+    for index in (b"9" * 5000, b"000"):
+        body = finder_page() + b"items[" + index + b"].Length=12345\r\n"
+        finder = FinderPeer([body])
+        with finder_rig(finder) as (client, _peer, module):
+            try:
+                search_error(module, "DEVICE_PROTOCOL_ERROR",
+                             lambda: client.list_recordings(SEARCH_FROM, SEARCH_TO))
+            finally:
+                assert finder.actions == [
+                    "factory.create", "findFile", "findNextFile", "close", "destroy"]
+
+
+@test
+def test_finder_accepts_complete_hundred_record_page_including_index_99():
+    body = b"found=100\r\n" + b"".join(
+        finder_page(path=f"/mnt/dvr/{index}.dav").partition(b"\r\n")[2].replace(
+            b"items[0].", f"items[{index}].".encode())
+        for index in range(100))
+    finder = FinderPeer([body, b"found=0\r\n"])
+    with finder_rig(finder) as (client, _peer, _module):
+        intervals = client.list_recordings(SEARCH_FROM, SEARCH_TO)
+        assert len(intervals) == 100, "All legitimate finder indices 0 through 99 must remain usable"
+        assert finder.actions == [
+            "factory.create", "findFile", "findNextFile", "findNextFile", "close", "destroy"]
 
 
 @test

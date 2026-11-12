@@ -41,6 +41,13 @@ class ArchiveSource:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraDeletion:
+    """Credential-free tombstone captured under the camera writer's lock."""
+    id: int
+    publication_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
 class CameraSource:
     id: int
     name: str
@@ -58,6 +65,9 @@ class CameraSource:
     # while holding SQLite's write lock, including name/enabled-only changes.
     publication_sequence: int = 0
     archive: ArchiveSettings | None = None
+    # An INSERT is a new incarnation even when SQLite reuses both ID and
+    # creation timestamp. Its deletion predecessor may not be published yet.
+    is_creation: bool = False
 
     @property
     def has_password(self) -> bool:
@@ -65,11 +75,12 @@ class CameraSource:
 
     @classmethod
     def from_camera(cls, camera: "Camera", *, source_revision: int,
-                    publication_sequence: int = 0, archive=None) -> "CameraSource":
+                    publication_sequence: int = 0, archive=None,
+                    is_creation: bool = False) -> "CameraSource":
         """Call while the camera and its revision share one database snapshot."""
         return cls(id=camera.id, name=camera.name, nvr_host=camera.nvr_host,
                    rtsp_port=camera.rtsp_port, username=camera.username, password=camera.password,
                    channel=camera.channel, stream_type=camera.stream_type, enabled=camera.enabled,
                    created_at=camera.created_at, updated_at=camera.updated_at,
                    source_revision=source_revision, publication_sequence=publication_sequence,
-                   archive=ArchiveSettings.from_archive(archive))
+                   archive=ArchiveSettings.from_archive(archive), is_creation=is_creation)

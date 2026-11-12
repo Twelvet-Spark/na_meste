@@ -411,7 +411,7 @@ def test_camera_history_rejection_does_not_stop_reader():
             db.commit()
             class RunningReader:
                 stopped = False
-                def stop(self, _camera_id):
+                def stop(self, _deletion):
                     self.stopped = True
             manager = RunningReader()
             exc = rejects(HTTPException, lambda: api_delete_camera(cam.id, db, manager))

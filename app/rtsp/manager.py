@@ -6,7 +6,7 @@ from typing import Optional
 from app.config import resolve_ffmpeg, settings
 from app.rtsp.dahua import build_rtsp_url
 from app.rtsp.reader import RTSPReader
-from app.rtsp.source import CONNECTION_FIELDS, CameraSource
+from app.rtsp.source import CONNECTION_FIELDS, CameraDeletion, CameraSource
 
 logger = logging.getLogger("app.rtsp.manager")
 
@@ -19,7 +19,7 @@ class ReaderManager:
 
     def __init__(self):
         self._readers: dict[int, RTSPReader] = {}
-        self._published_sources: dict[int, CameraSource] = {}
+        self._published_sources: dict[int, CameraSource | CameraDeletion] = {}
         self._lock = threading.RLock()
         self._ffmpeg, self._ffprobe = resolve_ffmpeg()
         if not self._ffmpeg or not self._ffprobe:
@@ -45,12 +45,17 @@ class ReaderManager:
 
     def _admit_source_locked(self, camera: CameraSource) -> bool:
         previous = self._published_sources.get(camera.id)
-        if previous is not None:
+        if isinstance(previous, CameraDeletion):
+            if camera.publication_sequence <= previous.publication_sequence:
+                return False
+        elif previous is not None:
             if ((camera.publication_sequence, camera.source_revision)
                     < (previous.publication_sequence, previous.source_revision)):
                 logger.info("Пропущена устаревшая публикация камеры #%d", camera.id)
                 return False
-            if (camera.created_at == previous.created_at
+            if (not (camera.is_creation
+                     and camera.publication_sequence > previous.publication_sequence)
+                    and camera.created_at == previous.created_at
                     and camera.source_revision == previous.source_revision
                     and any(getattr(camera, name) != getattr(previous, name) for name in CONNECTION_FIELDS)):
                 raise ValueError("One camera source revision cannot describe different connections")
@@ -83,10 +88,14 @@ class ReaderManager:
         logger.info("Ридер камеры #%d «%s» запущен", camera.id, camera.name)
         return reader
 
-    def stop(self, camera_id: int) -> None:
+    def stop(self, deletion: CameraDeletion) -> None:
+        """Publish a committed deletion without forgetting its ordering barrier."""
         with self._lock:
-            self._stop_locked(camera_id)
-            self._published_sources.pop(camera_id, None)
+            previous = self._published_sources.get(deletion.id)
+            if previous is not None and deletion.publication_sequence <= previous.publication_sequence:
+                return
+            self._published_sources[deletion.id] = deletion
+            self._stop_locked(deletion.id)
 
     def get(self, camera_id: int) -> Optional[RTSPReader]:
         with self._lock:

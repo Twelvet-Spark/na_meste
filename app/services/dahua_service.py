@@ -251,16 +251,18 @@ class DahuaArchiveClient(DahuaClient):
             if key in fields:
                 raise DahuaError("DEVICE_PROTOCOL_ERROR")
             fields[key] = value
-        found = fields.pop("found", "")
-        if not found.isdecimal() or len(found) > 3 or int(found) > 100:
-            raise DahuaError("DEVICE_PROTOCOL_ERROR")
-        count = int(found)
-        for key in fields:
-            match = re.fullmatch(r"items\[(\d+)\]\.[A-Za-z][A-Za-z0-9]*", key)
-            if match is None or int(match[1]) >= count:
-                raise DahuaError("DEVICE_PROTOCOL_ERROR")
         result = []
         try:
+            found = fields.pop("found", "")
+            if not found.isdecimal() or len(found) > 3:
+                raise ValueError
+            count = int(found)
+            if count > 100:
+                raise ValueError
+            for key in fields:
+                match = re.fullmatch(r"items\[(\d+)\]\.[A-Za-z][A-Za-z0-9]*", key)
+                if match is None or len(match[1]) > 2 or int(match[1]) >= count:
+                    raise ValueError
             for index in range(count):
                 prefix = f"items[{index}]."
                 channel = int(fields[prefix + "Channel"])
