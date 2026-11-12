@@ -156,7 +156,7 @@ def _create(request, db, metadata, contents, lock):
 
 @router.get("")
 def api_list_employees(db: Session = Depends(get_db)):
-    return [service.employee_out(db, employee) for employee, _count in service.list_employees(db)]
+    return [service.employee_out(db, employee) for employee in service.list_employees(db)]
 
 
 @router.post("", status_code=201)

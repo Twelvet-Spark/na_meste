@@ -347,7 +347,7 @@ main > .panel + .panel { margin-top: 20px; }
   height: 12px;
   background: var(--md-outline);
 }
-.camera-row .dot.online { background: #2E7D43; box-shadow: 0 0 10px rgba(46, 125, 67, 0.6); }
+.camera-row .dot.online { background: #2E7D43; }
 .camera-row .dot.connecting { background: #B78900; }
 .camera-row .dot.reconnecting { background: #B45309; }
 .camera-row .dot.offline { background: var(--md-outline); }
@@ -386,7 +386,7 @@ main > .panel + .panel { margin-top: 20px; }
   transform: scale(1.02);
 }
 .cam-card:active { transform: scale(0.98); }
-.cam-card .dot.online { background: #2E7D43; box-shadow: 0 0 10px rgba(46, 125, 67, 0.6); }
+.cam-card .dot.online { background: #2E7D43; }
 .cam-card .dot.connecting { background: #B78900; }
 .cam-card .dot.reconnecting { background: #B45309; }
 .cam-card .dot.offline { background: var(--md-outline); }
@@ -578,7 +578,7 @@ main > .panel + .panel { margin-top: 20px; }
 }
 .filters input::placeholder { color: rgba(73, 69, 79, 0.55); }
 .filters input { flex: 1 1 240px; min-width: 180px; }
-.filters select { flex: 0 0 auto; }
+.filters select { flex: 0 1 auto; min-width: 0; max-width: 100%; }
 .filters input:focus, .filters select:focus {
   outline: none;
   border-bottom-color: var(--md-primary);

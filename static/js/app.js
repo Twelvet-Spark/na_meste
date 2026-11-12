@@ -17,7 +17,7 @@
   function newCard(camera) {
     const element = node('article', 'cam-card');
     const link = node('a', 'camera-preview'); link.href = `/cameras/${camera.id}`;
-    const image = node('img', ''); image.alt = `Предпросмотр: ${camera.name}`; image.loading = 'lazy'; image.hidden = true;
+    const image = node('img', ''); image.alt = `Предпросмотр: ${camera.name}`; image.hidden = true;
     const unavailable = node('span', 'muted', 'Предпросмотр недоступен');
     link.append(image, unavailable);
     image.addEventListener('load', () => {

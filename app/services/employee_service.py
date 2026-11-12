@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
-from sqlalchemy import func, update
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -138,13 +138,13 @@ def get_employee(db, employee_id):
 
 
 def list_employees(db):
-    counts = dict(db.query(EmployeeFace.employee_id, func.count(EmployeeFace.id)).group_by(EmployeeFace.employee_id))
-    return [(row, counts.get(row.id, 0)) for row in db.query(Employee).order_by(Employee.name)]
+    return db.query(Employee).order_by(Employee.name).all()
 
 
 def employee_out(db, employee):
     data = EmployeeOut.model_validate(employee)
-    samples = db.query(EmployeeFace).filter_by(employee_id=employee.id).order_by(EmployeeFace.id).all()
+    samples = db.query(EmployeeFace.id, EmployeeFace.created_at).filter(
+        EmployeeFace.employee_id == employee.id).order_by(EmployeeFace.id).all()
     data.faces = [FaceOut(id=row.id, created_at=row.created_at,
                           thumbnail_url=f"/api/employees/{employee.id}/faces/{row.id}/thumbnail") for row in samples]
     data.faces_count = len(samples)
