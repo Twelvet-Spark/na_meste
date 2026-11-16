@@ -221,3 +221,22 @@ Optional body batches use estimated native cost and the remaining live-deadline 
 ```
 
 Warmup 30s is excluded; compare ordinary >=4.5 FPS (target 5), attendance >=8 FPS (target 10), p95 receipt-to-publication <=1s, worst rolling 60s windows, OOM/queues, journal integrity and concurrent-workload prerequisites. Run 30 copies only after 10 passes. Repeated single-view load does not establish multi-store accuracy or camera-exposure latency. Empty AI-floor output remains an unmet AI-floor acceptance result; never fill holes or fabricate an outline to clear it.
+
+### Measured provisional result — 2026-11-16
+
+The corrected 900s/10-camera replay used revision `e7b3bf1267bf145a5083ef4b612cdf75f72a600f`, RTX 4070 12GB, ten independent native 1920×1080/15FPS software decoders, and a 30s excluded warmup. Private report: `data/evaluation/rtx4070-production-10-budgeted-fixed.json`. Other desktop GPU processes were present; this is a contaminated provisional result, not RTX 5060 Ti certification. Later label-scoring/report-only changes were not part of that measured source snapshot.
+
+| Gate | Measured | Required |
+|---|---|---|
+| Ordinary analyzed FPS, each camera | 1.000–1.055 | >=4.5 |
+| Attendance analyzed FPS, each camera | 1.330–1.349 | >=8 |
+| Per-camera p95 receipt-to-publication | 0.664–0.763s | <=1s |
+| Worst-window p95 receipt-to-publication | 0.775–0.964s | <=1s |
+| Anonymous person recall | 23.91% | >=90% |
+| False-positive fraction | 7.83% | <=5% |
+| Identity switches/person-minute | 12.50 | <=2 |
+| Durable observed-track visits | 32,640/32,640 | No loss/degradation |
+
+**Not deployment accepted.** All camera FPS and anonymous quality gates failed; 30 cameras were not attempted. No OOM/runtime errors, persistent journal growth, gaps, orphan/duplicate/missing visits or unresolved shutdown work were observed. Seated/occluded/distant recall was 23.35%/23.19%/1.21%; sparse analysis left 6,424 annotated opportunities without nearby inference. Journaling every observed track does not mean every visible person was detected.
+
+Remaining measured stage costs include per-camera person p95 about 37–38ms, combined face p95 109–130ms, and optional appearance chunk p95 373–399ms. Cost-aware deferral reduced optional work to 1,342 body crops/51 acknowledged links; it did not establish minimum throughput. The run returned 11,705 preview responses and 71 usable object suggestions, but zero usable floor suggestions. Employee identity accuracy, eligible concurrent enrollment, attendance crossing/commissioning, and target-GPU capacity remain unverified. Manual calibration remains available; it is not an AI-floor acceptance pass.
