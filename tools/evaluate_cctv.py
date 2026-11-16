@@ -1065,7 +1065,11 @@ class IdentityEvaluator:
         index = self._nearest(camera, source)
         tracks = outcome.observed_tracks
         if index is None:
-            self.outside_annotation_confirmations += sum(track.employee_id is not None for track in tracks)
+            for track in tracks:
+                if track.employee_id is not None:
+                    self.outside_annotation_confirmations += 1
+                    self.unattributed_confirmations.add(
+                        (*token, outcome.tracking_generation, track.track_id, track.employee_id))
             return
         people = self.frames[camera][index]["people"]
         choices = [[j for j, track in enumerate(tracks) if box_iou(person["bbox"], track.bbox) >= .5]
@@ -1081,6 +1085,10 @@ class IdentityEvaluator:
                 continue
             attributed.add(candidates[0])
             if track.employee_id is None:
+                continue
+            if (self.specs[camera].clip.source_camera_key, person["track_label"]) not in self.labels:
+                self.unattributed_confirmations.add(
+                    (*token, outcome.tracking_generation, track.track_id, track.employee_id))
                 continue
             key = (camera, source.stream_id, index, person["track_label"])
             self.confirmations.setdefault(key, []).append(dict(
@@ -1226,10 +1234,19 @@ class IdentityEvaluator:
                         window_seconds=2., attempt_intervals=self.intervals,
                         sampling="ONE_CLOSEST_INDEPENDENT_NATIVE_PREPASS_PACKET_PER_ANNOTATION_NO_INTERPOLATION"),
                     association_policy="RECIPROCAL_UNIQUE_PERSON_IOU_GE_0.5_WITHIN_0.125S_NO_UNCERTAIN_TRACKS",
+                    annotation_coverage_requirement=(
+                        "EVERY_PUBLISHED_CONFIRMED_ID_REQUIRES_UNAMBIGUOUS_LABELED_GT_WITHIN_0.125S; "
+                        "SUPPLY_DENSER_V1_ANNOTATION_TIMESTAMPS_WHERE_NEEDED; "
+                        "NO_IDENTITY_OR_FACE_INTERPOLATION_BETWEEN_ANNOTATIONS"),
                     visit_policy="CAMERA_STREAM_GT_LABEL_CONTIGUOUS_ANNOTATIONS_SPLIT_ON_ABSENCE_OR_GAP_GT_2S",
-                    holdout=dict(validation_source="VIDEO_ONLY_ENROLLMENT_PHOTOS_NEVER_SCORED",
-                        photo_time_and_visit_provenance="NOT_PROVIDED_BY_MANIFEST_V1",
-                        independent_holdout_verified=False, labels="OPERATOR_SUPPLIED_NOT_INFERRED",
+                    holdout=dict(
+                        required_input_contract="OPERATOR_CONFIRMED_HELD_OUT_VALIDATION_LABELS",
+                        provenance_assessment=("TRUSTED_OPERATOR_INPUT_NOT_INDEPENDENTLY_VERIFIED" if self.labels
+                                               else "NOT_EVALUATED_NO_IDENTITY_LABELS"),
+                        validation_source="VIDEO_ONLY_ENROLLMENT_PHOTOS_NEVER_SCORED",
+                        warning=("THE_TOOL_DOES_NOT_VERIFY_ENROLLMENT_PHOTO_TIME_OR_VISIT_PROVENANCE; "
+                                 "FALSE_LABELS_OR_REUSED_ENROLLMENT_VISITS_CAN_MAKE_METRICS_OPTIMISTIC; "
+                                 "INSTALLATION_ATTENDANCE_COMMISSIONING_REMAINS_SEPARATE"),
                         repeated_copies="CORRELATED_REPLAYS_NOT_INDEPENDENT_IDENTITY_TRIALS"))
 
 
@@ -1263,6 +1280,21 @@ def acceptance_gates(cameras: list[dict], *, duration_seconds: float, copies: in
                                 "certified": target and not prerequisites and not failures and copies >= 10},
             "recognition": recognition if recognition is not None else {
                 "status": "NOT_EVALUATED", "reason": "NO_LABELED_RECOGNITION_MEASUREMENT"}}
+
+
+def deployment_acceptance(acceptance, *, gpu_contaminated):
+    """Combine computed gates under the declared operator-verified input contract."""
+    recognition = acceptance["recognition"]
+    passed = all((
+        acceptance["capacity"]["status"] == "PASS",
+        acceptance["journal"]["status"] == "PASS",
+        acceptance["detection_tracking"]["status"] == "PASS",
+        acceptance["target_hardware"]["certified"],
+        not gpu_contaminated,
+        recognition["status"] == "PASS",
+        recognition.get("certified", False),
+    ))
+    return {"status": "PASS" if passed else "NOT_ACCEPTED"}
 
 
 @dataclass(frozen=True)
@@ -2428,13 +2460,8 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
                                   runtime_failures=failures, recognition=quality["recognition"])
     acceptance["journal"] = dict(status=durable_status)
     acceptance["detection_tracking"] = quality["detection_tracking_acceptance"]
-    acceptance["deployment"] = dict(status="PASS" if all((
-        acceptance["capacity"]["status"] == "PASS", integrity["status"] == "PASS",
-        quality["detection_tracking_acceptance"]["status"] == "PASS",
-        acceptance["target_hardware"]["certified"], not other_processes.get("contaminated", True),
-        acceptance["recognition"]["status"] == "PASS", acceptance["recognition"]["certified"],
-        acceptance["recognition"]["holdout"]["independent_holdout_verified"])) else "NOT_ACCEPTED",
-        recognition_holdout="OPERATOR_PHOTO_TIME_VISIT_HOLDOUT_ATTESTATION_NOT_REPRESENTED_IN_MANIFEST_V1")
+    acceptance["deployment"] = deployment_acceptance(
+        acceptance, gpu_contaminated=other_processes.get("contaminated", True))
     result = {
         "status": "ERROR" if errors else "PRODUCTION_PIPELINE_MEASURED",
         "workload": "REPEATED_SINGLE_VIEW" if len({clip.source_camera_key for clip in manifest.clips}) == 1 and copies > 1 else "LOCAL_CLIP_REPLAY",

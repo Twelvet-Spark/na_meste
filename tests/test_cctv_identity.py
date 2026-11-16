@@ -71,6 +71,70 @@ class IdentityTests(unittest.TestCase):
     def report(self):
         return self.scorer.summary(self.annotations)
 
+    def complete_labeled_case(self, between_employee=None):
+        rows = [[person()] for _ in range(3)] + [[person("visitor")] for _ in range(3)]
+        self.setup_case((0., 1., 2., 3., 4., 5.), people=rows)
+        self.scorer.labels[("view", "visitor")] = None
+        for seq, stamp in enumerate((0., .5, 1., 2., 3., 4., 5.), 1):
+            employee = between_employee if stamp == .5 else 7 if stamp <= 2 else None
+            self.observe(stamp, seq, employee)
+        return self.report()
+
+    def deployment(self, recognition):
+        # Isolate the recognition input to the real final aggregation; these
+        # other gate results are deterministic fixtures, not measured capacity.
+        return runner.deployment_acceptance({
+            "capacity": {"status": "PASS"}, "journal": {"status": "PASS"},
+            "detection_tracking": {"status": "PASS"}, "target_hardware": {"certified": True},
+            "recognition": recognition}, gpu_contaminated=False)
+
+    def test_declared_held_out_contract_allows_complete_attributable_validation(self):
+        result = self.complete_labeled_case()
+        self.assertEqual(result["recall"], 1.)
+        self.assertEqual(result["wrong_confirmations"], 0)
+        self.assertEqual(result["unknown_false_assignment_visits"], 0)
+        self.assertEqual(result["unattributed_confirmations"], 0)
+        self.assertTrue(result["certified"])
+        self.assertEqual(self.deployment(result)["status"], "PASS")
+
+    def test_between_annotation_confirmation_remains_incomplete_after_correction(self):
+        result = self.complete_labeled_case(between_employee=8)
+        self.assertEqual(result["recall"], 1.)
+        # No interpolated GT identity: the event is unscored, not labelled wrong.
+        self.assertEqual(result["wrong_confirmations"], 0)
+        self.assertEqual(result["confirmed_observations_outside_annotation_tolerance"], 1)
+        self.assertEqual(result["unattributed_confirmations"], 1)
+        self.assertIn("UNATTRIBUTED_CONFIRMED_IDENTITIES", result["prerequisites"])
+        self.assertEqual(result["status"], "NOT_EVALUATED")
+        self.assertFalse(result["certified"])
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
+        # Re-delivery/cached correction must not erase the earlier evidence.
+        self.observe(.5, 2, 7, prepare=False)
+        self.assertEqual(self.report()["unattributed_confirmations"], 1)
+        self.assertFalse(self.report()["certified"])
+
+    def test_confirmed_unscored_visit_blocks_otherwise_complete_validation(self):
+        self.complete_labeled_case()
+        self.observe(.5, 1, 7, stream="unscored-visit", prepare=False)
+        result = self.report()
+        self.assertEqual(result["eligible_known_visits"], 1)
+        self.assertEqual(result["recall"], 1.)
+        self.assertEqual(result["unattributed_confirmations"], 1)
+        self.assertEqual(result["wrong_confirmations"], 0)
+        self.assertEqual(result["status"], "NOT_EVALUATED")
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
+
+    def test_attribution_failures_block_certification_without_guessing_identity(self):
+        for mode in ("ambiguous", "uncertain"):
+            with self.subTest(mode=mode):
+                self.complete_labeled_case()
+                self.observe(1., 20, 7, extra=mode == "ambiguous", uncertain=mode == "uncertain")
+                result = self.report()
+                self.assertEqual(result["recall"], 1.)
+                self.assertGreater(result["unattributed_confirmations"], 0)
+                self.assertEqual(result["wrong_confirmations"], 0)
+                self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
+
     def test_offline_native_opportunities_count_even_with_zero_admitted_or_published_results(self):
         self.setup_case()
         for seq, stamp in enumerate((0., 1., 2.), 1):
@@ -222,6 +286,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(result["certified"])
         self.assertIsNone(result["unknown_false_assignment_visits"])
         self.assertEqual(result["unknown_false_assignment_status"], "NOT_EVALUATED")
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
         rows = [[person()] for _ in range(3)] + [[person("visitor")] for _ in range(3)]
         self.setup_case((0., 1., 2., 3., 4., 5.), people=rows)
         self.scorer.labels[("view", "visitor")] = None
@@ -238,8 +303,12 @@ class IdentityTests(unittest.TestCase):
             self.observe(stamp, seq, 7)
         result = self.report()
         self.assertEqual(result["status"], "NOT_EVALUATED")
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
         self.assertIsNone(result["wrong_confirmations"])
         self.assertEqual(self.faces.calls, 0)
+        self.observe(.5, 20, 8, prepare=False)
+        self.assertEqual(self.report()["status"], "NOT_EVALUATED")
+        self.assertIsNone(self.report()["wrong_confirmations"])
         self.setup_case(people=[[person(), {**person("unlabeled"), "bbox": [.91, .1, .99, .9], "face_bbox": None}]
                                for _ in range(3)])
         for seq, stamp in enumerate((0., 1., 2.), 1):
@@ -249,6 +318,14 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(result["unlabeled_visits"], 1)
         self.assertEqual(result["status"], "NOT_EVALUATED")
         self.assertFalse(result["certified"])
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
+        source = runner.ReplayFrame(1, "stream-1", 20, 1., 101., None, None)
+        self.scorer.observe(1, source, SimpleNamespace(tracking_generation="generation", observed_tracks=[
+            SimpleNamespace(track_id=2, bbox=(.91, .1, .99, .9), employee_id=7, association_uncertain=False)]))
+        result = self.report()
+        self.assertEqual(result["unattributed_confirmations"], 1)
+        self.assertEqual(result["wrong_confirmations"], 0)
+        self.assertEqual(self.deployment(result)["status"], "NOT_ACCEPTED")
 
     def test_annotation_size_visibility_and_native_alignment_rejections_remain_separate(self):
         rows = [[{**person(), "face_bbox": [.3, .2, .4, .3]}],
