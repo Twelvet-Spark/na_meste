@@ -7,6 +7,38 @@
     <div><h1>Настройки</h1><p class="muted">Изменения применятся только после обычного перезапуска приложения. Текущая работа камер и записи не прерывается при сохранении.</p></div>
     <a class="btn" href="/debug">Открыть диагностику</a>
   </header>
+  <section class="panel" id="setup-transfer" aria-labelledby="transfer-heading">
+    <h2 id="transfer-heading">Перенос на другой компьютер</h2>
+    <p>Камеры с паролями, настройки архива, рабочие места, сотрудники и сохранённые образцы лиц. <strong>Без видео и истории.</strong> Исходные фотографии не хранятся — переносятся миниатюры лиц и данные распознавания.</p>
+    <p class="request-notice">Файл зашифрован вашим паролем. Храните его как секрет; забытый пароль восстановить нельзя. Импорт доступен только в пустую установку той же версии приложения и модели лиц. Максимум 64 МиБ.</p>
+    <p id="transfer-status" class="form-status" role="status" aria-live="polite">Проверка доступности переноса…</p>
+    <button class="btn" type="button" id="transfer-retry" hidden>Повторить проверку</button>
+    <fieldset class="plain-fieldset" id="transfer-controls" disabled>
+      <div class="settings-grid">
+        <form id="transfer-export-form" autocomplete="off">
+          <h3>Экспорт с этого компьютера</h3>
+          <label class="field" for="transfer-export-password">Пароль файла<input id="transfer-export-password" type="password" autocomplete="new-password" required maxlength="1024" aria-describedby="transfer-password-help"></label>
+          <label class="field" for="transfer-export-confirm">Повторите пароль<input id="transfer-export-confirm" type="password" autocomplete="new-password" required maxlength="1024"></label>
+          <p class="field-help" id="transfer-password-help">Не менее 12 байт UTF-8. Рекомендуется длинная уникальная парольная фраза.</p>
+          <button class="btn primary" type="submit">Скачать файл переноса</button>
+        </form>
+        <form id="transfer-import-form" autocomplete="off">
+          <h3>Импорт на этот компьютер</h3>
+          <label class="field" for="transfer-file">Файл переноса<input id="transfer-file" type="file" accept=".nmsetup" required></label>
+          <label class="field" for="transfer-import-password">Пароль файла<input id="transfer-import-password" type="password" autocomplete="off" required maxlength="1024"></label>
+          <div class="form-actions"><button class="btn" type="submit" id="transfer-preview-button">Проверить файл</button><button class="btn" type="button" id="transfer-clear">Очистить</button></div>
+        </form>
+      </div>
+      <div id="transfer-preview" hidden>
+        <h3>Будет импортировано</h3>
+        <ul id="transfer-counts"></ul>
+        <ul id="transfer-warnings"></ul>
+        <p>Настройки приложения, VPN, история и видео не переносятся. Калибровку нужно проверить и повторно ввести учёт в эксплуатацию.</p>
+        <button class="btn primary" type="button" id="transfer-import-button">Подтвердить импорт</button>
+      </div>
+    </fieldset>
+    <p id="transfer-message" class="form-status" role="status" aria-live="polite"></p>
+  </section>
   <p id="settings-connection" class="muted small" role="status" aria-live="polite">Загрузка настроек…</p>
   <div id="settings-restart" class="request-notice" role="status" hidden>
     <strong>Сохранено. Требуется перезапуск</strong>
@@ -83,4 +115,4 @@
   </dialog>
 </main>
 {% endblock %}
-{% block scripts %}<script src="/static/js/settings.js"></script>{% endblock %}
+{% block scripts %}<script src="/static/js/settings.js"></script><script src="/static/js/setup_transfer.js"></script>{% endblock %}
