@@ -1962,7 +1962,7 @@ class ApprovedInference:
             accounting.identity_evaluator = IdentityEvaluator(
                 specs, manifest.identity_labels, self.employee_subjects, self.face_engine,
                 ordinary_interval=self.service.retry_interval,
-                attendance_interval=settings.attendance_face_attempt_interval)
+                attendance_interval=settings.attendance_face_interval)
             self.attendance = AttendanceService(engine, model_bundle=self.bundle)
             self.attendance.health.set_providers(self.providers)
             self.journal = HumanJournal(engine, min_hits=self.service.min_hits,
