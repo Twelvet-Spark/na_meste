@@ -62,8 +62,8 @@
     count.textContent = `Сохранено: ${employee.faces_count}/15 · пригодно: ${employee.usable_faces_count}`;
     const state = document.createElement('span');
     const needsCorrection = employee.needs_name_completion || employee.needs_photo_remediation;
-    state.className = `status ${needsCorrection ? 'connecting' : employee.active ? 'online' : 'offline'}`;
-    state.textContent = !employee.face_model_id ? 'Модель лиц недоступна' : needsCorrection ? 'Нужно дополнить' : employee.active ? 'Готов к распознаванию' : 'Распознавание отключено';
+    state.className = `status ${needsCorrection || !employee.face_runtime_available ? 'connecting' : employee.active ? 'online' : 'offline'}`;
+    state.textContent = !employee.face_runtime_available ? 'Распознавание недоступно' : needsCorrection ? 'Нужно дополнить' : employee.active ? 'Готов к распознаванию' : 'Распознавание отключено';
     readiness.append(count, state);
     if (needsCorrection) {
       const help = document.createElement('span'); help.className = 'small muted';

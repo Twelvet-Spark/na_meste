@@ -176,6 +176,7 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
         with immediate_session(engine) as db:
             valid = sample(db, 1, model=MODEL)
             converted = sample(db, 2, thumb=thumbnail(2))
+            sample(db, 2, thumb=thumbnail(7))
             incompatible = sample(db, 3, thumb=thumbnail(3), model=OTHER_MODEL)
             invalid = sample(db, 4, embedding=b"invalid", thumb=thumbnail(4), model=MODEL)
             missing = sample(db, 5)
@@ -183,7 +184,7 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
             old_commission = commission(db)
         recognizer = Recognizer()
         report = rebuild_gallery(engine, recognizer)
-        assert report["faces_reencoded"] == 3 and report["usable_faces_count"] == 4
+        assert report["faces_reencoded"] == 4 and report["usable_faces_count"] == 5
         assert report["employees_needing_photos"] == [5, 6]
         with Session(engine) as db:
             assert db.get(EmployeeFace, valid).embedding == vector().tobytes()
@@ -197,6 +198,9 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
             assert db.get(AttendanceRuntime, 1).gallery_revision == 1
             assert db.get(AttendanceRuntime, 1).commission_id is None
             assert db.get(AttendanceCommission, old_commission) is not None
+            assert dict(db.query(Employee.id, Employee.revision).all()) == {
+                1: 0, 2: 1, 3: 1, 4: 1, 5: 0, 6: 0,
+            }
         before, calls = dump(engine), len(recognizer.batches)
         restarted = rebuild_gallery(engine, recognizer)
         assert restarted["faces_reencoded"] == 0 and restarted["employees_needing_photos"] == [5, 6]

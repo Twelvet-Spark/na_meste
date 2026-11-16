@@ -189,15 +189,70 @@ def committed_v2(engine, *, populated=True):
                 "INSERT INTO camera_archives VALUES (12,'https',443,300,4,?)", (STAMP,))
 
 
+COMMITTED_V3_TABLE_DDL = (
+    """CREATE TABLE recording_sessions (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        camera_id INTEGER NOT NULL,
+        camera_name VARCHAR(100) NOT NULL,
+        source_revision INTEGER NOT NULL,
+        requested_at DATETIME NOT NULL,
+        started_at DATETIME,
+        deadline_at DATETIME NOT NULL,
+        ended_at DATETIME,
+        status VARCHAR(20) NOT NULL CHECK (status IN ('STARTING','RECORDING','RECONNECTING','STOPPING','STOPPED','COMPLETED','FAILED','INTERRUPTED')),
+        reason_code VARCHAR(64),
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+    """CREATE TABLE recording_connections (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        directory VARCHAR(200) NOT NULL UNIQUE,
+        source_revision INTEGER NOT NULL,
+        created_at DATETIME NOT NULL,
+        anchor_utc DATETIME,
+        media_origin_seconds FLOAT,
+        closed_at DATETIME,
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT
+    )""",
+    """CREATE TABLE recording_segments (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        connection_id VARCHAR(36) NOT NULL,
+        camera_id INTEGER NOT NULL,
+        source_revision INTEGER NOT NULL,
+        storage_key VARCHAR(250) NOT NULL UNIQUE,
+        started_at DATETIME,
+        ended_at DATETIME,
+        duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        bytes INTEGER NOT NULL DEFAULT 0 CHECK (bytes >= 0),
+        codec VARCHAR(32),
+        state VARCHAR(20) NOT NULL CHECK (state IN ('READY','EXPIRED','MISSING','CORRUPT','DELETING','UNINDEXED')),
+        CHECK (state != 'READY' OR (started_at IS NOT NULL AND ended_at IS NOT NULL AND duration_ms > 0)),
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT,
+        FOREIGN KEY(connection_id) REFERENCES recording_connections (id) ON DELETE RESTRICT,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+    """CREATE TABLE recording_gaps (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        session_id VARCHAR(36) NOT NULL,
+        started_at DATETIME NOT NULL,
+        ended_at DATETIME,
+        reason_code VARCHAR(64) NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES recording_sessions (id) ON DELETE RESTRICT
+    )""",
+)
+COMMITTED_V3_INDEX_DDL = """CREATE UNIQUE INDEX uq_recording_active_camera
+        ON recording_sessions (camera_id)
+        WHERE status IN ('STARTING','RECORDING','RECONNECTING','STOPPING')"""
+
+
 def committed_v3(engine):
-    from app.database import operator_schema
+    # Independent deployed predecessor, not the definitions being validated.
     committed_v2(engine)
     with engine.begin() as connection:
-        for name, ddl in operator_schema.V3_TABLES.items():
-            if name not in operator_schema.V2_TABLES:
-                connection.exec_driver_sql(ddl)
-        for ddl in operator_schema.V3_INDEXES.values():
+        for ddl in COMMITTED_V3_TABLE_DDL:
             connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql(COMMITTED_V3_INDEX_DDL)
         connection.exec_driver_sql("UPDATE operator_schema SET version=3 WHERE id=1")
 
 

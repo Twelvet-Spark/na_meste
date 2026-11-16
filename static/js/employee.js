@@ -45,7 +45,7 @@ function updateSummary() {
     current.active ? 'Активен.' : 'Неактивен — распознавание отключено.',
     current.needs_name_completion ? 'Старое имя сохранено. Уточните имя и фамилию вместе.' : '',
     `Сохранено образцов: ${current.faces_count}/15; пригодно для текущей модели: ${current.usable_faces_count}.`,
-    !current.face_model_id ? 'Модель лиц недоступна. Проверьте диагностику.' : '',
+    !current.face_runtime_available ? 'Распознавание недоступно. Проверьте диагностику.' : '',
     current.needs_photo_remediation ? 'Замените непригодные образцы новыми фото; исходные фотографии не хранятся. Итоговый набор — 1–15 фото. Данные и активность можно менять уже сейчас.' : '',
   ].filter(Boolean).join(' ');
 }

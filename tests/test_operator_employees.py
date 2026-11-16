@@ -20,6 +20,7 @@ from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 from uuid import uuid4
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -127,6 +128,7 @@ def api(*, historical=False):
         app.state.face_engine = model
         app.state.embedding_store = store
         app.state.face_model_id = MODEL
+        app.state.ai_worker = SimpleNamespace(service=SimpleNamespace(faces=model, store=store))
         app.state.enrollment_lock = threading.BoundedSemaphore(1)
         app.include_router(employees.router)
         # Missing new routes must fail HTTP behavior assertions, not import collection.
@@ -874,12 +876,19 @@ def test_views_distinguish_stored_unproven_samples_and_unavailable_runtime_model
         current = detail(client, created["id"])
         assert current["faces_count"] == 2 and current["usable_faces_count"] == 1
         assert current["needs_photo_remediation"] is True and current["face_model_id"] == MODEL
+        assert current["face_runtime_available"] is True
+        client.app.state.ai_worker.service.faces = None
+        assert detail(client, created["id"])["face_runtime_available"] is False
+        client.app.state.ai_worker = None
+        assert detail(client, created["id"])["face_runtime_available"] is False
         client.app.state.face_engine = None
         client.app.state.embedding_store = None
+        current = detail(client, created["id"])
+        assert current["faces_count"] == 2 and current["usable_faces_count"] == 1
+        assert current["face_model_id"] == MODEL and current["face_runtime_available"] is False
         client.app.state.face_model_id = None
         current = detail(client, created["id"])
-        assert current["faces_count"] == 2 and current["usable_faces_count"] == 0
-        assert current["face_model_id"] is None and current["needs_photo_remediation"] is True
+        assert current["usable_faces_count"] == 0 and current["face_model_id"] is None
 
 
 @test

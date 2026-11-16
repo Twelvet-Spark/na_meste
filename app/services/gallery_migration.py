@@ -132,6 +132,9 @@ def rebuild_gallery(engine, face_engine) -> dict:
             else:
                 metadata.model_id, metadata.alignment_id = model_id, alignment_id
                 metadata.created_at = utcnow()
+        changed_owners = {row.employee_id for row, _vector in changed}
+        writer.execute(update(Employee).where(Employee.id.in_(changed_owners)).values(
+            revision=Employee.revision + 1, updated_at=utcnow()))
         writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
             gallery_revision=AttendanceRuntime.gallery_revision + 1, commission_id=None))
     return report

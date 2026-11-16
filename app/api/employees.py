@@ -88,6 +88,20 @@ def _model_id(request):
     return getattr(request.app.state, "face_model_id", None)
 
 
+def _view(request, db, employee):
+    result = service.employee_out(db, employee, model_id=_model_id(request))
+    engine = getattr(request.app.state, "face_engine", None)
+    store = getattr(request.app.state, "embedding_store", None)
+    worker = getattr(request.app.state, "ai_worker", None)
+    live = getattr(worker, "service", None)
+    live_faces = getattr(live, "faces", None)
+    result["face_runtime_available"] = (
+        engine is not None and store is not None and live_faces is not None
+        and getattr(live, "store", None) is store and _model_id(request) is not None
+        and engine.model_id == live_faces.model_id == store.model_id == _model_id(request))
+    return result
+
+
 async def _read_form(request, model, *, creating):
     if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
         raise HTTPException(415, "Отправьте metadata и фотографии как multipart/form-data")
@@ -156,7 +170,7 @@ def _create(request, db, metadata, contents, lock):
 
 @router.get("")
 def api_list_employees(request: Request, db: Session = Depends(get_db)):
-    return [service.employee_out(db, employee, model_id=_model_id(request))
+    return [_view(request, db, employee)
             for employee in service.list_employees(db)]
 
 
@@ -168,14 +182,14 @@ async def api_create_employee(request: Request, db: Session = Depends(get_db)):
 
 @router.get("/{employee_id}")
 def api_get_employee(employee_id: int, request: Request, faces: bool = False, db: Session = Depends(get_db)):
-    return service.employee_out(db, _employee_or_404(db, employee_id), model_id=_model_id(request))
+    return _view(request, db, _employee_or_404(db, employee_id))
 
 
 @router.put("/{employee_id}", dependencies=[Depends(require_operator_request)])
 def api_update_employee(employee_id: int, payload: service.EmployeeUpdate, request: Request,
                         db: Session = Depends(get_db)):
     employee = service.update_employee(db, _employee_or_404(db, employee_id), payload)
-    result = service.employee_out(db, employee, model_id=_model_id(request))
+    result = _view(request, db, employee)
     _refresh(request, db)
     return result
 
@@ -191,7 +205,7 @@ def _replace(request, db, employee_id, metadata, contents, lock):
     prepared = _prepare(contents, request, lock)
     employee = service.replace_employee_faces(db, employee_id, metadata.expected_revision,
                                               metadata.keep_face_ids, prepared, model_id=_model_id(request))
-    result = service.employee_out(db, employee, model_id=_model_id(request))
+    result = _view(request, db, employee)
     _refresh(request, db)
     return result
 
