@@ -2564,6 +2564,7 @@ def main(argv: list[str] | None = None) -> int:
                                      "codec": probes[clip.path].codec} for clip in manifest.clips]
                 report.update(evaluate(manifest, copies=args.copies, duration=args.duration, device=args.device,
                                        ffmpeg=ffmpeg, probes=probes, isolated=isolated, scene_prompts=prompts))
+                report["recognition"] = report["quality"]["recognition"]
     except (EvaluationError, OSError) as exc:
         report.update(status="ERROR", error_code=str(exc) if isinstance(exc, EvaluationError) else "EVALUATION_IO_FAILED")
         report["acceptance"] = {"capacity": {"status": "NOT_EVALUATED"}, "recognition": {"status": "NOT_EVALUATED"}}
