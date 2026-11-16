@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -117,9 +118,8 @@ def read_json(path: Path) -> Any:
         raise EvaluationError("JSON_UNREADABLE_OR_INVALID") from None
 
 
-def local_path(value: str | Path, base: Path, *, must_exist: bool = True) -> Path:
-    """Reject URLs, UNC/device paths, drive-relative paths and NTFS ADS on any OS."""
-    text = str(value) if isinstance(value, Path) else value
+def _local_path_text(text: str) -> str:
+    """Check lexical locality before any filesystem/drive-target traversal."""
     if (not isinstance(text, str) or not text or text != text.strip()
             or any(ord(char) < 32 for char in text) or text.startswith(("\\", "//"))):
         raise EvaluationError("LOCAL_PATH_REQUIRED")
@@ -131,9 +131,72 @@ def local_path(value: str | Path, base: Path, *, must_exist: bool = True) -> Pat
         raise EvaluationError("LOCAL_PATH_REQUIRED")
     if drive_absolute and os.name != "nt":
         raise EvaluationError("WINDOWS_PATH_ON_NONWINDOWS_HOST")
+    return text
+
+
+def _windows_drive_type(root: str) -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    kernel.GetDriveTypeW.restype = wintypes.UINT
+    return kernel.GetDriveTypeW(root)
+
+
+def _check_local_drive(path) -> None:
+    drive = PureWindowsPath(str(path)).drive
+    if drive:
+        if not re.fullmatch(r"[A-Za-z]:", drive) or _windows_drive_type(drive + "\\") in (0, 4):
+            raise EvaluationError("LOCAL_DRIVE_REQUIRED")
+
+
+def _alias_target(path: Path) -> str | None:
+    try:
+        metadata = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        return os.readlink(path)
+    return None
+
+
+def _preflight_local_aliases(path: Path, active: set[str] | None = None) -> None:
+    """Inspect ancestors outward, before resolving a child through any alias."""
+    _check_local_drive(path)
+    active = set() if active is None else active
+    for ancestor in (*reversed(path.parents), path):
+        target = _alias_target(ancestor)
+        if target is None:
+            continue
+        # Windows readlink returns this prefix even for a normal local junction.
+        # Only a drive-letter substitute is normalized; UNC/device targets fail.
+        if target.startswith("\\\\?\\") and re.match(r"^[A-Za-z]:[\\/]", target[4:]):
+            target = target[4:]
+        target = _local_path_text(target)
+        destination = Path(target.replace("\\", "/"))
+        destination = destination if destination.is_absolute() else ancestor.parent / destination
+        key = os.path.normcase(str(ancestor))
+        if key in active or len(active) >= 40:
+            raise EvaluationError("LOCAL_ALIAS_CYCLE_OR_LIMIT")
+        active.add(key)
+        try:
+            _preflight_local_aliases(destination, active)
+        finally:
+            active.remove(key)
+
+
+def local_path(value: str | Path, base: Path, *, must_exist: bool = True) -> Path:
+    """Reject remote syntax, aliases and mapped network drives before file IO."""
+    text = _local_path_text(str(value) if isinstance(value, Path) else value)
     path = Path(text.replace("\\", "/"))
     try:
-        path = (path if path.is_absolute() else base / path).resolve()
+        path = path if path.is_absolute() else base / path
+        _preflight_local_aliases(path)
+        path = path.resolve()
+        _local_path_text(str(path))
+        _check_local_drive(path)
         if must_exist and not path.is_file():
             raise EvaluationError("INPUT_FILE_MISSING")
     except (OSError, RuntimeError, ValueError):
@@ -637,7 +700,7 @@ def match_people(boxes: list, predictions: list[Prediction], *, iou_threshold: f
     return sorted((person, prediction) for prediction, person in owners.items())
 
 
-class QualityEvaluator:
+class _QualityTotals:
     def __init__(self):
         self.annotated = self.matched = self.predicted = self.false_positives = self.switches = self.frames = 0
         self.person_seconds = 0.
@@ -694,6 +757,50 @@ class QualityEvaluator:
                     "failures": failures, "durable_visit_coverage": "NOT_EVALUATED"},
                 "recognition": {"status": "NOT_EVALUATED", "reason": "NO_VERIFIED_ELIGIBLE_KNOWN_VISIT_DENOMINATOR",
                                 "eligible_known_visits": None, "recall": None, "wrong_confirmations": None}}
+
+
+class QualityEvaluator:
+    """Fixed source-1Hz acceptance; selected transition annotations are diagnostic."""
+    def __init__(self):
+        self._frames = {}
+
+    def add_frame(self, camera_key: str, stream_id: str, time_seconds: float, people: list,
+                  predictions: list[Prediction], *, visible_seconds: float = 0.):
+        stamp = _number(time_seconds, "ANNOTATION_TIME_INVALID")
+        visible = _number(visible_seconds, "ANNOTATION_VISIBILITY_DURATION_INVALID")
+        self._frames[(camera_key, stream_id, stamp)] = (people, predictions, visible)
+
+    def summary(self) -> dict:
+        regular, transitions = [], []
+        seconds = set()
+        for key, values in sorted(self._frames.items()):
+            camera, stream, stamp = key
+            second = (camera, stream, math.floor(stamp))
+            cohort = transitions if second in seconds else regular
+            cohort.append((key, values))
+            seconds.add(second)
+
+        def summarize(records):
+            totals = _QualityTotals()
+            for index, (key, values) in enumerate(records):
+                camera, stream, stamp = key
+                people, predictions, visible = values
+                visible = min(1., visible)
+                if index + 1 < len(records):
+                    following = records[index + 1][0]
+                    if following[:2] == key[:2]:
+                        visible = min(visible, following[2] - stamp)
+                totals.add_frame(camera, stream, stamp, people, predictions, visible_seconds=visible)
+            return totals.summary()
+
+        result = summarize(regular)
+        result["sampling"] = {
+            "method": "EARLIEST_ANNOTATED_TIMESTAMP_PER_SOURCE_INTEGER_SECOND",
+            "interval_seconds": 1, "transition_frames_excluded_from_acceptance": len(transitions)}
+        result["transitions"] = summarize(transitions)
+        result["transitions"].pop("detection_tracking_acceptance")
+        result["transitions"]["scope"] = "DIAGNOSTIC_ONLY_EXCLUDED_FROM_ACCEPTANCE"
+        return result
 
 
 def percentile(values: Iterable[float], fraction: float) -> float | None:
@@ -1101,21 +1208,29 @@ class AnnotationSamples:
     def evaluate(self) -> dict:
         # Called after all decoder threads are joined; metadata only, no images.
         evaluator = QualityEvaluator()
-        missing = 0
+        missing = transition_missing = 0
         for (camera, stream), state in self._streams.items():
             spec = self.specs[camera]
             frames = (spec.clip.annotations or {}).get("frames", [])
+            seconds = set()
             for index, frame in enumerate(frames):
                 stamp = frame["time_seconds"]
                 if not state["first"] <= stamp <= state["last"]:
                     continue
                 sample = state["samples"].get(index)
-                missing += int(sample is None)
-                following = frames[index + 1]["time_seconds"] if index + 1 < len(frames) else spec.probe.duration_seconds
-                visible = max(0., min(stamp + 1, following, state["last"]) - stamp)
+                second = math.floor(stamp)
+                if second in seconds:
+                    transition_missing += int(sample is None)
+                else:
+                    missing += int(sample is None)
+                seconds.add(second)
+                # Coverage bound is independent of inserted transition annotations;
+                # each scoring cohort clips it to its own following sample.
+                visible = max(0., min(stamp + 1, state["last"]) - stamp)
                 evaluator.add_frame(str(camera), stream, stamp, frame["people"], sample[1] if sample else [], visible_seconds=visible)
         result = evaluator.summary()
         result["annotation_opportunities_without_nearby_inference"] = missing
+        result["transitions"]["annotation_opportunities_without_nearby_inference"] = transition_missing
         result["unknown_source_timestamp_observations"] = self.unknown_pts
         result["timestamp_tolerance_seconds"] = ANNOTATION_TOLERANCE_SECONDS
         result["scope"] = "ANONYMOUS_TRACKING_NOT_EMPLOYEE_RECOGNITION"

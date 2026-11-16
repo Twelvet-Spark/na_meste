@@ -14,9 +14,11 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import tools.evaluate_cctv as runner
 
 from tools.evaluate_cctv import (
     AnalysisSample, AnnotationSamples, CameraMeasurements, ClipProbe, EvaluationError,
@@ -73,6 +75,40 @@ class ManifestTests(unittest.TestCase):
                 self.document["clips"][0]["path"] = path
                 with self.assertRaises(EvaluationError):
                     self.save()
+
+    def test_resolved_alias_to_network_or_device_is_rejected_before_file_check(self):
+        class ResolvedAlias:
+            def __init__(self, target):
+                self.target = target
+
+            def __str__(self):
+                return self.target
+
+            def is_file(self):
+                raise AssertionError("Remote target must not reach file existence checks")
+
+        for target in (r"\\server\share\clip.mkv", "//server/share/clip.mkv",
+                       r"\\?\UNC\server\share\clip.mkv", r"\\.\C:\clip.mkv"):
+            for must_exist in (True, False):
+                with self.subTest(target=target, must_exist=must_exist):
+                    with patch.object(Path, "resolve", return_value=ResolvedAlias(target)):
+                        with self.assertRaises(EvaluationError):
+                            runner.local_path("local-alias.mkv", self.root, must_exist=must_exist)
+
+    def test_network_junction_is_rejected_before_resolving_child_path(self):
+        alias = self.root / "junction"
+        for target in (r"\\server\share", r"\\?\UNC\server\share"):
+            with self.subTest(target=target):
+                with patch.object(runner, "_alias_target", side_effect=lambda path: target if path == alias else None), \
+                        patch.object(Path, "resolve", side_effect=AssertionError("Must not resolve a remote junction")):
+                    with self.assertRaises(EvaluationError):
+                        runner.local_path(alias / "clip.mkv", self.root)
+
+    def test_mapped_network_drive_is_rejected_before_alias_inspection(self):
+        with patch.object(runner, "_windows_drive_type", return_value=4), \
+                patch.object(runner, "_alias_target", side_effect=AssertionError("Must not inspect a remote drive")):
+            with self.assertRaises(EvaluationError):
+                runner._preflight_local_aliases(PureWindowsPath(r"Z:\clips\clip.mkv"))
 
     def test_rejects_nonfinite_negative_boolean_offsets_and_missing_files(self):
         for offset in (float("nan"), float("inf"), 10 ** 400, -1, True):
@@ -169,6 +205,28 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(result["annotation_opportunities_without_nearby_inference"], 2)
         self.assertAlmostEqual(result["recall"], 1 / 3)
 
+    def test_collector_keeps_transition_visibility_and_misses_out_of_1hz_totals(self):
+        document = self.annotations()
+        person = document["frames"][0]["people"][0]
+        document["frames"] = [{"time_seconds": stamp, "people": [person.copy()]}
+                              for stamp in (61.045, 61.925, 62.045)]
+        manifest = self.save_annotations(document)
+        specs = build_replay_specs(manifest, {manifest.clips[0].path: ClipProbe(1920, 1080, 15, 63, "fixture")}, 1)
+        collector = AnnotationSamples(specs)
+        for sequence, stamp in enumerate((61.045, 61.85, 62.5), 1):
+            packet = ReplayFrame(1, specs[0].stream_id, sequence, stamp, sequence, None, None)
+            collector.observe_decoded(packet)
+            if stamp == 61.85:
+                collector.observe(packet, [Prediction("transition-track", tuple(person["bbox"]))])
+        result = collector.evaluate()
+        self.assertEqual(result["frames"], 2)
+        self.assertEqual(result["recall"], 0)
+        self.assertAlmostEqual(result["visible_person_seconds"], 1.455)
+        self.assertEqual(result["annotation_opportunities_without_nearby_inference"], 2)
+        self.assertEqual(result["transitions"]["frames"], 1)
+        self.assertEqual(result["transitions"]["recall"], 1)
+        self.assertEqual(result["transitions"]["annotation_opportunities_without_nearby_inference"], 0)
+
     def test_report_hardlink_alias_cannot_overwrite_input(self):
         manifest = self.save()
         output = self.root / "hardlink.json"
@@ -221,6 +279,43 @@ class QualityTests(unittest.TestCase):
         self.assertIsNone(summary["false_positive_fraction"])
         self.assertIsNone(percentile([], .95))
 
+
+    def test_successful_transition_frames_cannot_rescue_failing_fixed_1hz_recall(self):
+        person = {"track_label": "anonymous-1", "bbox": [.1, .1, .4, .9],
+                  "face_bbox": None, "face_visible": False, "occluded": False, "seated": True}
+        baseline = QualityEvaluator()
+        with_transitions = QualityEvaluator()
+        for second in range(82):
+            predictions = [Prediction("track-1", tuple(person["bbox"]))] if second < 73 else []
+            for evaluator in (baseline, with_transitions):
+                evaluator.add_frame("camera-a", "stream-1", second + .045, [person],
+                                    predictions, visible_seconds=1)
+        for second in range(11):
+            with_transitions.add_frame("camera-a", "stream-1", second + .925, [person],
+                                       [Prediction("track-1", tuple(person["bbox"]))], visible_seconds=.075)
+        original, result = baseline.summary(), with_transitions.summary()
+        self.assertEqual(original["detection_tracking_acceptance"]["status"], "FAIL")
+        self.assertEqual(result["detection_tracking_acceptance"]["status"], "FAIL")
+        self.assertEqual(result["frames"], 82)
+        self.assertEqual(result["annotated_people"], 82)
+        self.assertEqual(result["matched_people"], 73)
+        self.assertAlmostEqual(result["recall"], 73 / 82)
+        self.assertEqual(result["visible_person_seconds"], original["visible_person_seconds"])
+        self.assertEqual(result["transitions"]["frames"], 11)
+        self.assertEqual(result["transitions"]["recall"], 1)
+
+    def test_earliest_regular_annotation_wins_even_when_transition_is_added_first(self):
+        person = {"track_label": "anonymous-1", "bbox": [.1, .1, .4, .9],
+                  "face_bbox": None, "face_visible": False, "occluded": False, "seated": False}
+        evaluator = QualityEvaluator()
+        evaluator.add_frame("camera-a", "stream-1", 61.925, [person],
+                            [Prediction("transition-track", tuple(person["bbox"]))], visible_seconds=.075)
+        evaluator.add_frame("camera-a", "stream-1", 61.045, [person], [], visible_seconds=1)
+        result = evaluator.summary()
+        self.assertEqual(result["frames"], 1)
+        self.assertEqual(result["recall"], 0)
+        self.assertEqual(result["transitions"]["frames"], 1)
+        self.assertEqual(result["transitions"]["recall"], 1)
 
     def test_face_observations_report_native_sizes_and_reasons_not_guessed_accuracy(self):
         quality = SimpleNamespace(min_size=32, blur=12)
