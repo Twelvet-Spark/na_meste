@@ -426,6 +426,33 @@ class ProductionAccountingTests(unittest.TestCase):
                                           pending_updates=0, pending_barriers=0))
         self.assertTrue(accounting.health_report(102)["persistent_growth"])
 
+    def test_growth_requires_sustained_post_warmup_bucket_increases(self):
+        workloads = {
+            "stable_positive": lambda second: 2,
+            "step_then_plateau": lambda second: 1 if second == 0 else 2,
+            "bounded_oscillation": lambda second: 2 + (second % 10),
+            "warmup_growth_only": lambda second: min(second + 1, 30),
+            "sustained_growth": lambda second: second + 1,
+        }
+        for name, pending_at in workloads.items():
+            with self.subTest(name=name):
+                accounting = runner.ProductionAccounting({}, None, None)
+                accounting.measurement_start = 30.
+                for second in range(151):
+                    accounting.health(second, dict(state="OK", pending_commands=pending_at(second),
+                                                   pending_updates=0, pending_barriers=0))
+                self.assertEqual(accounting.health_report(150)["persistent_growth"], name == "sustained_growth")
+
+    def test_growth_does_not_include_warmup_in_its_minute(self):
+        accounting = runner.ProductionAccounting({}, None, None)
+        accounting.measurement_start = 30.
+        for second in range(90):
+            accounting.health(second, dict(state="OK", pending_commands=second + 1,
+                                           pending_updates=0, pending_barriers=0))
+        self.assertFalse(accounting.health_report(89)["persistent_growth"])
+        accounting.health(90, dict(state="OK", pending_commands=91, pending_updates=0, pending_barriers=0))
+        self.assertTrue(accounting.health_report(90)["persistent_growth"])
+
     def test_journal_integrity_checks_missing_duplicate_and_unbounded_events(self):
         import sqlite3
         with closing(sqlite3.connect(":memory:")) as db:

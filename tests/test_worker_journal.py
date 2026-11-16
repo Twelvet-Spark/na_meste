@@ -401,6 +401,26 @@ def test_metadata_stall_rechecks_budget_and_keeps_unattempted_body_crops():
         assert body.calls == before and pending and set(worker._appearance_pending) == pending
 
 
+def test_appearance_budget_learns_matching_and_publication_cost_not_only_embedding():
+    body = Body()
+    with fixture(body=body) as (_engine, _attendance, clock, worker, manager, detector, _journal):
+        process = worker.global_manager.process_embeddings
+        def costly_matching(items):
+            result = process(items)
+            clock.advance(.12 * len(items))
+            return result
+        def crowded(frames):
+            return [[(np.array([10.+40*i, 10., 40.+40*i, 100.]), .99) for i in range(8)]
+                    for _ in frames]
+        with patch.object(detector, 'detect_batch', side_effect=crowded), patch.object(
+                worker.global_manager, 'process_embeddings', side_effect=costly_matching):
+            publish(manager, clock, 3)
+            worker.step()
+            assert body.calls == [1] and clock.mono <= worker.scheduler.deadlines[3]
+            worker.step()
+            assert body.calls == [1] and worker._appearance_pending
+
+
 if __name__ == '__main__':
     import traceback
     cases = [value for name, value in list(globals().items()) if name.startswith('test_') and callable(value)]

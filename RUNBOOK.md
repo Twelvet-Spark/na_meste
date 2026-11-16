@@ -210,8 +210,10 @@ Decode throughput, analyzed throughput and preview throughput are different meas
 
 The runner now exercises the actual `AIWorker`, deadline scheduler, durable journal/acknowledged body links, one production preview cache and separate live/enrollment face owners. Use explicit reviewed local scene prompts via `--scene-prompts`; no eligible enrollment-quality face means concurrent enrollment is `NOT_EVALUATED`, not a fabricated workload. Prompt format: `{version:1,prompts:[{clip_path,source_camera_key,time_seconds,kind,positive_points,negative_points,box}]}`, with local clip paths relative to that file, normalized points and `kind` floor/object.
 
+Optional body batches use estimated native cost and the remaining live-deadline slack, not a fixed 16-crop admission. The first call probes one crop; later calls stay <=16 and reserve time for live work. A metadata-read stall rechecks that budget before the model call. Conservative timing estimates may defer appearance linking after a latency spike; person tracking and durable local visits do not depend on it.
+
 ```bat
 .venv\Scripts\python.exe tools\evaluate_cctv.py --manifest data/evaluation/store-recording.json --scene-prompts data/evaluation/scene-prompts.json --copies 10 --duration 900 --device cuda --report data/evaluation/production-replay-10.json
 ```
 
-Warmup30s is excluded; compare ordinary >=4.5FPS (target5), attendance >=8FPS (target10), p95 receipt-to-publication <=1s, worst rolling60s windows, OOM/queues, journal integrity and concurrent-workload prerequisites. Run30 copies only after10 passes. Repeated single-view load does not establish multi-store accuracy or camera-exposure latency. Empty AI-floor output remains an unmet AI-floor acceptance result; never fill holes or fabricate an outline to clear it.
+Warmup 30s is excluded; compare ordinary >=4.5 FPS (target 5), attendance >=8 FPS (target 10), p95 receipt-to-publication <=1s, worst rolling 60s windows, OOM/queues, journal integrity and concurrent-workload prerequisites. Run 30 copies only after 10 passes. Repeated single-view load does not establish multi-store accuracy or camera-exposure latency. Empty AI-floor output remains an unmet AI-floor acceptance result; never fill holes or fabricate an outline to clear it.

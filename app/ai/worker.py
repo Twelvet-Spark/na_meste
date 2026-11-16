@@ -581,12 +581,8 @@ class AIWorker(threading.Thread):
             del batch[limit:]
             if not batch:
                 return
-            native_started = time.monotonic()
+            chunk_started = time.monotonic()
             vectors = self.reid.embed([work.crop for work in batch])
-            sample = (time.monotonic() - native_started) / len(batch)
-            previous = self._appearance_seconds_per_crop or .02
-            # React immediately to slower work; lower estimates gradually.
-            self._appearance_seconds_per_crop = max(.002, sample, .8 * previous + .2 * sample)
             if len(vectors) != len(batch):
                 raise ValueError("Appearance batch omitted an observation")
             # Never hold the publication guard during a model call.
@@ -609,6 +605,10 @@ class AIWorker(threading.Thread):
                         vector, work.employee_id))
                 for proposal in self.global_manager.process_embeddings(items):
                     self.journal.submit_link(proposal)
+            sample = (time.monotonic() - chunk_started) / len(batch)
+            previous = self._appearance_seconds_per_crop or .02
+            # Include matching/publication; react up immediately, down gradually.
+            self._appearance_seconds_per_crop = max(.002, sample, .8 * previous + .2 * sample)
         except Exception:
             self._appearance_retry_at = time.monotonic() + 1.
             logger.exception("Optional appearance unavailable")

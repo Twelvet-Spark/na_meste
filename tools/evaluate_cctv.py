@@ -872,9 +872,370 @@ class CameraMeasurements:
                 "stage_times": {"person": None, "face": None, "appearance": None, "journal": None}}
 
 
+def annotation_face_rejections(person, width, height):
+    """Only facts present in the annotation; never invent pose or hidden faces."""
+    if not person["face_visible"]:
+        return ("FACE_OCCLUDED_OR_NOT_VISIBLE" if person["occluded"] else "FACE_NOT_VISIBLE",)
+    box = person["face_bbox"]
+    if box is None:
+        return ("FACE_BOX_UNANNOTATED",)
+    if min((box[2] - box[0]) * width, (box[3] - box[1]) * height) < 48:
+        return ("FACE_TOO_SMALL",)
+    return ()
+
+
+def native_annotation_quality(frame, person, people, engine):
+    """Identity-free quality on the annotated native person crop, before matching.
+
+    No person prediction, embedding, match score, confirmation or enrollment
+    identity is consulted. Alignment is measured, not advertised as a pose test.
+    """
+    import cv2
+    import numpy as np
+    height, width = frame.shape[:2]
+    reasons = annotation_face_rejections(person, width, height)
+    if reasons:
+        return reasons
+    if engine is None:
+        return ("FACE_MODEL_UNAVAILABLE",)
+    target = person["face_bbox"]
+    if any(other is not person and other["face_bbox"] is not None
+           and box_iou(target, other["face_bbox"]) > .1 for other in people):
+        return ("AMBIGUOUS_FACE_ASSOCIATION",)
+    x1, y1, x2, y2 = person["bbox"]
+    left, top = max(0, int(x1 * width)), max(0, int(y1 * height))
+    right, bottom = min(width, math.ceil(x2 * width)), min(height, math.ceil(y2 * height))
+    faces = engine.detect_faces(frame[top:bottom, left:right])
+    if len(faces) != 1:
+        return ("NO_NATIVE_FACE" if not faces else "AMBIGUOUS_FACE_ASSOCIATION",)
+    face = faces[0]
+    box = np.asarray(face.native_bbox)
+    if (box.shape != (4,) or not np.isfinite(box).all() or box[2] <= box[0] or box[3] <= box[1]
+            or box[0] < 0 or box[1] < 0 or box[2] > right - left or box[3] > bottom - top):
+        return ("NATIVE_FACE_ASSOCIATION_UNCERTAIN",)
+    native = ((box[0] + left) / width, (box[1] + top) / height,
+              (box[2] + left) / width, (box[3] + top) / height)
+    if box_iou(native, target) < .5:
+        return ("NATIVE_FACE_ASSOCIATION_UNCERTAIN",)
+    reasons = []
+    if min(box[2] - box[0], box[3] - box[1]) < 48:
+        reasons.append("FACE_TOO_SMALL")
+    if not math.isfinite(face.det_score) or face.det_score < .8:
+        reasons.append("LOW_FACE_DETECTION")
+    points = np.asarray(face.landmarks)
+    aligned = face.aligned
+    if (not isinstance(aligned, np.ndarray) or aligned.dtype != np.uint8 or aligned.shape != (112, 112, 3)
+            or points.shape != (5, 2) or not np.isfinite(points).all()
+            or np.linalg.matrix_rank(points - points.mean(axis=0)) < 2
+            or np.linalg.norm(points[1] - points[0]) < 1
+            or (points < 0).any() or (points[:, 0] > right - left).any() or (points[:, 1] > bottom - top).any()):
+        reasons.append("BAD_ALIGNMENT")
+    else:
+        blur = float(cv2.Laplacian(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+        if not math.isfinite(blur) or blur < 20:
+            reasons.append("BLURRY_FACE")
+    return tuple(reasons)
+
+
+class IdentityEvaluator:
+    """Explicit operator labels, annotation-only visits, identity-free eligibility."""
+    def __init__(self, specs, labels, employee_subjects, face_engine, *,
+                 ordinary_interval, attendance_interval):
+        self.specs = {spec.camera_id: spec for spec in specs}
+        self.labels = {(item["source_camera_key"], item["track_label"]): item["subject_id"] for item in labels}
+        self.employee_subjects = dict(employee_subjects)
+        self.face_engine = face_engine
+        self.intervals = {spec.camera_id: attendance_interval if spec.attendance else ordinary_interval for spec in specs}
+        if any(not math.isfinite(value) or value <= 0 for value in self.intervals.values()):
+            raise EvaluationError("IDENTITY_EVALUATION_CADENCE_INVALID")
+        self.frames = {camera: (spec.clip.annotations or {}).get("frames", []) for camera, spec in self.specs.items()}
+        self.times = {camera: [frame["time_seconds"] for frame in frames] for camera, frames in self.frames.items()}
+        self.clip_keys = {camera: id(spec.clip) for camera, spec in self.specs.items()}
+        self.qualities, self.confirmations = {}, {}
+        self.prepared_packets, self.observed_packets = set(), set()
+        self.association_rejections = Counter()
+        self.unattributed_confirmations = set()
+        self.outside_annotation_confirmations = 0
+        self.quality_seconds = 0.
+        self.prepass = dict(status="NOT_RUN", decoded_frames=0, decoded_clips=0, elapsed_seconds=0.,
+                            excluded_from_capacity_timing=True, independent_of_worker_admission=True)
+
+    def _nearest(self, camera, source):
+        if source.source_time_seconds is None:
+            return None
+        times = self.times[camera]
+        insertion = bisect.bisect_left(times, source.source_time_seconds)
+        candidates = [index for index in (insertion - 1, insertion) if 0 <= index < len(times)]
+        if not candidates:
+            return None
+        index = min(candidates, key=lambda item: (abs(times[item] - source.source_time_seconds), item))
+        return index if abs(times[index] - source.source_time_seconds) <= ANNOTATION_TOLERANCE_SECONDS else None
+
+    def capture_quality(self, camera, source):
+        """Offline decode callback: retain native quality metadata, never pixels."""
+        if not self.labels:
+            return
+        index = self._nearest(camera, source)
+        token = (self.clip_keys[camera], source.stream_id, source.seq)
+        if index is None or token in self.prepared_packets:
+            return
+        self.prepared_packets.add(token)
+        if self.prepass["status"] == "NOT_RUN":
+            self.prepass["status"] = "CAPTURED_NATIVE_METADATA"
+        people = self.frames[camera][index]["people"]
+        delta = abs(source.source_time_seconds - self.times[camera][index])
+        for person in people:
+            if (self.specs[camera].clip.source_camera_key, person["track_label"]) not in self.labels:
+                continue
+            key = (self.clip_keys[camera], index, person["track_label"])
+            old = self.qualities.get(key)
+            if old is not None and delta >= old["delta"]:
+                continue
+            started = time.monotonic()
+            try:
+                reasons = native_annotation_quality(source.frame, person, people, self.face_engine)
+            except Exception as exc:
+                if isinstance(exc, MemoryError) or any(text in str(exc).lower()
+                        for text in ("out of memory", "cudaerrormemoryallocation")):
+                    raise
+                reasons = ("NATIVE_QUALITY_UNAVAILABLE",)
+            self.quality_seconds += time.monotonic() - started
+            self.qualities[key] = dict(delta=delta, time=source.source_time_seconds,
+                                       packet_seq=source.seq, reasons=reasons)
+
+    def precompute(self, ffmpeg):
+        """Bounded native-frame prepass, before measured replay or matching starts.
+
+        Each distinct authorized annotated clip is decoded independently of the
+        live scheduler. Replicas reuse only its measured quality metadata; their
+        detector/recognizer/journal work still runs for real during measured replay.
+        """
+        if not self.labels:
+            self.prepass["status"] = "NOT_REQUIRED_NO_LABELS"
+            return
+        if self.face_engine is None:
+            self.prepass["status"] = "FACE_MODEL_UNAVAILABLE"
+            return
+        self.prepass["status"] = "RUNNING"
+        started = time.monotonic()
+        seen = set()
+        for camera, spec in self.specs.items():
+            key = self.clip_keys[camera]
+            if key in seen:
+                continue
+            seen.add(key)
+            if not any((spec.clip.source_camera_key, person["track_label"]) in self.labels
+                       and not annotation_face_rejections(person, spec.probe.width, spec.probe.height)
+                       for frame in self.frames[camera] for person in frame["people"]):
+                continue
+            native_spec = ReplaySpec(camera, spec.clip, spec.probe, 0.,
+                                     f"quality-prepass-{camera}", False, spec.probe.fps)
+            reader = FFmpegReplay(native_spec, ffmpeg, realtime=False, repeat=False,
+                                  on_frame=lambda packet, owner=camera: self.capture_quality(owner, packet))
+            deadline = time.monotonic() + max(60., spec.probe.duration_seconds * 20.)
+            try:
+                reader.start()
+                while reader.is_alive():
+                    reader.join(.25)
+                    reader.check_health()
+                    if time.monotonic() > deadline:
+                        raise EvaluationError("IDENTITY_NATIVE_QUALITY_PREPASS_TIMEOUT")
+                reader.check_health()
+                if not reader.decoded_count:
+                    raise EvaluationError("IDENTITY_NATIVE_QUALITY_PREPASS_EMPTY")
+                self.prepass["decoded_frames"] += reader.decoded_count
+                self.prepass["decoded_clips"] += 1
+            except Exception:
+                self.prepass["status"] = "FAILED"
+                self.prepass["elapsed_seconds"] = time.monotonic() - started
+                raise
+            finally:
+                reader.stop()
+        self.prepass["status"] = "COMPLETED"
+        self.prepass["elapsed_seconds"] = time.monotonic() - started
+
+    def observe(self, camera, source, outcome):
+        """Only worker-published outcomes; candidates/fresh-evidence votes are not confirmations."""
+        if not self.labels:
+            return
+        token = (camera, source.stream_id, source.seq)
+        if token in self.observed_packets:
+            return
+        self.observed_packets.add(token)
+        index = self._nearest(camera, source)
+        tracks = outcome.observed_tracks
+        if index is None:
+            self.outside_annotation_confirmations += sum(track.employee_id is not None for track in tracks)
+            return
+        people = self.frames[camera][index]["people"]
+        choices = [[j for j, track in enumerate(tracks) if box_iou(person["bbox"], track.bbox) >= .5]
+                   for person in people]
+        attributed = set()
+        for person, candidates in zip(people, choices):
+            if (len(candidates) != 1 or sum(candidates[0] in others for others in choices) != 1):
+                self.association_rejections["PERSON_NOT_DETECTED" if not candidates else "AMBIGUOUS_PERSON_ASSOCIATION"] += 1
+                continue
+            track = tracks[candidates[0]]
+            if track.association_uncertain:
+                self.association_rejections["PREDICTION_ASSOCIATION_UNCERTAIN"] += 1
+                continue
+            attributed.add(candidates[0])
+            if track.employee_id is None:
+                continue
+            key = (camera, source.stream_id, index, person["track_label"])
+            self.confirmations.setdefault(key, []).append(dict(
+                time=source.source_time_seconds, employee_id=track.employee_id,
+                subject=self.employee_subjects.get(track.employee_id),
+                track_token=(outcome.tracking_generation, track.track_id, track.employee_id)))
+        for index, track in enumerate(tracks):
+            if index not in attributed and track.employee_id is not None:
+                self.unattributed_confirmations.add((*token, outcome.tracking_generation, track.track_id, track.employee_id))
+
+    @staticmethod
+    def _eligible(opportunities, cadence):
+        times = sorted(set(opportunities))
+        for index, first in enumerate(times):
+            selected = [first]
+            for stamp in times[index + 1:]:
+                if stamp - first > 2. + 1e-9:
+                    break
+                if stamp - selected[-1] + 1e-9 >= cadence:
+                    selected.append(stamp)
+                    if len(selected) == 3:
+                        return True
+        return False
+
+    def summary(self, annotations):
+        visits = {}
+        rejections = Counter()
+        occluded = 0
+        for (camera, stream), coverage in annotations.coverage().items():
+            previous, last_time = {}, None
+            for index, frame in enumerate(self.frames[camera]):
+                stamp = frame["time_seconds"]
+                if not coverage["first"] <= stamp <= coverage["last"]:
+                    continue
+                current = {}
+                for person in frame["people"]:
+                    label = person["track_label"]
+                    key = previous.get(label) if last_time is not None and stamp - last_time <= 2. else None
+                    if key is None:
+                        key = (camera, stream, label, stamp)
+                        identity_key = (self.specs[camera].clip.source_camera_key, label)
+                        visits[key] = dict(camera_id=camera, stream_id=stream, track_label=label, started_at_seconds=stamp,
+                            labeled=identity_key in self.labels, subject_id=self.labels.get(identity_key),
+                            opportunities=[], unknown_quality=0, confirmations=[], rejection_counts=Counter())
+                    current[label] = key
+                    visit = visits[key]
+                    if not visit["labeled"]:
+                        continue
+                    sample_key = (camera, stream, index, label)
+                    sample = self.qualities.get((self.clip_keys[camera], index, label))
+                    reasons = (sample["reasons"] if sample is not None else
+                               annotation_face_rejections(person, self.specs[camera].probe.width,
+                                                          self.specs[camera].probe.height) or
+                               (("FACE_MODEL_UNAVAILABLE",) if self.face_engine is None else ("NO_NATIVE_QUALITY_SAMPLE",)))
+                    rejections.update(reasons)
+                    visit["rejection_counts"].update(reasons)
+                    occluded += int(person["occluded"])
+                    if any(reason in reasons for reason in ("NO_NATIVE_QUALITY_SAMPLE", "NATIVE_QUALITY_UNAVAILABLE", "FACE_MODEL_UNAVAILABLE")):
+                        visit["unknown_quality"] += 1
+                    if not reasons:
+                        visit["opportunities"].append(sample["time"])
+                    visit["confirmations"].extend(self.confirmations.get(sample_key, ()))
+                previous, last_time = current, stamp
+        rows = []
+        wrong_confirmations = wrong_known = unknown_assigned = eligible = correct_eligible = correct_known = undetermined = 0
+        correct_times = []
+        ineligibility = Counter()
+        for visit in visits.values():
+            known = visit["labeled"] and visit["subject_id"] is not None
+            qualifies = known and self._eligible(visit["opportunities"], self.intervals[visit["camera_id"]])
+            matches = [item for item in visit["confirmations"] if known and item["subject"] == visit["subject_id"]]
+            wrong = [item for item in visit["confirmations"] if visit["labeled"]
+                     and (not known or item["subject"] != visit["subject_id"])]
+            wrong_count = len({item["track_token"] for item in wrong})
+            eligible += int(qualifies)
+            correct_eligible += int(qualifies and bool(matches))
+            correct_known += int(bool(matches))
+            wrong_confirmations += wrong_count
+            wrong_known += int(known and bool(wrong))
+            unknown_assigned += int(visit["labeled"] and not known and bool(wrong))
+            undetermined += int(known and not qualifies and visit["unknown_quality"] > 0)
+            if known and not qualifies:
+                ineligibility["QUALITY_COVERAGE_UNDETERMINED" if visit["unknown_quality"] else
+                              "NO_THREE_CADENCED_QUALITY_OPPORTUNITIES_IN_TWO_SECONDS"] += 1
+            delay = max(0., min(item["time"] for item in matches) - visit["started_at_seconds"]) if matches else None
+            if delay is not None:
+                correct_times.append(delay)
+            rows.append(dict(camera_id=visit["camera_id"], stream_id=visit["stream_id"], track_label=visit["track_label"],
+                             started_at_seconds=visit["started_at_seconds"], labeled=visit["labeled"], subject_id=visit["subject_id"],
+                             eligible_known=qualifies, quality_opportunities=len(visit["opportunities"]),
+                             correct_confirmed=bool(matches), wrong_confirmations=wrong_count,
+                             time_to_first_correct_confirmation_seconds=delay,
+                             time_to_first_assignment_seconds=(max(0., min(item["time"] for item in visit["confirmations"])
+                                 - visit["started_at_seconds"]) if visit["confirmations"] else None),
+                             rejection_counts=dict(visit["rejection_counts"])))
+        labeled = sum(row["labeled"] for row in rows)
+        known = sum(row["labeled"] and row["subject_id"] is not None for row in rows)
+        unlabeled = len(rows) - labeled
+        recall = correct_eligible / eligible if eligible else None
+        failures = []
+        if wrong_confirmations:
+            failures.append("WRONG_EMPLOYEE_CONFIRMATION")
+        if recall is not None and recall < .9:
+            failures.append("ELIGIBLE_KNOWN_RECALL_BELOW_0.90")
+        missing = []
+        if not self.labels:
+            missing.append("NO_VERIFIED_IDENTITY_LABELS")
+        if not eligible:
+            missing.append("NO_ELIGIBLE_KNOWN_VISITS")
+        if unlabeled:
+            missing.append("PARTIAL_LABEL_COVERAGE")
+        if undetermined:
+            missing.append("NATIVE_QUALITY_COVERAGE_INCOMPLETE")
+        if self.unattributed_confirmations:
+            missing.append("UNATTRIBUTED_CONFIRMED_IDENTITIES")
+        status = "FAIL" if failures else "NOT_EVALUATED" if missing else "PASS"
+        return dict(status=status, reason=missing[0] if missing else None, failures=failures, prerequisites=missing,
+                    certified=status == "PASS" and labeled > known,
+                    scope="OPERATOR_LABELED_ANNOTATED_VIDEO_VISITS_ONLY",
+                    recall_status="EVALUATED" if eligible else "NOT_EVALUATED", recall=recall,
+                    eligible_known_visits=eligible, confirmed_eligible_known_visits=correct_eligible,
+                    known_visits=known, ineligible_known_visits=known - eligible - undetermined,
+                    not_established_eligible_known_visits=known - eligible, ineligibility_counts=dict(ineligibility),
+                    eligibility_undetermined_known_visits=undetermined, unknown_visits=labeled - known,
+                    labeled_visits=labeled, unlabeled_visits=unlabeled, correct_known_visits=correct_known,
+                    wrong_confirmations=wrong_confirmations if self.labels else None,
+                    wrong_known_visits=wrong_known if self.labels else None,
+                    unknown_false_assignment_visits=unknown_assigned if labeled > known else None,
+                    unknown_false_assignment_status="EVALUATED" if labeled > known else "NOT_EVALUATED",
+                    all_visit_identification_coverage=correct_known / labeled if labeled else None,
+                    all_visit_identification_coverage_definition="CORRECT_KNOWN_VISITS_OVER_ALL_LABELED_VISITS_UNKNOWN_IS_NEVER_SUCCESS",
+                    time_to_first_correct_confirmation_seconds=dict(samples=len(correct_times),
+                        p50=percentile(correct_times, .5), p95=percentile(correct_times, .95),
+                        origin="FIRST_PLAYED_ANNOTATED_GT_VISIT_OBSERVATION_NOT_TRUE_ARRIVAL"),
+                    rejection_counts=dict(rejections), annotated_body_occlusion_opportunities=occluded,
+                    prediction_association_rejections=dict(self.association_rejections),
+                    unattributed_confirmations=len(self.unattributed_confirmations),
+                    confirmed_observations_outside_annotation_tolerance=self.outside_annotation_confirmations,
+                    pose_rejections=None, pose_status="NOT_EVALUATED_NO_POSE_LABELS_OR_ESTIMATOR_ALIGNMENT_IS_NOT_POSE",
+                    native_quality_seconds=self.quality_seconds, visits=rows,
+                    quality_prepass={**self.prepass, "metadata_opportunities": len(self.qualities)},
+                    eligibility_policy=dict(native_min_px=48, det_score=.8, blur_min=20, distinct_opportunities=3,
+                        window_seconds=2., attempt_intervals=self.intervals,
+                        sampling="ONE_CLOSEST_INDEPENDENT_NATIVE_PREPASS_PACKET_PER_ANNOTATION_NO_INTERPOLATION"),
+                    association_policy="RECIPROCAL_UNIQUE_PERSON_IOU_GE_0.5_WITHIN_0.125S_NO_UNCERTAIN_TRACKS",
+                    visit_policy="CAMERA_STREAM_GT_LABEL_CONTIGUOUS_ANNOTATIONS_SPLIT_ON_ABSENCE_OR_GAP_GT_2S",
+                    holdout=dict(validation_source="VIDEO_ONLY_ENROLLMENT_PHOTOS_NEVER_SCORED",
+                        photo_time_and_visit_provenance="NOT_PROVIDED_BY_MANIFEST_V1",
+                        independent_holdout_verified=False, labels="OPERATOR_SUPPLIED_NOT_INFERRED",
+                        repeated_copies="CORRELATED_REPLAYS_NOT_INDEPENDENT_IDENTITY_TRIALS"))
+
+
 def acceptance_gates(cameras: list[dict], *, duration_seconds: float, copies: int,
                      gpu_inventory: list[dict], integration_needs: list[str],
-                     runtime_failures: Iterable[str] = ()) -> dict:
+                     runtime_failures: Iterable[str] = (), recognition: dict | None = None) -> dict:
     failures = list(runtime_failures)
     if len(cameras) != copies:
         failures.append("CAMERA_RESULTS_MISSING")
@@ -900,7 +1261,8 @@ def acceptance_gates(cameras: list[dict], *, duration_seconds: float, copies: in
                          "required_total_seconds": 900, "warmup_seconds": WARMUP_SECONDS},
             "target_hardware": {"status": "TARGET_HARDWARE_PRESENT" if target else "NOT_TARGET_HARDWARE",
                                 "certified": target and not prerequisites and not failures and copies >= 10},
-            "recognition": {"status": "NOT_EVALUATED", "reason": "VERIFIED_LABELS_AND_INDEPENDENT_QUALITY_ELIGIBILITY_REQUIRED"}}
+            "recognition": recognition if recognition is not None else {
+                "status": "NOT_EVALUATED", "reason": "NO_LABELED_RECOGNITION_MEASUREMENT"}}
 
 
 @dataclass(frozen=True)
@@ -1024,13 +1386,17 @@ class ProductionAccounting:
         self.source_metadata_missing = 0
         self.errors = Counter()
         self.enrollment = None
+        self.identity_evaluator = None
         self.measurement_end = float("inf")
+        self.measurement_start = None
+        self._growth_checked_bucket = -1
         self._health = deque()
         self._health_lock = threading.Lock()
         self._degraded_start = None
         self.degraded_intervals = []
         self.peak_pending = 0
         self.persistent_growth = False
+
 
     def batch(self, inputs, outcomes, started):
         self.batch_calls += 1
@@ -1056,6 +1422,8 @@ class ProductionAccounting:
                 self.annotations.observe(source, [
                     Prediction(f"{generation}:{track.track_id}", _bbox(list(track.bbox)), track.employee_id)
                     for track in outcome.observed_tracks])
+                if self.identity_evaluator is not None:
+                    self.identity_evaluator.observe(camera_id, source, outcome)
         if self.faces is not None:
             self.faces.observe(outcome, packet.frame.shape)
         if self.enrollment is not None:
@@ -1087,13 +1455,29 @@ class ProductionAccounting:
             now = max(now, self._health[-1][0])
         pending = sum(snapshot[key] for key in ("pending_commands", "pending_updates", "pending_barriers"))
         self.peak_pending = max(self.peak_pending, pending)
-        self._health.append((now, pending))
-        while len(self._health) > 1 and self._health[1][0] <= now - WINDOW_SECONDS:
+        if self.measurement_start is None:
+            self.measurement_start = now + WARMUP_SECONDS
+        if now >= self.measurement_start:
+            self._health.append((now, pending))
+        while self._health and self._health[0][0] < now - WINDOW_SECONDS:
             self._health.popleft()
-        if (self._health and now - self._health[0][0] >= WINDOW_SECONDS
-                and pending > self._health[0][1]
-                and all(value > 0 for _stamp, value in self._health)):
-            self.persistent_growth = True
+        bucket = math.floor((now - self.measurement_start) / 10.)
+        if bucket >= 6 and bucket != self._growth_checked_bucket:
+            self._growth_checked_bucket = bucket
+            # Six completed ten-second buckets, each with >=8 distinct sampled
+            # seconds. A one-off step, positive plateau or bounded oscillation
+            # is not sustained growth. Do not weight busy sampling bursts more.
+            medians = []
+            for index in range(bucket - 6, bucket):
+                lower = self.measurement_start + index * 10.
+                seconds = {math.floor(stamp - lower): value for stamp, value in self._health
+                           if lower <= stamp < lower + 10.}
+                if len(seconds) < 8:
+                    break
+                medians.append(percentile(seconds.values(), .5))
+            if len(medians) == 6 and medians[0] > 0 and all(
+                    right > left for left, right in zip(medians, medians[1:])):
+                self.persistent_growth = True
         if snapshot["state"] != "OK" and self._degraded_start is None:
             self._degraded_start = now
         elif snapshot["state"] == "OK" and self._degraded_start is not None:
@@ -1566,7 +1950,7 @@ class ApprovedInference:
             self.engine = engine
             init_db()
             configure_replay_cameras(engine, specs)
-            self._enroll(manifest, SessionLocal)
+            self.employee_subjects = self._enroll(manifest, SessionLocal)
             self.store = EmbeddingStore(self.bundle.face_model_id)
             with SessionLocal() as session:
                 self.store.refresh(session)
@@ -1575,6 +1959,10 @@ class ApprovedInference:
                 min_confidence=settings.min_recognition_confidence, min_confirmations=settings.min_confirmations,
                 retry_interval=settings.face_recognition_retry_interval, track_lost_timeout=settings.track_lost_timeout,
                 tracker_high_threshold=settings.tracker_new_track_threshold)
+            accounting.identity_evaluator = IdentityEvaluator(
+                specs, manifest.identity_labels, self.employee_subjects, self.face_engine,
+                ordinary_interval=self.service.retry_interval,
+                attendance_interval=settings.attendance_face_attempt_interval)
             self.attendance = AttendanceService(engine, model_bundle=self.bundle)
             self.attendance.health.set_providers(self.providers)
             self.journal = HumanJournal(engine, min_hits=self.service.min_hits,
@@ -1601,7 +1989,7 @@ class ApprovedInference:
 
     def _enroll(self, manifest, session_factory):
         if not manifest.enrollments:
-            return
+            return {}
         if self.enroll_engine is None:
             raise EvaluationError("FACE_MODEL_UNAVAILABLE_FOR_ENROLLMENTS")
         from app.services.employee_service import enrollment_slot, prepare_face, PreparedFace
@@ -1618,11 +2006,13 @@ class ApprovedInference:
                         raise EvaluationError("ENROLLMENT_FACE_QUALITY_INSUFFICIENT")
                     samples.append(sample)
                 prepared.append((enrollment.subject_id, samples))
+        employee_subjects = {}
         with session_factory.begin() as session:
             for subject, samples in prepared:
                 employee = Employee(name=subject, active=True)
                 session.add(employee)
                 session.flush()
+                employee_subjects[employee.id] = subject
                 for sample in samples:
                     face = EmployeeFace(employee_id=employee.id, embedding=sample.embedding, thumbnail=sample.thumbnail)
                     session.add(face)
@@ -1630,6 +2020,7 @@ class ApprovedInference:
                     session.add(FaceModelMetadata(face_id=face.id, model_id=sample.model_id,
                                                   alignment_id=sample.alignment_id))
             session.get(AttendanceRuntime, 1).gallery_revision += 1
+        return employee_subjects
 
     def start(self):
         self.monitor.startup()
@@ -1820,6 +2211,11 @@ class AnnotationSamples:
                     if delta <= ANNOTATION_TOLERANCE_SECONDS and (old is None or delta < old[0]):
                         state["samples"][index] = (delta, predictions)
 
+    def coverage(self):
+        with self._lock:
+            return {key: {"first": state["first"], "last": state["last"]}
+                    for key, state in self._streams.items()}
+
     def evaluate(self) -> dict:
         # Called after all decoder threads are joined; metadata only, no images.
         evaluator = QualityEvaluator()
@@ -1881,12 +2277,19 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
     metrics = {spec.camera_id: CameraMeasurements(spec.camera_id, spec.target_fps, spec.attendance) for spec in specs}
     accounting = ProductionAccounting(metrics, annotations, manager, face_observations)
     inference = ApprovedInference(manifest, isolated, device, specs, manager, accounting)
+    try:
+        accounting.identity_evaluator.precompute(ffmpeg)
+    except Exception:
+        inference.close()
+        inference.dispose()
+        raise
     scene_load = SceneLoad(inference, manager, specs, scene_prompts or [])
     errors = []
     inventory, other_processes = gpu_inventory(), gpu_processes()
     peaks = {gpu["name"]: gpu["memory_used_mib"] for gpu in inventory}
     started = time.monotonic()
     manager.measurement_end = accounting.measurement_end = started + duration
+    accounting.measurement_start = started + WARMUP_SECONDS
     cpu_started = time.process_time()
     ended = started
     preview_token, preview = None, None
@@ -2015,22 +2418,23 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
         failures.append("ATTENDANCE_PERSISTENCE_DEGRADED")
     elapsed = ended - started
     quality = annotations.evaluate()
+    quality["recognition"] = accounting.identity_evaluator.summary(annotations)
     quality["verified_identity_labels_supplied"] = len(manifest.identity_labels)
     durable_status = ("FAIL" if any(reason in failures for reason in
                       ("JOURNAL_LOSS", "JOURNAL_DEGRADED", "JOURNAL_UNFLUSHED")) else integrity["status"])
     quality["detection_tracking_acceptance"]["durable_visit_coverage"] = durable_status
-    if manifest.identity_labels:
-        quality["recognition"]["reason"] = "INDEPENDENT_POSE_BLUR_ASSOCIATION_ELIGIBILITY_AND_VISIT_SCORING_NOT_INTEGRATED"
     acceptance = acceptance_gates(camera_reports, duration_seconds=elapsed, copies=copies,
                                   gpu_inventory=inventory, integration_needs=integration_needs,
-                                  runtime_failures=failures)
+                                  runtime_failures=failures, recognition=quality["recognition"])
     acceptance["journal"] = dict(status=durable_status)
     acceptance["detection_tracking"] = quality["detection_tracking_acceptance"]
     acceptance["deployment"] = dict(status="PASS" if all((
         acceptance["capacity"]["status"] == "PASS", integrity["status"] == "PASS",
         quality["detection_tracking_acceptance"]["status"] == "PASS",
         acceptance["target_hardware"]["certified"], not other_processes.get("contaminated", True),
-        acceptance["recognition"]["status"] == "PASS")) else "NOT_ACCEPTED")
+        acceptance["recognition"]["status"] == "PASS", acceptance["recognition"]["certified"],
+        acceptance["recognition"]["holdout"]["independent_holdout_verified"])) else "NOT_ACCEPTED",
+        recognition_holdout="OPERATOR_PHOTO_TIME_VISIT_HOLDOUT_ATTESTATION_NOT_REPRESENTED_IN_MANIFEST_V1")
     result = {
         "status": "ERROR" if errors else "PRODUCTION_PIPELINE_MEASURED",
         "workload": "REPEATED_SINGLE_VIEW" if len({clip.source_camera_key for clip in manifest.clips}) == 1 and copies > 1 else "LOCAL_CLIP_REPLAY",
