@@ -326,11 +326,11 @@ class DiagnosticsService:
                         key: number(measurement.get(key)) for key in (
                             "processed_fps_10s", "target_fps", "completion_age_p95_seconds", "pending_age_seconds",
                             "queue_age_seconds", "processing_seconds", "completion_age_seconds",
-                            "skipped_slots", "face_deferred", "reid_deferred")}
+                            "skipped_slots", "skipped_frames", "face_deferred", "reid_deferred")}
                     row["inference"].update(
                         reason_codes=[safe_code(code) for code in measurement.get("reason_codes", [])],
                         stage_times_ms={key: number(measurement.get("stage_times_ms", {}).get(key))
-                                        for key in ("person", "face_detection", "face_recognition", "tracking")},
+                                        for key in ("person", "face_detection", "face_recognition", "tracking", "appearance")},
                         model_ids={key: model_identifier(measurement.get("model_ids", {}).get(key))
                                    for key in ("bundle", "person", "face", "body")},
                         providers=provider_summary(measurement.get("providers")))

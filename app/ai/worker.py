@@ -123,6 +123,7 @@ class AIWorker(threading.Thread):
         self.metrics = InferenceMetrics()
         self._optional_rotation = 0
         self.model_ids = {}
+        self._runnable_ids = set()
 
     def stop(self, timeout=None):
         self._stop_event.set()
@@ -137,12 +138,21 @@ class AIWorker(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 if not self.step():
-                    maximum = max(.001, settings.ai_batch_wait_ms / 1000.)
-                    delay = self.scheduler.delay(time.monotonic(), maximum)
-                    self._stop_event.wait(delay if delay > 0 else .001)
+                    self._stop_event.wait(self._idle_delay(time.monotonic()))
         finally:
             self.flush("SHUTDOWN")
             logger.info("AI worker stopped")
+
+    def _idle_delay(self, now):
+        # Period waiting is not a historical frame queue. Offline/duplicate slots
+        # cannot force a tight loop, and a pending retry has its own wake deadline.
+        maximum = (settings.ai_batch_wait_ms / 1000. or .01) if self._runnable_ids else .01
+        delay = self.scheduler.delay(now, maximum, camera_ids=self._runnable_ids)
+        retries = [deadline - now for deadline in self._retry_after.values() if deadline > now]
+        if retries:
+            delay = min(delay, min(retries))
+        return delay if delay > 0 else .001
+
 
     def _persist(self, events):
         for crossing in events:
@@ -192,7 +202,9 @@ class AIWorker(threading.Thread):
         try:
             packets = self._collect_frames()
             self.health.transition("configuration", [])
-            selected = self.scheduler.select((item[0] for item in packets), time.monotonic())
+            selected = self.scheduler.select(
+                (item[0] for item in packets), time.monotonic(),
+                attendance_ids=(camera_id for camera_id, _packet, config in packets if config.attendance))
             # Configuration is re-read at admission, not inferred from cached readers.
             configurations = self._read_configurations() if selected else {}
         except SQLAlchemyError:
@@ -225,6 +237,7 @@ class AIWorker(threading.Thread):
                 continue
             submissions.append((camera_id, packet, config, reader, epoch))
             self.metrics.pending(camera_id, packet.received_mono)
+            self.metrics.admit_packet(camera_id, packet, reader_token=id(reader))
         if not submissions:
             self._persist(self.doorway.expire(time.monotonic()))
             self.metrics.snapshots(time.monotonic())
@@ -289,6 +302,7 @@ class AIWorker(threading.Thread):
                                         camera_ids=active):
                 submission, outcome = published[self._optional_rotation % len(published)]
                 self._optional_rotation += 1
+                appearance_started = time.monotonic()
                 camera_id, packet, config, reader, epoch = submission
                 try:
                     self.global_manager.process(camera_id, outcome, packet.frame, packet.received_mono)
@@ -299,6 +313,9 @@ class AIWorker(threading.Thread):
                         self._reset_camera(camera_id, "SOURCE_CHANGED")
                 except Exception:
                     logger.exception("Optional global tracking failed for camera %d", camera_id)
+                finally:
+                    self.metrics.record_stage(camera_id, "appearance",
+                                              (time.monotonic() - appearance_started) * 1000.)
             else:
                 for submission, _outcome in published:
                     self.metrics.defer_reid(submission[0])
@@ -322,7 +339,7 @@ class AIWorker(threading.Thread):
         self._persist(self.doorway.reset_camera(camera_id, reason))
         self.service.reset_camera(camera_id)
         self.state.drop_camera(camera_id)
-        self.metrics.drop(camera_id)
+        self.metrics.clear_pending(camera_id)
         if self.global_manager is not None:
             self.global_manager.drop_camera(camera_id)
         for mapping in (self._streams, self._last_seq, self._last_received, self._last_received_at, self._retry_after):
@@ -347,6 +364,7 @@ class AIWorker(threading.Thread):
         return read_snapshot(self.attendance.engine, read)
 
     def _collect_frames(self):
+        self._runnable_ids.clear()
         now = time.monotonic()
         camera_ids = self._camera_ids()
         configurations = self._read_configurations()
@@ -367,6 +385,7 @@ class AIWorker(threading.Thread):
                                            enabled=False, online=False, included=False)
         for camera_id in set(self._configurations) - included:
             self._reset_camera(camera_id, "CAMERA_DISABLED")
+            self.metrics.drop(camera_id)
             self.health.transition(f"inference:{camera_id}", [])
             self._configurations.pop(camera_id, None)
         packets = []
@@ -416,6 +435,7 @@ class AIWorker(threading.Thread):
                 self.metrics.configure(camera_id, settings.attendance_ai_fps if config.attendance else settings.ai_fps, now)
             packets.append((camera_id, packet, config))
             self.metrics.pending(camera_id, packet.received_mono)
+        self._runnable_ids = {camera_id for camera_id, _packet, _config in packets}
         return packets
 
     def _camera_ids(self):

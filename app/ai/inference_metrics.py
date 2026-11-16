@@ -11,13 +11,16 @@ class InferenceMetrics:
 
     def configure(self, camera_id, target_fps, now):
         with self._lock:
-            state = self._cameras.setdefault(camera_id, {
-                "samples": deque(maxlen=4096), "since": now, "bad_since": None,
-                "good_since": None, "degraded": False, "skipped": 0,
-                "face_deferred": 0, "reid_deferred": 0, "pending": None,
-                "stage_times_ms": {}, "error_code": None,
-                "queue_age_seconds": None, "processing_seconds": None, "completion_age_seconds": None,
-            })
+            state = self._cameras.get(camera_id)
+            if state is None:
+                state = {
+                    "samples": deque(maxlen=4096), "bad_since": now,
+                    "good_since": None, "degraded": False, "skipped": 0, "skipped_frames": 0,
+                    "last_packet": None, "face_deferred": 0, "reid_deferred": 0, "pending": None,
+                    "stage_times_ms": {}, "error_code": None,
+                    "queue_age_seconds": None, "processing_seconds": None, "completion_age_seconds": None,
+                }
+                self._cameras[camera_id] = state
             state["target_fps"] = target_fps
 
     def pending(self, camera_id, received_mono):
@@ -34,7 +37,7 @@ class InferenceMetrics:
             state["face_deferred"] += face_deferred
             if error_code is None:
                 state["samples"].append((completed, max(0., completed - received_mono)))
-            state["stage_times_ms"] = dict(stage_times_ms or {})
+            state["stage_times_ms"].update(stage_times_ms or {})
             state["completion_age_seconds"] = max(0., completed - received_mono)
             state["queue_age_seconds"] = max(0., started_mono - received_mono) if started_mono is not None else None
             state["processing_seconds"] = max(0., completed - started_mono) if started_mono is not None else None
@@ -46,6 +49,30 @@ class InferenceMetrics:
     def drop(self, camera_id):
         with self._lock:
             self._cameras.pop(camera_id, None)
+
+    def clear_pending(self, camera_id):
+        """Continuity resets do not retire real camera history or hysteresis."""
+        with self._lock:
+            state = self._cameras.get(camera_id)
+            if state is not None:
+                state["pending"] = None
+
+    def admit_packet(self, camera_id, packet, *, reader_token):
+        with self._lock:
+            state = self._cameras[camera_id]
+            token = (reader_token, packet.stream_id, packet.source_revision)
+            previous = state["last_packet"]
+            if previous is not None and previous[0] == token:
+                state["skipped_frames"] += max(0, packet.seq - previous[1] - 1)
+                if packet.seq <= previous[1]:
+                    return
+            state["last_packet"] = (token, packet.seq)
+
+    def record_stage(self, camera_id, name, elapsed_ms):
+        with self._lock:
+            state = self._cameras.get(camera_id)
+            if state is not None:
+                state["stage_times_ms"][name] = max(0., elapsed_ms)
 
     def snapshot(self, camera_id, now):
         with self._lock:
@@ -79,6 +106,7 @@ class InferenceMetrics:
                 "completion_age_seconds": state["completion_age_seconds"],
                 "pending_age_seconds": (max(0., now - state["pending"]) if state["pending"] is not None else None),
                 "skipped_slots": state["skipped"], "face_deferred": state["face_deferred"],
+                "skipped_frames": state["skipped_frames"],
                 "reid_deferred": state["reid_deferred"], "stage_times_ms": dict(state["stage_times_ms"]),
                 "reason_codes": (["CAPACITY_DEGRADED"] if state["degraded"] else [])
                     + ([state["error_code"]] if state["error_code"] else []),
