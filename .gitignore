@@ -1,5 +1,6 @@
 # --- Python ---
 venv/
+.model-build/
 __pycache__/
 *.pyc
 *.egg-info/

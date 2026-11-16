@@ -41,6 +41,16 @@ Launch from the project root, using the selected venv's `python main.py` or the 
 
 Startup automatically restores readers for all saved enabled cameras. Connecting is asynchronous; wait for `ONLINE`. Do **not** edit/save every camera after restart. Manual recording is not resumed.
 
+### Preparing the licensed bundle (separate build environment)
+
+```bat
+py -m venv .model-build
+.model-build\Scripts\python.exe -m pip install -r tools\model_build_requirements.txt
+.model-build\Scripts\python.exe tools\prepare_models.py --output models/store-v1 --device cpu
+```
+
+Never install export-only PyTorch dependencies into the server environment. The preparer pins official sources and artifact hashes, retains license notices, checks exported graphs and real inference, and publishes the bundle only after validation. Bundle-backed inference does not download weights at startup. Preparation alone does not activate a bundle or certify capacity. Preserve existing model files; upstream license grants do not independently guarantee training-data rights.
+
 ### Unattended Windows launch
 
 `run_server_task.bat` can be started at logon. It selects `.venv`, then `venv`, creates `data/` for `data/app_run.log`, reads `Settings.app_port` once at wrapper startup without opening the DB, waits while that exact port is busy, and retries server exits after 5 seconds. Restart the **wrapper**, not just the server, after changing `APP_PORT`.

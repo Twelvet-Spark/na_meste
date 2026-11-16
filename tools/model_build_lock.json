@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "alignment_id": "arcface-5pt-112-v1",
+  "opset": 16,
+  "authentication": "Official bytes fetched 2026-11-16 without loading checkpoints; release asset metadata and MobileSAM Git blob identity verified.",
+  "sources": {
+    "dfine": {
+      "revision": "956d1709314c2c6a4df6f34de232054578a7449f",
+      "url": "https://codeload.github.com/Peterande/D-FINE/zip/956d1709314c2c6a4df6f34de232054578a7449f",
+      "sha256": "be84234b480b1a341fac0b55194f969976ce56941c3dc1f77763bc87800ab033",
+      "size": 235615,
+      "cache_name": "dfine-source.zip"
+    },
+    "osnet": {
+      "revision": "f8cd150fdf77e8d9e1ed143b7f308c2c609ded50",
+      "url": "https://codeload.github.com/KaiyangZhou/deep-person-reid/zip/f8cd150fdf77e8d9e1ed143b7f308c2c609ded50",
+      "sha256": "1acd355d16db6fbffadfb6486ad7bfdeb130a770dc94bff6ed92120a11300e23",
+      "size": 463459,
+      "cache_name": "osnet-source.zip"
+    },
+    "mobilesam": {
+      "revision": "f706ad9c4eb7f219c00d9050e46328518ffb65d2",
+      "url": "https://codeload.github.com/ChaoningZhang/MobileSAM/zip/f706ad9c4eb7f219c00d9050e46328518ffb65d2",
+      "sha256": "bdcd4f3fa3b906d502439f6694a5e29b3faaf3f3a768d1c2f4633e0c7e71c4e9",
+      "size": 77560162,
+      "cache_name": "mobilesam-source.zip"
+    }
+  },
+  "artifacts": {
+    "person": {
+      "url": "https://github.com/Peterande/storage/releases/download/dfinev1.0/dfine_s_coco.pth",
+      "revision": "release:177720969:asset:196374453",
+      "release_id": 177720969,
+      "asset_id": 196374453,
+      "sha256": "48a6c8cc43eb57186843f752e2e8461ddd3326e0d3c575e71e6e960844683e89",
+      "size": 41841422,
+      "cache_name": "dfine_s_coco.pth",
+      "source": "dfine",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/LICENSE",
+      "preprocessing_id": "dfine-rgb-letterbox640-black-div255-v1"
+    },
+    "face_detection": {
+      "url": "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2026may.onnx",
+      "revision": "48b10fa505aeb51fbd127fc60a5c660040e823b7",
+      "sha256": "ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0",
+      "size": 229738,
+      "cache_name": "face_detection_yunet_2026may.onnx",
+      "license": "MIT",
+      "license_url": "https://github.com/opencv/opencv_zoo/blob/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/LICENSE",
+      "preprocessing_id": "yunet-bgr-f32-strides8-16-32-v1"
+    },
+    "face_recognition": {
+      "url": "https://huggingface.co/fal/AuraFace-v1/resolve/af6d057c9b0ec4071d4c49c80e3539258798b609/glintr100.onnx",
+      "revision": "af6d057c9b0ec4071d4c49c80e3539258798b609",
+      "sha256": "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
+      "size": 260694151,
+      "cache_name": "glintr100.onnx",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/fal/AuraFace-v1/blob/af6d057c9b0ec4071d4c49c80e3539258798b609/LICENSE.md",
+      "preprocessing_id": "auraface-rgb112-minus127.5-div127.5-v1"
+    },
+    "body": {
+      "url": "https://huggingface.co/kaiyangzhou/osnet/resolve/a5c5cc037c24235cda3b21085b93ad77c9616224/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth",
+      "revision": "a5c5cc037c24235cda3b21085b93ad77c9616224",
+      "sha256": "8a07e8da38946f7cee37f4561617bf8b6d2fe8f3a4027852893ea092e46d919f",
+      "cache_name": "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth",
+      "source": "osnet",
+      "license": "MIT",
+      "license_url": "https://huggingface.co/kaiyangzhou/osnet/blob/a5c5cc037c24235cda3b21085b93ad77c9616224/README.md",
+      "preprocessing_id": "osnet-rgb256x128-imagenet-v1"
+    },
+    "scene": {
+      "url": "https://raw.githubusercontent.com/ChaoningZhang/MobileSAM/f706ad9c4eb7f219c00d9050e46328518ffb65d2/weights/mobile_sam.pt",
+      "revision": "f706ad9c4eb7f219c00d9050e46328518ffb65d2",
+      "sha256": "6dbb90523a35330fedd7f1d3dfc66f995213d81b29a5ca8108dbcdd4e37d6c2f",
+      "git_blob_sha1": "7ef2d090979fd9853adf17b7a99c8b94a1c5a6a7",
+      "size": 40728226,
+      "cache_name": "mobile_sam.pt",
+      "source": "mobilesam",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/ChaoningZhang/MobileSAM/blob/f706ad9c4eb7f219c00d9050e46328518ffb65d2/LICENSE",
+      "preprocessing_id": "mobilesam-rgb-longest1024-meanstd-pad-v1"
+    }
+  },
+  "notices": {
+    "yunet-LICENSE": {
+      "url": "https://raw.githubusercontent.com/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/LICENSE",
+      "sha256": "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958",
+      "size": 1085,
+      "cache_name": "yunet-LICENSE"
+    },
+    "aura-LICENSE.md": {
+      "url": "https://huggingface.co/fal/AuraFace-v1/resolve/af6d057c9b0ec4071d4c49c80e3539258798b609/LICENSE.md",
+      "sha256": "609e2cb599f84aaa41d8ef29d8fdb04d164fab22e8d9292ca34a599d0f56a338",
+      "size": 12624,
+      "cache_name": "aura-LICENSE.md"
+    },
+    "aura-README.md": {
+      "url": "https://huggingface.co/fal/AuraFace-v1/resolve/af6d057c9b0ec4071d4c49c80e3539258798b609/README.md",
+      "sha256": "106272348689716d3c159ff16ec42e5f36aafebca591b3678b375f8aa2d12cde",
+      "size": 3959,
+      "cache_name": "aura-README.md"
+    },
+    "osnet-model-card.md": {
+      "url": "https://huggingface.co/kaiyangzhou/osnet/resolve/a5c5cc037c24235cda3b21085b93ad77c9616224/README.md",
+      "sha256": "75ed396c0659298d3b37ec0e87d075c18a9f18c4664ae8bd15542fa182f15954",
+      "size": 2881,
+      "cache_name": "osnet-model-card.md"
+    }
+  },
+  "parity": {
+    "person_coordinate_pixels": 1.0,
+    "person_score_absolute": 0.01,
+    "recognition_cosine_delta": 0.0001,
+    "body_cosine_delta": 0.0001,
+    "body_fp16_cosine_delta": 0.001,
+    "scene_relative": 0.001,
+    "scene_absolute": 0.005
+  }
+}

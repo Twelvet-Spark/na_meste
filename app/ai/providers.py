@@ -117,5 +117,11 @@ def resolve_providers(device: str = "auto") -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def model_providers(providers: list[str]) -> list:
+    """Keep FP32 math truthful; CUDA's default TF32 can exceed model parity."""
+    return [(provider, {"use_tf32": 0}) if provider == "CUDAExecutionProvider" else provider
+            for provider in providers]
+
+
 def provider_label(providers: list[str]) -> str:
     return providers[0] if providers else "?"
