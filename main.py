@@ -1,8 +1,4 @@
 """Мониторинг камер Dahua (RTSP) и присутствия сотрудников (AI).
-from app.api.setup_transfer import router as setup_transfer_router
-from app.services.setup_transfer_service import SetupTransferService
-    app.state.setup_transfer = SetupTransferService(engine, embedding_model=settings.insightface_model)
-app.include_router(setup_transfer_router)
 
 Запуск:
     python main.py
@@ -31,6 +27,7 @@ from app.api.presence import router as presence_router
 from app.api.recordings import router as recordings_router
 from app.api.settings import router as settings_router
 from app.api.debug import router as debug_router
+from app.api.setup_transfer import router as setup_transfer_router
 from app.config import BASE_DIR, settings
 from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
@@ -45,6 +42,7 @@ from app.services.recording_service import RecordingManager
 from app.media.playback import PlaybackManager
 from app.services.settings_service import SettingsService
 from app.services.diagnostics_service import DiagnosticsService, SafeLogFilter
+from app.services.setup_transfer_service import SetupTransferService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +67,7 @@ async def lifespan(app: FastAPI):
     # Initialize persisted revisions before publishing any camera frames.
     init_db()
     app.state.settings_service = SettingsService(settings, engine)
+    app.state.setup_transfer = SetupTransferService(engine, embedding_model=settings.insightface_model)
     app.state.diagnostics = DiagnosticsService(app.state, engine, settings)
     app.state.manager = ReaderManager()
     app.state.recordings = None
@@ -208,6 +207,7 @@ app.include_router(attendance_router)
 app.include_router(recordings_router)
 app.include_router(settings_router)
 app.include_router(debug_router)
+app.include_router(setup_transfer_router)
 
 
 @app.get("/", include_in_schema=False)

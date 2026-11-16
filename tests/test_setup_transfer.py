@@ -326,6 +326,44 @@ def interrupted_multipart_closes_encrypted_spool():
     asyncio.run(scenario())
 
 
+@test
+def populated_sqlite_like_user_table_blocks_import():
+    with database() as db:
+        with db.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE sqliteXhistory (value INTEGER)")
+            connection.exec_driver_sql("INSERT INTO sqliteXhistory VALUES (1)")
+        assert not service(db).status()["destination_empty"]
+
+
+@test
+def application_entrypoint_registers_transfer_service_and_routes():
+    import os
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory() as directory:
+        env = {**os.environ, "DATABASE_URL": "sqlite:///" + str(Path(directory)/"app.db"),
+               "OPERATOR_SETTINGS_PATH": str(Path(directory)/"settings.json"),
+               "RECORDING_ROOT": str(Path(directory)/"recordings"), "AI_ENABLED": "false",
+               "TELEGRAM_ENABLED": "false", "PYTHONPATH": str(root) + os.pathsep + str(root/"tests")}
+        code = """
+import asyncio
+import main
+from operator_test_support import Client
+main.build_enroll_engine = lambda: None
+async def check():
+    async with main.lifespan(main.app):
+        status, _, data = await Client(main.app).arequest('GET', '/api/setup-transfer/status',
+                                                         headers={'host':'localhost'})
+        assert status == 200, (status, data)
+        assert data['destination_empty'] and not data['restart_required']
+asyncio.run(check())
+"""
+        result = subprocess.run([sys.executable, "-c", code],
+            cwd=os.environ.get("TRANSFER_TEST_ENTRYPOINT_CWD", str(root)), env=env,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 if __name__ == "__main__":
     failed = 0
     for fn in TESTS:

@@ -3,9 +3,7 @@ import base64
 import binascii
 import io
 import json
-import math
 import os
-import struct
 import warnings
 from datetime import datetime
 from typing import Annotated, Literal
@@ -16,6 +14,8 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from PIL import Image
 from app.ai.doorway import DoorwayCalibration
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+import numpy as np
+from app.ai.face_recognition import normalized_embedding
 
 from app.rtsp.dahua import normalize_host
 
@@ -23,7 +23,7 @@ MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_BODY_BYTES = MAX_FILE_BYTES + 16 * 1024
 HEADER = b"NMSETUP\x00\x01"
 OVERHEAD = 8 + 1 + 16 + 12 + 16
-ID = Annotated[int, Field(strict=True, ge=1, le=2**63-1)]
+ID = Annotated[int, Field(strict=True, ge=1, le=2**53-1)]
 Port = Annotated[int, Field(strict=True, ge=1, le=65535)]
 
 
@@ -133,8 +133,9 @@ class FaceRecord(DatedRecord):
         raw = decode_binary(value)
         if len(raw) != 2048:
             raise ValueError("invalid embedding")
-        vector = struct.unpack("<512f", raw)
-        if not all(math.isfinite(v) for v in vector) or sum(v*v for v in vector) < 1e-12:
+        with np.errstate(over="ignore", invalid="ignore"):
+            usable = normalized_embedding(np.frombuffer(raw, dtype="<f4"))
+        if usable is None:
             raise ValueError("invalid embedding")
         return value
 
@@ -235,10 +236,18 @@ def _unique_keys(pairs):
 def _bounded_json(payload: bytes):
     if len(payload) > MAX_FILE_BYTES - OVERHEAD:
         raise TransferError("TRANSFER_TOO_LARGE", 413)
-    # Scan nesting before the JSON decoder can recurse; ignore brackets in strings.
-    depth = 0
+    # Bound containers BEFORE json.loads builds Python objects. A byte limit alone
+    # permits millions of tiny dicts. This scanner only budgets; json.loads remains
+    # the syntax/UTF-8 authority, including escapes and duplicate keys.
+    limits = {"cameras": 10000, "archives": 10000, "calibrations": 10000,
+              "workplaces": 10000, "employees": 10000, "faces": 150000,
+              "assignments": 100000}
+    stack = []  # kind, item/member count, awaiting array item, maximum
     quoted = escaped = False
-    for char in payload:
+    start = 0
+    root_key = None
+    nodes = 0
+    for index, char in enumerate(payload):
         if quoted:
             if escaped:
                 escaped = False
@@ -246,14 +255,40 @@ def _bounded_json(payload: bytes):
                 escaped = True
             elif char == 34:
                 quoted = False
-        elif char == 34:
-            quoted = True
+                if len(stack) == 1 and stack[0][0] == 123:
+                    token = payload[start:index+1]
+                    root_key = token if len(token) <= 128 else None
+            continue
+        if char in (9, 10, 13, 32):
+            continue
+        if stack and stack[-1][0] == 91 and stack[-1][2] and char != 93:
+            stack[-1][1] += 1
+            stack[-1][2] = False
+            if stack[-1][1] > stack[-1][3]:
+                raise TransferError("TRANSFER_TOO_LARGE", 413)
+        if char == 34:
+            quoted, start = True, index
         elif char in (91, 123):
-            depth += 1
-            if depth > 16:
+            maximum = 150000
+            if char == 91 and len(stack) == 1 and root_key is not None:
+                maximum = limits.get(json.loads(root_key), maximum)
+            stack.append([char, 0, char == 91, maximum])
+            nodes += 1
+            if len(stack) > 16:
                 raise TransferError("TRANSFER_INVALID")
         elif char in (93, 125):
-            depth -= 1
+            if stack:
+                stack.pop()
+        elif char == 44:
+            nodes += 1
+            if stack and stack[-1][0] == 91:
+                stack[-1][2] = True
+        elif char == 58 and stack and stack[-1][0] == 123:
+            stack[-1][1] += 1
+            if stack[-1][1] > 32:
+                raise TransferError("TRANSFER_INVALID")
+        if nodes > 2_000_000:
+            raise TransferError("TRANSFER_TOO_LARGE", 413)
     return json.loads(payload, object_pairs_hook=_unique_keys,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
 

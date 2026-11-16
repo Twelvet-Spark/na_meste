@@ -130,7 +130,7 @@ def malformed_links_geometry_and_fields_are_rejected():
 
 @test
 def invalid_biometrics_cannot_enter_gallery():
-    for raw in (b"bad", struct.pack("<512f", *([0.] * 512)), struct.pack("<512f", float("nan"), *([0.] * 511))):
+    for raw in (b"bad", struct.pack("<512f", *([0.] * 512)), struct.pack("<512f", float("nan"), *([0.] * 511)), struct.pack("<512f", 1e20, *([0.] * 511))):
         data = document()
         data["faces"][0]["embedding"] = base64.b64encode(raw).decode()
         refused(lambda: parse(data))
@@ -153,6 +153,35 @@ def legacy_missing_samples_and_limits_are_not_silent_truncation():
     data = document()
     data["cameras"] *= 10001
     refused(lambda: parse(data))
+
+
+@test
+def ids_must_be_lossless_for_browser_links():
+    data = document()
+    unsafe = 9007199254740993
+    data["employees"][0]["id"] = unsafe
+    data["faces"][0]["employee_id"] = unsafe
+    data["assignments"][0]["employee_id"] = unsafe
+    refused(lambda: parse(data))
+    safe = 9007199254740991
+    data["employees"][0]["id"] = safe
+    data["faces"][0]["employee_id"] = safe
+    data["assignments"][0]["employee_id"] = safe
+    assert int(float(parse(data).employees[0].id)) == safe
+
+
+@test
+def excessive_json_records_are_rejected_without_materialization_spike():
+    import tracemalloc
+    # 200,001 empty records occupy <1 MiB on disk but >14 MiB as Python dicts.
+    payload = b'{"faces":[' + b'{},' * 200000 + b'{}]}'
+    tracemalloc.start()
+    try:
+        refused(lambda: transfer.validate_document(payload, expected_model="buffalo_l"))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024, f"unbounded decoder allocation: {peak}"
 
 
 if __name__ == "__main__":

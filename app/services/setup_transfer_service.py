@@ -55,8 +55,9 @@ def _schema(connection):
 
 
 def _empty(connection):
-    for name, (kind, _, _) in attendance_schema._catalog(connection).items():
-        if kind != "table" or name.startswith("sqlite_") or name in {"operator_schema", "attendance_runtime"}:
+    # Do not use _catalog's LIKE filter: '_' also matches non-system names.
+    for (name,) in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'"):
+        if name.startswith("sqlite_") or name in {"operator_schema", "attendance_runtime"}:
             continue
         quoted = connection.dialect.identifier_preparer.quote_identifier(name)
         if connection.exec_driver_sql(f"SELECT 1 FROM {quoted} LIMIT 1").first() is not None:
