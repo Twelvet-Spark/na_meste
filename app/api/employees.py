@@ -199,7 +199,10 @@ def api_update_employee(employee_id: int, payload: service.EmployeeUpdate, reque
 
 @router.delete("/{employee_id}", status_code=204, dependencies=[Depends(require_operator_request)])
 def api_delete_employee(employee_id: int, request: Request, db: Session = Depends(get_db)):
-    service.delete_employee(db, _employee_or_404(db, employee_id))
+    journal = getattr(request.app.state, "human_journal", None)
+    service.delete_employee(
+        db, _employee_or_404(db, employee_id),
+        has_pending=journal.has_employee_work if journal is not None else None)
     _refresh(request, db)
     return None
 

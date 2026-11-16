@@ -244,6 +244,17 @@ class DoorwayDetector:
         if packet.seq <= camera.last_seq:
             return events
         camera.last_seq = packet.seq
+        if outcome.face_unavailable:
+            # A failed shared face session is stronger than an ordinary NO_FACE
+            # observation after the line. Revoke retained proof before lifecycle
+            # handling can emit it, including pending tracks absent this frame.
+            # Keep the points/bracket/armed side: anonymous geometry still counts.
+            for track in camera.tracks.values():
+                track.faces.clear()
+                track.reasons.add("FACE_MODEL_UNAVAILABLE")
+                for pending in track.pending:
+                    pending.faces.clear()
+                    pending.reasons.add("FACE_MODEL_UNAVAILABLE")
         ambiguous_ids = {item.track_id for item in outcome.track_lifecycle if item.state == "AMBIGUOUS"}
         # Lifecycle includes unmatched tracks; process it before any pending admission.
         for lifecycle in outcome.track_lifecycle:
@@ -262,7 +273,7 @@ class DoorwayDetector:
                     if track.previous is not None:
                         possible = _intersection_fraction(track.previous, (x1 + x2) / 2,
                                                           y2, calibration) is not None
-                    if detection.fresh_face_evidence is not None:
+                    if not outcome.face_unavailable and detection.fresh_face_evidence is not None:
                         track.faces.append(detection.fresh_face_evidence)
                 events.extend(self._interrupt(track, "ASSOCIATION_UNCERTAIN", possible=possible))
             elif lifecycle.state == "LOST":
@@ -281,8 +292,10 @@ class DoorwayDetector:
             if ((track.previous is not None or track.pending)
                     and packet.received_mono - track.last_seen > settings.attendance_max_frame_gap):
                 events.extend(self._interrupt(track, "FRAME_GAP"))
+            if outcome.face_unavailable:
+                track.reasons.add("FACE_MODEL_UNAVAILABLE")
             track.last_seen = packet.received_mono
-            observation = detection.fresh_face_evidence
+            observation = None if outcome.face_unavailable else detection.fresh_face_evidence
             if observation is not None:
                 if track.gallery_revision is not None and track.gallery_revision != observation.store_revision:
                     track.reasons.add("GALLERY_CHANGED")

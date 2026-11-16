@@ -39,10 +39,16 @@ from app.ai.face_detector import FaceInfo
 from app.ai.face_recognition import EmbeddingStore
 from app.database.database import get_db, immediate_session
 from app.database.models import (
-    AttendanceCommission, AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata, HumanVisit,
+    AttendanceCommission, AttendanceRuntime, Camera, Employee, EmployeeFace,
+    FaceModelMetadata, HumanJournalGap, HumanVisit, HumanVisitEvent,
 )
 from operator_test_support import Client, multipart
 from test_operator_storage import database, dump, legacy, schema, STAMP
+from test_human_journal import (
+    Clock as JournalClock, GEN as JOURNAL_GENERATION, TransactionGate,
+    face as journal_face, idle as journal_idle, module as journal_module,
+    outcome as journal_outcome, packet as journal_packet, person as journal_person,
+)
 
 TESTS = []
 MAX_PHOTO = 15 * 1024 * 1024
@@ -960,6 +966,151 @@ def test_human_visit_reference_prevents_employee_deletion_without_touching_enrol
         client.json("DELETE", f"/api/employees/{original['id']}", status=409)
         assert dump(engine) == before
         assert detail(client, original["id"])["usable_faces_count"] == 1
+
+
+@contextmanager
+def journal_api():
+    with api() as (client, engine, _model, _store, _root):
+        employee = create(client)
+        with immediate_session(engine) as db:
+            db.add(Employee(id=employee["id"] + 1, name="Unreferenced employee"))
+            for camera_id in (12, 13):
+                db.add(Camera(id=camera_id, name=f"Journal {camera_id}", nvr_host="unused",
+                              username="", password="", channel=camera_id, enabled=True))
+        clock = JournalClock()
+        journal = journal_module.HumanJournal(
+            engine, now=clock.now, monotonic=clock.mono, lifecycle_capacity=3)
+        client.app.state.human_journal = journal
+        try:
+            journal_idle(journal)
+            yield client, engine, employee, clock, journal
+        finally:
+            # An expected RED deletion can leave an unretryable FK command.
+            # Stop that writer too, without masking the consumer assertion.
+            result = journal.close(timeout_seconds=1)
+            journal._thread.join(timeout=2)
+            assert not journal._thread.is_alive(), result
+
+
+def pending_employee_deletion(stage):
+    with journal_api() as (client, engine, employee, clock, journal):
+        gate = TransactionGate()
+        with patch.object(journal_module, "immediate_session", gate):
+            try:
+                if stage == "queued":
+                    journal.observe(13, journal_packet(clock, 1),
+                                    journal_outcome(journal_person()))
+                    assert gate.entered.wait(5), "writer did not reach transaction gate"
+                admission = journal.observe(
+                    12, journal_packet(clock, 1),
+                    journal_outcome(journal_person(
+                        employee=employee["id"],
+                        evidence=journal_face(clock, 1, employee["id"]))))[0]
+                if stage == "inflight":
+                    assert gate.entered.wait(5), "identification was not taken by writer"
+                clock.advance(.2)
+                journal.observe(12, journal_packet(clock, 2), journal_outcome(lifecycle=[
+                    SimpleNamespace(track_id=1, state="LOST", reason="TRACK_LOST")]))
+                if stage == "inflight":
+                    journal.observe(13, journal_packet(clock, 1),
+                                    journal_outcome(journal_person()))
+                # Fill the lifecycle FIFO and force its reserved recovery barrier.
+                # The current visit is already UNKNOWN: protection must include
+                # the frozen identification, not only current in-memory identity.
+                rejected = journal.observe(12, journal_packet(clock, 3),
+                                           journal_outcome(journal_person(track=2)))[0]
+                assert rejected.status == "REJECTED"
+                with Session(engine) as db:
+                    assert db.query(HumanVisit).count() == 0
+                client.json("DELETE", f"/api/employees/{employee['id'] + 1}", status=204)
+                client.json("DELETE", f"/api/employees/{employee['id']}", status=409)
+                assert detail(client, employee["id"])["name"] == employee["name"]
+            finally:
+                gate.release.set()
+        journal_idle(journal)
+        acknowledgements = journal.drain_acknowledgements()
+        assert any(ack.kind == "RESET_REQUIRED" and ack.camera_id == 12
+                   for ack in acknowledgements)
+        with Session(engine) as db:
+            visit = db.get(HumanVisit, admission.visit_id)
+            assert visit.employee_id is None and visit.status == "CLOSED"
+            assert visit.end_reason == "JOURNAL_GAP"
+            assert db.query(HumanVisit).filter_by(camera_id=13).count() == 1
+            identified = db.query(HumanVisitEvent).filter_by(
+                visit_id=visit.id, type="IDENTIFIED").all()
+            assert len(identified) == 1 and identified[0].payload["employee_id"] == employee["id"]
+            assert db.query(HumanJournalGap).filter_by(camera_id=12).count() == 1
+            assert db.get(Employee, employee["id"]).name == employee["name"]
+            assert db.get(Employee, employee["id"] + 1) is None
+        assert journal.health_snapshot()["state"] == "OK"
+
+
+@test
+def test_queued_identification_blocks_employee_deletion_after_live_identity_clear_and_drains():
+    pending_employee_deletion("queued")
+
+
+@test
+def test_inflight_identification_blocks_employee_deletion_after_live_identity_clear_and_drains():
+    pending_employee_deletion("inflight")
+
+
+def historical_employee_deletion(transition):
+    with journal_api() as (client, engine, employee, clock, journal):
+        admission = journal.observe(
+            12, journal_packet(clock, 1),
+            journal_outcome(journal_person(
+                employee=employee["id"],
+                evidence=journal_face(clock, 1, employee["id"]))))[0]
+        journal_idle(journal)
+        clock.advance(.2)
+        if transition == "conflict":
+            journal.observe(12, journal_packet(clock, 2),
+                            journal_outcome(journal_person(uncertain=True)))
+        else:
+            journal.observe(12, journal_packet(clock, 2), journal_outcome(lifecycle=[
+                SimpleNamespace(track_id=1, state="LOST", reason="TRACK_LOST")]))
+        journal_idle(journal)
+        if transition == "closed":
+            journal.reset_camera(12, JOURNAL_GENERATION, "SOURCE_CHANGED")
+            journal_idle(journal)
+            assert journal.close().drained
+            # Reopen the real writer: protection must not depend on a live binding.
+            restarted = journal_module.HumanJournal(engine, now=clock.now, monotonic=clock.mono)
+            try:
+                journal_idle(restarted)
+            finally:
+                assert restarted.close().drained
+        client.app.state.human_journal = None
+        with Session(engine) as db:
+            visit = db.get(HumanVisit, admission.visit_id)
+            assert visit.employee_id is None
+            assert visit.identity_state == ("CONFLICT" if transition == "conflict" else "UNKNOWN")
+            assert visit.status == {"closed": "CLOSED", "conflict": "ACTIVE", "lost": "PROVISIONAL"}[transition]
+            identified = db.query(HumanVisitEvent).filter_by(
+                visit_id=visit.id, type="IDENTIFIED").one()
+            assert identified.payload["employee_id"] == employee["id"]
+        before = dump(engine)
+        client.json("DELETE", f"/api/employees/{employee['id']}", status=409)
+        assert dump(engine) == before
+        current = detail(client, employee["id"])
+        assert current["name"] == employee["name"] and current["usable_faces_count"] == 1
+        client.json("DELETE", f"/api/employees/{employee['id'] + 1}", status=204)
+
+
+@test
+def test_lost_visit_identification_history_blocks_employee_deletion():
+    historical_employee_deletion("lost")
+
+
+@test
+def test_closed_visit_identification_history_blocks_employee_deletion_after_restart():
+    historical_employee_deletion("closed")
+
+
+@test
+def test_conflicted_visit_identification_history_blocks_employee_deletion():
+    historical_employee_deletion("conflict")
 
 
 if __name__ == "__main__":

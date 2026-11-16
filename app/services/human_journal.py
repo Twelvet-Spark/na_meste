@@ -904,6 +904,38 @@ class HumanJournal:
         with self._condition:
             return any(gen.camera_id == camera_id for gen in self._generations.values())
 
+    @staticmethod
+    def _command_references_employee(command, employee_id):
+        if command.values is not None and command.values.get('employee_id') == employee_id:
+            return True
+        if any(event['payload'].get('employee_id') == employee_id for event in command.events):
+            return True
+        if command.kind == 'LINK':
+            return command.payload.get('employee_id') == employee_id
+        if command.kind == 'BARRIER':
+            return any(values.get('employee_id') == employee_id
+                       or event['payload'].get('employee_id') == employee_id
+                       for values, event in command.payload[0])
+        return False
+
+    def has_employee_work(self, employee_id: int) -> bool:
+        """Called inside the deletion publication transaction, never around it.
+
+        Scan only bounded owned state. Frozen commands/events can retain an owner
+        after LOST/conflict has cleared the current visit. The in-flight command
+        remains visible through commit and _complete; afterward durable history
+        protects it. The writer never waits for the publication lock.
+        """
+        with self._condition:
+            if any(visit.values['employee_id'] == employee_id for visit in self._visits.values()):
+                return True
+            if (self._inflight is not None
+                    and self._command_references_employee(self._inflight, employee_id)):
+                return True
+            return any(self._command_references_employee(command, employee_id)
+                       for commands in (self._commands, self._updates.values(), self._barriers.values())
+                       for command in commands)
+
     def blocked_generations(self) -> tuple:
         with self._condition:
             return tuple((gen.camera_id, gen.generation, gen.gap_started_at)

@@ -382,7 +382,10 @@ class AIWorker(threading.Thread):
                 self._last_seq[camera_id] = packet.seq
                 self._last_received[camera_id] = packet.received_mono
                 self._last_received_at[camera_id] = packet.received_at
-                self.health.transition(f"inference:{camera_id}", [])
+                self.health.transition(
+                    f"inference:{camera_id}",
+                    ["FACE_MODEL_UNAVAILABLE"] if outcome.face_unavailable else [],
+                    at=packet.received_at, mono=packet.received_mono)
                 if config.calibration is not None:
                     self._persist(self.doorway.process(packet, camera_id, outcome, config.calibration))
                 self._observe_journal(camera_id, packet, outcome)

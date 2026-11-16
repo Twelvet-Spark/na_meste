@@ -116,7 +116,7 @@ class Trajectory:
 
     def send(self, y=None, *, seconds=None, x=.5, track=1, observation=AUTO_FACE,
              lifecycle=None, uncertain=False, stream="stream-a", generation="generation-a",
-             revision=None, seq=None, frame=FRAME, age=0., detections=None):
+             revision=None, seq=None, frame=FRAME, age=0., detections=None, face_unavailable=False):
         self.seq = self.seq + 1 if seq is None else seq
         self.seconds = self.seconds + .25 if seconds is None else seconds
         if observation is AUTO_FACE:
@@ -135,7 +135,8 @@ class Trajectory:
                              received_mono=MONO + self.seconds, frame=frame)
         outcome = FrameOutcome(detections=detections, tracking_generation=generation,
                                track_lifecycle=lifecycle,
-                               person_regions=[item.bbox for item in detections])
+                               person_regions=[item.bbox for item in detections],
+                               face_unavailable=face_unavailable)
         with patch("app.ai.doorway.time.monotonic", return_value=MONO + self.seconds + age):
             result = self.detector.process(packet, 1, outcome, self.calibration)
         self.events.extend(result)
@@ -360,6 +361,68 @@ def test_face_reason_codes_override_retained_raw_confirmed_identity():
             path.send(y, observation=face(index, (index - 1) * .25, reasons=(reason,)))
         crossing = single_crossing(path, eligible=False)
         assert reason in crossing.disqualifying_reasons
+
+
+def crossing_with_face_failure(failure_seq, *, unavailable=True):
+    path = Trajectory()
+    path.walk([.25, .3, .45])  # Three valid votes, fresh proof before the line.
+    for seq, y in ((4, .55), (5, .7)):
+        if seq < failure_seq:
+            path.send(y)
+            continue
+        reason = "FACE_MODEL_UNAVAILABLE" if unavailable else "NO_FACE"
+        rejected = replace(
+            face(seq, (seq - 1) * .25, employee=None, confirmed=None, reasons=(reason,)),
+            quality=FaceQuality(0., 0., None, False), face_bbox=None, aligned_jpeg=None,
+        )
+        detection = replace(person(y, observation=rejected), state="unknown",
+                            identity_reason_codes=(reason,))
+        path.send(detections=[detection], observation=None, face_unavailable=unavailable)
+    return path
+
+
+@test
+def test_face_session_failure_on_crossing_frame_cannot_reuse_preline_confirmation():
+    crossing = single_crossing(crossing_with_face_failure(4), eligible=False)
+    assert crossing.track_key == (1, "stream-a", "generation-a", 1)
+    assert crossing.direction == "ENTRY" and crossing.crossing_index == 1
+    assert abs(crossing.occurred_mono - 1000.625) < 1e-9
+    assert crossing.confirmed_employee_id is None
+    assert "FACE_MODEL_UNAVAILABLE" in crossing.disqualifying_reasons
+
+
+@test
+def test_face_session_failure_after_line_before_completion_revokes_retained_proof():
+    crossing = single_crossing(crossing_with_face_failure(5), eligible=False)
+    assert crossing.track_key == (1, "stream-a", "generation-a", 1)
+    assert crossing.direction == "ENTRY" and crossing.crossing_index == 1
+    assert abs(crossing.occurred_mono - 1000.625) < 1e-9
+    assert crossing.confirmed_employee_id is None
+    assert "FACE_MODEL_UNAVAILABLE" in crossing.disqualifying_reasons
+
+
+@test
+def test_face_session_failure_latches_pending_crossing_even_without_current_detection():
+    path = Trajectory()
+    path.walk([.25, .3, .45, .55, .7], observation=None)
+    assert path.events == []
+    path.send(observation=None, lifecycle=[], face_unavailable=True)
+    # Healthy late evidence is a new recognition run, not permission to credit
+    # the earlier crossing whose face session was unavailable during its window.
+    path.send(.75, observation=face(7, 1.5))
+    crossing = single_crossing(path, eligible=False)
+    assert crossing.track_key == (1, "stream-a", "generation-a", 1)
+    assert crossing.direction == "ENTRY" and crossing.crossing_index == 1
+    assert "FACE_MODEL_UNAVAILABLE" in crossing.disqualifying_reasons
+
+
+@test
+def test_ordinary_no_face_after_line_preserves_valid_preline_confirmation():
+    for first_no_face in (4, 5):
+        crossing = single_crossing(
+            crossing_with_face_failure(first_no_face, unavailable=False), eligible=True)
+        assert crossing.confirmed_employee_id == 1
+        assert abs(crossing.occurred_mono - 1000.625) < 1e-9
 
 
 @test

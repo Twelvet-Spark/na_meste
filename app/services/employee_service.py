@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image, UnidentifiedImageError
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -23,7 +23,7 @@ from app.database.database import immediate_session
 from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
     EmployeeFace, EmployeeWorkplace, GlobalPerson, OperatorRequest, PresenceSession,
-    WorkSession, Workplace, HumanVisit, FaceModelMetadata,
+    WorkSession, Workplace, HumanVisit, HumanVisitEvent, FaceModelMetadata,
 )
 from app.services.attendance_evidence import encode_evidence
 from app.services.workplace_service import WorkplaceOut, replace_assignments, validate_assignments
@@ -362,7 +362,7 @@ def update_employee(db: Session, employee: Employee, data: EmployeeUpdate) -> Em
         raise HTTPException(503, "База данных недоступна") from exc
 
 
-def delete_employee(db: Session, employee: Employee):
+def delete_employee(db: Session, employee: Employee, *, has_pending=None):
     employee_id, bind = employee.id, db.get_bind().engine
     db.rollback()
     try:
@@ -370,11 +370,20 @@ def delete_employee(db: Session, employee: Employee):
             current = writer.get(Employee, employee_id)
             if current is None:
                 raise HTTPException(404, "Сотрудник не найден")
+            # Admission uses this same publication fence. Inspect pending work
+            # after BEGIN IMMEDIATE so a completed writer cannot fall between
+            # this check and the durable-history query.
+            if has_pending is not None and has_pending(employee_id):
+                raise HTTPException(409, "У сотрудника есть история; отключите активность вместо удаления")
             history = (writer.query(PresenceSession.id).filter_by(employee_id=employee_id).first()
                        or writer.query(AttendanceEmployeeReference.event_id).filter_by(employee_id=employee_id).first()
                        or writer.query(WorkSession.entry_event_id).filter_by(employee_id=employee_id).first()
                        or writer.query(AttendanceEvent.id).filter_by(employee_id=employee_id).first()
                        or writer.query(HumanVisit.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(HumanVisitEvent.id).filter(
+                           HumanVisitEvent.type == "IDENTIFIED",
+                           func.json_extract(HumanVisitEvent.payload, "$.employee_id") == employee_id,
+                       ).first()
                        or writer.query(GlobalPerson.id).filter_by(employee_id=employee_id).first())
             if history:
                 raise HTTPException(409, "У сотрудника есть история; отключите активность вместо удаления")

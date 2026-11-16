@@ -94,6 +94,7 @@ class FrameOutcome:
     observed_tracks: list[DetectionResult] = field(default_factory=list)
     face_deferred: int = 0
     stage_times_ms: dict[str, float] = field(default_factory=dict)
+    face_unavailable: bool = False
 
 
 @dataclass
@@ -178,6 +179,8 @@ class RecognitionService:
         self._last_gallery_refresh = float("-inf")
         self._face_turn = 0
         self._face_camera_served: dict[int, int] = {}
+        self._face_detection_failed = False
+        self._face_recognition_failed = False
         self._lock = threading.Lock()
 
     def set_expected_gallery_revision(self, revision: int) -> None:
@@ -260,6 +263,7 @@ class RecognitionService:
             tracking_ms = face_detection_ms = 0.
             face_work: list[_FaceWork] = []
             admission_revision = self._store_revision
+            face_failed = False
             for current, persons in zip(admitted, batches):
                 item, outcome = current.input, current.outcome
                 camera_id, packet = item.camera_id, item.packet
@@ -296,6 +300,8 @@ class RecognitionService:
                         self._face_runs.pop((camera_id, track.track_id), None)
                         current.reasons[track.track_id] = (unavailable,)
                         continue
+                    if face_failed:
+                        continue
                     if track.hits < self.min_hits:
                         continue
                     run = self._face_runs.setdefault(
@@ -306,13 +312,25 @@ class RecognitionService:
                                 else self.retry_interval)
                     if packet.received_mono - run.last_attempt >= interval:
                         face_detection_started = time.perf_counter()
-                        face_work.append(self._detect_face(
-                            item, outcome.tracking_generation, track, heads, admission_revision,
-                        ))
-                        face_detection_ms += (time.perf_counter() - face_detection_started) * 1000.
+                        try:
+                            face_work.append(self._detect_face(
+                                item, outcome.tracking_generation, track, heads, admission_revision,
+                            ))
+                        except Exception:
+                            self._face_detection_failed = face_failed = True
+                            logger.warning("FACE_MODEL_UNAVAILABLE: face detection failed", exc_info=True)
+                        else:
+                            self._face_detection_failed = False
+                        finally:
+                            face_detection_ms += (time.perf_counter() - face_detection_started) * 1000.
 
             face_recognition_started = time.perf_counter()
             by_camera = {current.input.camera_id: current for current in frames}
+            if face_failed:
+                # A shared session failed after potentially selecting other
+                # cameras' faces. Finish tracking every frame, but publish none
+                # of the partial identity work from this batch.
+                face_work.clear()
             eligible: list[_FaceWork] = []
             for work in face_work:
                 if work.reasons:
@@ -339,16 +357,26 @@ class RecognitionService:
                         if evidence is not None:
                             by_camera[work.input.camera_id].evidence[work.track_id] = evidence
                 else:
-                    embeddings = np.asarray(self.faces.embed_aligned([work.aligned for work in selected]))
-                    if embeddings.shape != (len(selected), 512):
-                        raise ModelBundleError("MODEL_CONTRACT_INVALID", "face_recognition",
-                                               "Embedding batch shape")
-                    for work, embedding in zip(selected, embeddings):
-                        evidence = self._apply_face(work, embedding)
-                        if evidence is not None:
-                            by_camera[work.input.camera_id].evidence[work.track_id] = evidence
+                    try:
+                        embeddings = np.asarray(self.faces.embed_aligned([work.aligned for work in selected]))
+                        if embeddings.shape != (len(selected), 512):
+                            raise ModelBundleError("MODEL_CONTRACT_INVALID", "face_recognition",
+                                                   "Embedding batch shape")
+                    except Exception:
+                        self._face_recognition_failed = face_failed = True
+                        logger.warning("FACE_MODEL_UNAVAILABLE: face recognition failed", exc_info=True)
+                    else:
+                        self._face_recognition_failed = False
+                        for work, embedding in zip(selected, embeddings):
+                            evidence = self._apply_face(work, embedding)
+                            if evidence is not None:
+                                by_camera[work.input.camera_id].evidence[work.track_id] = evidence
             face_recognition_ms = (time.perf_counter() - face_recognition_started) * 1000.
             self._invalidate_gallery()
+            face_unavailable = self._face_detection_failed or self._face_recognition_failed
+            if face_failed or face_unavailable:
+                for current in frames:
+                    self._clear_unavailable_faces(current, attempted=face_failed)
             for current in frames:
                 item, outcome = current.input, current.outcome
                 height, width = item.packet.frame.shape[:2]
@@ -381,11 +409,51 @@ class RecognitionService:
                         outcome.observed_tracks.append(result)
                     if track.hits >= self.min_hits:
                         outcome.detections.append(result)
+                outcome.face_unavailable = (
+                    face_unavailable or self._identity_unavailable() == "FACE_MODEL_UNAVAILABLE"
+                    or any("FACE_MODEL_UNAVAILABLE" in result.identity_reason_codes
+                           for result in outcome.observed_tracks or outcome.detections)
+                )
             # Reconcile all cameras against one final gallery publication, not
             # separate revisions observed while returning individual outcomes.
             self._invalidate_gallery()
             return [self._finalize_outcome(current.input.camera_id, current.outcome)
                     for current in frames]
+
+    def _clear_unavailable_faces(self, current: _FrameWork, *, attempted: bool) -> None:
+        """Invalidate shared-session evidence without resetting real observations.
+
+        A failure charges the existing retry cadence to the affected batch,
+        including cached ordinary confirmations. Frames before the next due
+        attempt retain unavailability without pushing that deadline forward.
+        """
+        current.evidence.clear()
+        reasons = ("FACE_MODEL_UNAVAILABLE",)
+        item, packet = current.input, current.input.packet
+        for track in current.tracks:
+            run = self._face_runs.setdefault(
+                (item.camera_id, track.track_id), _FaceRun(attendance=item.attendance),
+            )
+            self._clear_run(track, run)
+            run.reason_codes = reasons
+            current.reasons[track.track_id] = reasons
+            if not current.observed:
+                continue
+            if attempted:
+                run.last_attempt = track.last_recog_attempt = packet.received_mono
+            # This is explicit unavailable evidence, not a face observation or a
+            # negative gallery match. Doorway must not reuse pre-failure votes.
+            current.evidence[track.track_id] = FaceEvidence(
+                frame_seq=packet.seq, received_at=packet.received_at,
+                received_mono=packet.received_mono, candidate_employee_id=None,
+                candidate_employee_name=None, score=0., runner_up_employee_id=None,
+                runner_up_employee_name=None, runner_up_score=0., margin=0.,
+                quality=FaceQuality(0., 0., None, False), store_revision=self._store_revision,
+                confirmed_employee_id=None, confirmed_employee_name=None,
+                supporting_frame_sequences=(), supporting_received_monos=(),
+                supporting_received_ats=(), confirmed_at_mono=None,
+                face_bbox=None, aligned_jpeg=None, reason_codes=reasons,
+            )
 
     def reset_camera(self, camera_id: int) -> str:
         """Every worker-owned reset, including same-stream resets, changes UUID."""
