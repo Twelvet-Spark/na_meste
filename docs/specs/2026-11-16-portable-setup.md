@@ -45,6 +45,8 @@ Calls proposed by the assistant:
 - Strict typed fields, reject extra keys, duplicate JSON keys, nonfinite numbers, malformed base64, duplicate/out-of-range IDs, dangling foreign keys and invalid camera/archive/calibration fields. Reject unsupported format/schema/model identifiers rather than guessing. Model-pack name matching is not a guarantee for locally replaced model weights; require the same unmodified model pack on both PCs in documentation.
 - Embeddings: exactly 2048 bytes, finite nonzero float32 vector, preserved without rerunning inference; thumbnails null or bounded JPEG/PNG (<=1 MiB and <=1 million pixels), header verification plus decode, never fetched from external paths. Preserve source values unless field representation explicitly requires conversion; invalid stored source data must fail export with a safe error rather than produce an unusable file.
 - Limit to 10,000 cameras, 10,000 workplaces, 10,000 employees, 150,000 face rows, 100,000 assignments, nesting depth 16; enforce file/document limits before unbounded materialization and counts before ORM writes. Current 1–15 enrollment limits do not retroactively destroy legacy data.
+- IDs are positive integers no greater than 9,007,199,254,740,991, so browser links remain lossless. Embeddings must also pass the existing gallery normalizer without float32 overflow.
+- Before JSON decoding, enforce each collection limit, depth 16, at most 32 members per object and a 2,000,000-container/delimiter budget; do not first materialize an oversized object graph.
 - Generic wrong-password/damaged-file error; distinguish unsupported format and deployment/model incompatibility using safe codes only. No exception text or Pydantic input echoes.
 
 ## Transaction and runtime behavior
