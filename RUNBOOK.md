@@ -178,3 +178,11 @@ Use the same application/dependency version (`cryptography>=46` is retained) and
 Included: camera credentials/live/archive setup, disabled attendance calibration geometry, workplaces/assignments, employee records and saved face thumbnails/embeddings. Legacy incomplete records remain repairable.
 
 Excluded: video, recording metadata/cache, attendance/observation history and evidence, app/operator settings, `.env`/Telegram, topology, models, Cloudflare/WARP/VPN and routing. Reconfigure network access separately. **This is setup migration, not a full backup.**
+
+## 10. Private offline evaluation
+
+Use `tools/evaluate_cctv.py`, not the server entry point, for local clip evaluation. Its manifest lists local clip/annotation/enrollment paths; it must not contain camera credentials or recorder URLs. Relative paths resolve against the manifest. Keep clips, anonymous labels, thumbnails and reports under ignored `data/evaluation/`, never in Git.
+
+The runner establishes `NA_MESTE_EVALUATION_ROOT` before importing application modules. This internal bootstrap requires an existing absolute temporary directory and bypasses deployment JSON, `.env`, ambient application settings and secret sources. SQLite/media/topology are redirected there and Telegram is disabled. Do not set this variable for the production server.
+
+Decode throughput, analyzed throughput and preview throughput are different measurements. Replicated copies of one view measure load, not multi-store accuracy. Without operator-confirmed enrollment-to-video labels, employee recognition is `NOT_EVALUATED`. Record the actual GPU; an RTX 4070 result cannot certify an RTX 5060 Ti.

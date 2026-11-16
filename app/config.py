@@ -131,6 +131,32 @@ class Settings(BaseSettings):
 
 
 def load_settings(*, path=None, env_file=BASE_DIR / ".env"):
+    evaluation_root = os.environ.get("NA_MESTE_EVALUATION_ROOT")
+    if evaluation_root is not None:
+        # Explicit CLI bootstrap: never read deployment JSON, dotenv, secrets or
+        # ambient application settings when replaying private local evidence.
+        root = Path(evaluation_root)
+        if not root.is_absolute() or not root.is_dir():
+            raise OverrideError("EVALUATION_ROOT_INVALID")
+        root = root.resolve()
+
+        class EvaluationSettings(Settings):
+            @classmethod
+            def settings_customise_sources(cls, settings_cls, init_settings, env_settings,
+                                           dotenv_settings, file_secret_settings):
+                return (init_settings,)
+
+        try:
+            return EvaluationSettings(
+                _env_file=None,
+                database_url=f"sqlite:///{(root / 'evaluation.db').as_posix()}",
+                recording_root=root / "media",
+                topology_config=str(root / "topology.json"),
+                ai_device=os.environ.get("NA_MESTE_EVALUATION_DEVICE", "cpu"),
+                telegram_enabled=False,
+            )
+        except Exception:
+            raise OverrideError("EVALUATION_SETTINGS_INVALID") from None
     values, _version = read_document(settings_path() if path is None else path, Settings)
     try:
         return Settings(_env_file=env_file, **values)
