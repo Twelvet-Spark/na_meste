@@ -34,13 +34,15 @@
     TRANSFER_RESTART_FOR_GALLERY: 'Данные сохранены, но галерея не обновилась. Требуется обычный перезапуск.',
   };
   const labels = { cameras: 'Камеры', workplaces: 'Рабочие места', employees: 'Сотрудники', faces: 'Образцы лиц', assignments: 'Назначения рабочих мест' };
-  let preview = null, requestId = null, busy = false;
+  let preview = null, requestId = null, busy = false, attempted = false;
   const urls = new Set();
   const explain = (error) => errors[error.detail] || 'Соединение прервано или ответ не получен. Если импорт уже был отправлен, повторите его без смены файла и пароля: повтор не создаст дубликаты.';
   const passwordValid = (value) => { const size = new TextEncoder().encode(value).length; return size >= 12 && size <= 1024; };
 
   function invalidate() {
     preview = null; requestId = null;
+    attempted = false;
+    $('transfer-preview-button').disabled = false;
     $('transfer-preview').hidden = true;
     $('transfer-counts').replaceChildren();
     $('transfer-warnings').replaceChildren();
@@ -84,7 +86,11 @@
     busy = true; setBusy(root, true); message(output, 'Выполняется перенос…');
     try { await action(); }
     catch (error) { message(output, explain(error), 'error'); }
-    finally { setBusy(root, false); busy = false; }
+    finally {
+      setBusy(root, false); busy = false;
+      $('transfer-preview-button').disabled = attempted;
+      $('transfer-import-button').disabled = !preview?.destination_empty;
+    }
   }
   exportForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -114,7 +120,7 @@
   });
   importForm.addEventListener('submit', (event) => {
     event.preventDefault();
-    if (!importForm.reportValidity()) return;
+    if (attempted || busy || !importForm.reportValidity()) return;
     operation(async () => {
       invalidate();
       const result = await api('/api/setup-transfer/preview', { method: 'POST', body: formData() });
@@ -122,13 +128,13 @@
       list($('transfer-counts'), Object.entries(labels).map(([key, label]) => `${label}: ${result.counts[key]}`));
       list($('transfer-warnings'), result.warnings.map((code) => warnings[code]).filter(Boolean));
       $('transfer-preview').hidden = false;
-      // setBusy restores its original disabled state; apply readiness after it completes.
       message(output, result.destination_empty ? 'Проверка завершена. Сверьте состав и подтвердите импорт.' : errors.TRANSFER_DESTINATION_NOT_EMPTY, result.destination_empty ? '' : 'error');
-    }).then(() => { $('transfer-import-button').disabled = !preview?.destination_empty; });
+    });
   });
   $('transfer-import-button').addEventListener('click', () => {
     if (!preview || !requestId || !preview.destination_empty) return;
     operation(async () => {
+      attempted = true;
       const result = await api('/api/setup-transfer/import', { method: 'POST', body: formData(true) });
       if (result.committed !== true) throw {};
       clear();
