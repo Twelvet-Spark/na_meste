@@ -13,9 +13,13 @@ cryptography>=46
 # AI
 onnx>=1.16
 insightface>=2.0
-# ВАЖНО: insightface тянет CPU-сборку onnxruntime и затирает GPU-версию.
-# После установки выполните один раз:
-#   pip uninstall -y onnxruntime
-#   pip install --no-deps --force-reinstall onnxruntime-gpu
+# CPU- и GPU-дистрибутивы ORT предоставляют один модуль; не оставляйте оба.
+# Если зависимости InsightFace установили CPU-пакет, для NVIDIA выполните:
+#   python -m pip uninstall -y onnxruntime
+#   python -m pip install --no-deps --force-reinstall onnxruntime-gpu
 onnxruntime-gpu>=1.19
-# (для работы только на CPU замените onnxruntime-gpu на onnxruntime)
+# CUDA/cuDNN должны соответствовать конкретной сборке ORT, не только её версии.
+# Официальная таблица: https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements
+# Runtime-зависимости выбранной версии/источника: python -m pip install "onnxruntime-gpu[cuda,cudnn]"
+# CUDA 12/13 и разные major cuDNN не взаимозаменяемы; драйвер NVIDIA ставится отдельно.
+# Для CPU удалите оба ORT-дистрибутива и установите только onnxruntime (AI_DEVICE=cpu).
