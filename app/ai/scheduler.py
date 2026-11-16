@@ -46,8 +46,3 @@ class DeadlineScheduler:
         earliest = min(deadlines, default=None)
         return maximum if earliest is None else min(maximum, max(0., earliest - now))
 
-    def has_slack(self, now: float, minimum: float, *, camera_ids=None) -> bool:
-        deadlines = self.deadlines.values() if camera_ids is None else (
-            self.deadlines[camera_id] for camera_id in camera_ids if camera_id in self.deadlines)
-        earliest = min(deadlines, default=None)
-        return earliest is not None and earliest - now > minimum

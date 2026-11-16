@@ -191,6 +191,7 @@ class AIWorker(threading.Thread):
         self.metrics = InferenceMetrics()
         self._appearance_retry_at = 0.
         self._appearance_cursor = -1
+        self._appearance_seconds_per_crop = None
         self.model_ids = {}
         self._runnable_ids = set()
 
@@ -536,6 +537,15 @@ class AIWorker(threading.Thread):
                 and self._is_current(work.camera_id, work, work.config, reader, work.epoch,
                                      work.gallery_revision, configurations))
 
+    def _appearance_limit(self, now, active):
+        # Probe one crop before estimating a chunk. Native calls are not
+        # preemptible; reserve time for the next live deadline, not merely 20ms.
+        estimate = (self._appearance_seconds_per_crop or .02) * 1.25
+        reserve = max(.005, settings.ai_batch_wait_ms / 1000.)
+        slack = self.scheduler.delay(now, 16 * estimate + reserve, camera_ids=active) - reserve
+        limit = min(16, max(0, int(slack / estimate)))
+        return min(limit, 1) if self._appearance_seconds_per_crop is None else limit
+
     def _process_appearance(self):
         now = time.monotonic()
         if (not self._appearance_pending or now < self._appearance_retry_at
@@ -543,8 +553,8 @@ class AIWorker(threading.Thread):
             return
         active = {camera_id for camera_id, receipt in self._last_received.items()
                   if now - receipt <= settings.attendance_max_frame_gap}
-        if not self.scheduler.has_slack(now, max(.02, settings.ai_batch_wait_ms / 1000.),
-                                        camera_ids=active):
+        limit = self._appearance_limit(now, active)
+        if not limit:
             for camera_id in {work.camera_id for work in self._appearance_pending.values()}:
                 self.metrics.defer_reid(camera_id)
             return
@@ -553,7 +563,7 @@ class AIWorker(threading.Thread):
         try:
             with publication_guard(self.attendance.engine):
                 configurations = self._read_configurations()
-                while self._appearance_pending and len(batch) < 16:
+                while self._appearance_pending and len(batch) < limit:
                     cameras = sorted({work.camera_id for work in self._appearance_pending.values()})
                     camera_id = next((key for key in cameras if key > self._appearance_cursor), cameras[0])
                     self._appearance_cursor = camera_id
@@ -562,9 +572,21 @@ class AIWorker(threading.Thread):
                     work = self._appearance_pending.pop(visit_id)
                     if self._appearance_current(work, configurations):
                         batch.append(work)
+            # Metadata reads can consume the previously available slack.
+            limit = self._appearance_limit(time.monotonic(), active)
+            for work in reversed(batch[limit:]):
+                self._appearance_pending[work.visit_id] = work
+                self._appearance_pending.move_to_end(work.visit_id, last=False)
+                self.metrics.defer_reid(work.camera_id)
+            del batch[limit:]
             if not batch:
                 return
+            native_started = time.monotonic()
             vectors = self.reid.embed([work.crop for work in batch])
+            sample = (time.monotonic() - native_started) / len(batch)
+            previous = self._appearance_seconds_per_crop or .02
+            # React immediately to slower work; lower estimates gradually.
+            self._appearance_seconds_per_crop = max(.002, sample, .8 * previous + .2 * sample)
             if len(vectors) != len(batch):
                 raise ValueError("Appearance batch omitted an observation")
             # Never hold the publication guard during a model call.

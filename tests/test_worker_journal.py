@@ -329,10 +329,76 @@ def test_crowded_camera_cannot_starve_another_camera_at_crop_capacity():
             # At most one more bounded chunk before the quiet camera's first
             # acknowledgement; not 140 crowded-camera embeddings first.
             worker.step()
+            idle(journal)
             with Session(engine) as db:
                 quiet = db.query(HumanVisit).filter_by(camera_id=4).one()
                 assert quiet.global_id is not None
             assert sum(body.calls) <= 32
+
+
+def test_costed_optional_body_chunk_finishes_before_the_next_live_deadline():
+    class CostedBody(Body):
+        def embed(self, crops):
+            due = min(worker.scheduler.deadlines[key] for key in worker._last_received)
+            result = super().embed(crops)
+            clock.advance(.02 * len(crops))
+            finished.append((clock.mono, due))
+            return result
+    body, finished = CostedBody(), []
+    with fixture(body=body) as (_engine, _attendance, clock, worker, manager, detector, _journal):
+        for camera_id in range(4, 21):
+            add_camera(_engine, manager, camera_id)
+        def crowded(frames):
+            return [[(np.array([10.+40*i, 10., 40.+40*i, 100.]), .99) for i in range(8)]
+                    for _ in frames]
+        with patch.object(detector, 'detect_batch', side_effect=crowded):
+            for camera_id in range(1, 21):
+                publish(manager, clock, camera_id)
+            for _ in range(8):
+                worker.step()
+        assert finished and all(end <= due + 1e-9 for end, due in finished), finished
+        assert len(worker._appearance_pending) <= 128
+
+
+def test_observed_expensive_body_work_is_deferred_without_losing_the_pending_crop():
+    class CostedBody(Body):
+        def embed(self, crops):
+            result = super().embed(crops)
+            clock.advance(.12 * len(crops))
+            return result
+    body = CostedBody()
+    with fixture(body=body) as (_engine, _attendance, clock, worker, manager, detector, _journal):
+        def crowded(frames):
+            return [[(np.array([10.+40*i, 10., 40.+40*i, 100.]), .99) for i in range(8)]
+                    for _ in frames]
+        with patch.object(detector, 'detect_batch', side_effect=crowded):
+            publish(manager, clock, 3)
+            worker.step()
+            assert clock.mono <= worker.scheduler.deadlines[3]
+            assert body.calls == [1]
+            worker.step()
+            assert body.calls == [1] and worker._appearance_pending
+
+
+def test_metadata_stall_rechecks_budget_and_keeps_unattempted_body_crops():
+    body = Body()
+    with fixture(body=body) as (_engine, _attendance, clock, worker, manager, detector, _journal):
+        def crowded(frames):
+            return [[(np.array([10.+40*i, 10., 40.+40*i, 100.]), .99) for i in range(8)]
+                    for _ in frames]
+        with patch.object(detector, 'detect_batch', side_effect=crowded):
+            publish(manager, clock, 3)
+            worker.step()
+        pending = set(worker._appearance_pending)
+        before = list(body.calls)
+        read = worker._read_configurations
+        def delayed_read():
+            result = read()
+            clock.advance(.2)
+            return result
+        with patch.object(worker, '_read_configurations', side_effect=delayed_read):
+            worker._process_appearance()
+        assert body.calls == before and pending and set(worker._appearance_pending) == pending
 
 
 if __name__ == '__main__':
