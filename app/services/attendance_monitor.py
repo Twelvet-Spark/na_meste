@@ -68,11 +68,12 @@ class AttendanceWriteQueue:
 
 class AttendanceMonitor(threading.Thread):
     def __init__(self, service, *, write_queue=None, manager=None, worker=None,
-                 now=utcnow, monotonic=time.monotonic):
+                 now=utcnow, monotonic=time.monotonic, journal=None):
         super().__init__(name="attendance-monitor", daemon=True)
         self.service, self.health = service, service.health
         self.write_queue = write_queue
         self.manager, self.worker = manager, worker
+        self.journal = journal
         self._now, self._mono = now, monotonic
         self._stop_event = threading.Event()
         self._tick_lock = threading.Lock()
@@ -119,6 +120,8 @@ class AttendanceMonitor(threading.Thread):
     def tick(self, *, stopped=False):
         with self._tick_lock:
             now, mono = self._now(), self._mono()
+            if self.journal is not None:
+                self.journal.tick(now)
             try:
                 if self.manager is not None and not self._started_runtime:
                     self.startup()

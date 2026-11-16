@@ -23,6 +23,7 @@
     ['ai', 'live_face_margin', 'Отрыв от другого кандидата в обычном потоке'],
     ['ai', 'live_face_window', 'Окно подтверждения обычного потока, с'],
     ['ai', 'live_face_recheck_interval', 'Интервал перепроверки подтверждённого лица, с'],
+    ['ai', 'journal_image_keep_days', 'Хранение изображений журнала людей, дней'],
     ['attendance', 'attendance_ai_fps', 'Целевая частота учёта, кадров/с'],
     ['attendance', 'attendance_frame_max_age', 'Максимальный возраст кадра, с'],
     ['attendance', 'attendance_max_frame_gap', 'Максимальный разрыв кадров, с'],
@@ -287,6 +288,41 @@
     } catch (error) { message($('workplace-dialog-status'), errorText(error), 'error'); }
     finally { workplaceBusy = false; setBusy($('workplace-form'), false); }
   });
+  let runtimeBusy = false;
+  async function refreshRuntime() {
+    if (runtimeBusy) return;
+    runtimeBusy = true; $('runtime-refresh').disabled = true;
+    try {
+      const view = await api('/api/debug/status');
+      const model = view.models || {}, migration = model.gallery_migration || {}, journal = view.journal || {};
+      const show = (value) => value == null ? 'нет данных' : String(value);
+      const facts = [
+        ['Файлы моделей', Object.entries(model.component_status || {}).map(([key, state]) => `${key}: ${state}`).join('; ') || 'нет данных'],
+        ['Галерея лиц', model.gallery_current ? 'Актуальна' : 'Недоступна / устарела — лица не сопоставляются'],
+        ['Миграция образцов', `Пересчитано: ${show(migration.faces_reencoded)}; нужны новые фото: ${show(migration.faces_need_reenrollment)}`],
+        ['Журнал людей', journal.state === 'OK' ? 'Сохранение работает' : journal.state === 'JOURNAL_DEGRADED' ? 'Есть разрыв сохранения — полнота не гарантирована' : 'Состояние недоступно'],
+        ['Подсказки сцены', view.scene?.model_available ? 'Модель на CPU; контуры требуют проверки' : 'Модель недоступна; ручная разметка доступна'],
+      ];
+      $('runtime-facts').replaceChildren();
+      for (const [label, value] of facts) {
+        const dt = document.createElement('dt'), dd = document.createElement('dd');
+        dt.textContent = label; dd.textContent = value; $('runtime-facts').append(dt, dd);
+      }
+      $('runtime-cameras').replaceChildren();
+      for (const camera of view.cameras || []) {
+        const li = document.createElement('li'), metric = camera.inference;
+        li.textContent = `№${camera.id}: соединение ${camera.status}; ` + (metric
+          ? `обработка ${metric.processed_fps_10s?.toFixed(1) ?? '—'} / ${metric.target_fps} кадров/с, p95 ${metric.completion_age_p95_seconds?.toFixed(3) ?? '—'} с. ${metric.reason_codes.join(', ')}`
+          : 'анализ не выполняется / нет данных.');
+        $('runtime-cameras').append(li);
+      }
+      $('runtime-status').textContent = `Состояние на ${new Date(view.updated_at).toLocaleString('ru-RU')}. Обновляется кнопкой, не меняет черновик.`;
+    } catch (_) {
+      $('runtime-status').textContent = 'Состояние AI не обновлено. Показанные ранее данные устарели; настройки доступны независимо.';
+    } finally { runtimeBusy = false; $('runtime-refresh').disabled = false; }
+  }
+  $('runtime-refresh').addEventListener('click', refreshRuntime);
+  refreshRuntime();
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   setInterval(() => { if (!document.hidden) refresh(); }, 5000);
   refresh(); workplaces();

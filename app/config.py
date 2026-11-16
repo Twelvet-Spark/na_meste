@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     tracker_new_track_threshold: float = 0.5  # score детекции, создающей НОВЫЙ трек
                                               # (ниже — детекция только продлевает существующий)
     track_lost_timeout: float = 3.0         # сек grace period трека (re-identification)
+    journal_image_keep_days: int = Field(default=30, ge=1, le=365)
     min_recognition_confidence: float = Field(
         default=0.60, ge=0, le=1, allow_inf_nan=False,
         validation_alias=AliasChoices("MIN_RECOGNITION_CONFIDENCE", "FACE_RECOGNITION_THRESHOLD"),

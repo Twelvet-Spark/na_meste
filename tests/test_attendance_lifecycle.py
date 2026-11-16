@@ -962,25 +962,32 @@ def test_pending_crossing_is_saved_before_optional_global_processing_even_when_i
             step(worker, manager, observations, clock, y)
         observed_commits = []
 
-        class OptionalGlobal:
-            def drop_camera(self, camera_id):
-                return None
-
-            def process(self, *args):
-                # An external embedding failure must occur AFTER old crossing
-                # state was durably flushed by continuity reconciliation.
+        class OptionalBody:
+            def embed(self, crops):
+                # External embedding fails only after the pending crossing has
+                # been durably flushed by continuity reconciliation.
                 with Session(engine) as db:
                     observed_commits.append(db.query(AttendanceEvent).count())
                 raise RuntimeError("Optional model failure")
 
-        worker.global_manager = OptionalGlobal()
-        clock.advance(2.1)
-        with expected_error_logs("app.ai.worker", "Optional model failure"):
-            step(worker, manager, observations, clock, .8)
-        with Session(engine) as db:
-            assert db.query(AttendanceEvent).one().status == "REVIEW"
-        assert worker.state.camera(1) is not None
-        assert observed_commits == [1]
+        from app.ai.global_tracker import GlobalIdentityManager
+        from app.services.human_journal import HumanJournal
+        from test_human_journal import idle
+        journal = HumanJournal(engine, now=clock.utcnow, monotonic=clock.monotonic)
+        idle(journal)
+        worker.journal, worker.reid = journal, OptionalBody()
+        worker.global_manager = GlobalIdentityManager()
+        try:
+            clock.advance(2.1)
+            with expected_error_logs("app.ai.worker", "Optional model failure"):
+                step(worker, manager, observations, clock, .8)
+            with Session(engine) as db:
+                assert db.query(AttendanceEvent).one().status == "REVIEW"
+            assert worker.state.camera(1) is not None
+            assert observed_commits == [1]
+        finally:
+            worker.flush("SHUTDOWN")
+            assert journal.close().drained
 
 
 @test

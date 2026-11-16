@@ -1,4 +1,6 @@
 // Архив глобальных наблюдений: только чтение, отдельно от рабочих часов.
+(() => {
+  'use strict';
 
 const $ = (id) => document.getElementById(id);
 
@@ -11,6 +13,9 @@ function fmtDateTime(iso) {
 
 const state = { search: '', status: '', camera: '' };
 let searchTimer = null;
+let active = false;
+let camerasLoaded = false;
+let loadSequence = 0;
 
 async function loadCameras() {
   try {
@@ -36,15 +41,22 @@ function apiUrl() {
 }
 
 async function load() {
+  if (!active || document.hidden) return;
+  const sequence = ++loadSequence;
   let persons;
   try {
     const res = await fetch(apiUrl());
     if (!res.ok) throw new Error();
     persons = await res.json();
   } catch (e) {
-    $('summary').textContent = 'Ошибка загрузки';
+    if (active && sequence === loadSequence) {
+      $('summary').textContent = 'Ошибка загрузки архива';
+      OperatorUI.message($('archive-status'), 'Не удалось загрузить архив. Фильтры сохранены; повторим загрузку через несколько секунд.', 'error');
+    }
     return;
   }
+  if (!active || sequence !== loadSequence) return;
+  OperatorUI.message($('archive-status'), '');
 
   const tbody = $('persons-table').querySelector('tbody');
   tbody.innerHTML = '';
@@ -119,6 +131,11 @@ $('f-search').addEventListener('input', (e) => {
 $('f-status').addEventListener('change', (e) => { state.status = e.target.value; load(); });
 $('f-camera').addEventListener('change', (e) => { state.camera = e.target.value; load(); });
 
-loadCameras();
-load();
-setInterval(load, 5000);
+document.addEventListener('journal-tabchange', (event) => {
+  active = event.detail === 'archive';
+  if (!active) { loadSequence += 1; return; }
+  if (!camerasLoaded) { camerasLoaded = true; loadCameras(); }
+  load();
+});
+setInterval(() => { if (active) load(); }, 5000);
+})();

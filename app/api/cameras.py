@@ -27,7 +27,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 
 from app.config import settings
-from app.database.database import get_db
+from app.database.database import get_db, publication_guard
+from app.database.models import AttendanceCamera, AttendanceRuntime
 from app.rtsp.manager import ReaderManager
 from app.rtsp.jpeg_cache import JPEG_QUALITY
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
@@ -111,6 +112,15 @@ def _publish_recording_source(request: Request, source) -> None:
     playbacks = getattr(request.app.state, "playbacks", None)
     if playbacks is not None:
         playbacks.source_changed(source)
+
+def _invalidate_analysis(request: Request, camera_id: int) -> None:
+    scene = getattr(request.app.state, "scene_service", None)
+    if scene is not None:
+        scene.invalidate(camera_id)
+    state = _detection_state(request)
+    if state is not None:
+        state.drop_camera(camera_id)
+
 
 
 # -------------------------------------------------------------- проверка
@@ -238,6 +248,8 @@ def api_update_camera(
     _setup(request).source_changed(camera)
     _publish_recording_source(request, camera)
     manager.sync(camera, changed)
+    if changed & service.CONNECTION_FIELDS or ("enabled" in changed and not camera.enabled):
+        _invalidate_analysis(request, camera_id)
     return _camera_response(camera, manager, request, db)
 
 
@@ -249,8 +261,11 @@ def api_delete_camera(
     request: Request = None,
 ):
     camera = _camera_or_404(db, camera_id)
-    deletion = service.delete_camera(db, camera)
+    journal = getattr(request.app.state, "human_journal", None) if request is not None else None
+    deletion = service.delete_camera(
+        db, camera, has_pending=journal.has_camera_work if journal is not None else None)
     if request is not None:
+        _invalidate_analysis(request, camera_id)
         _setup(request).deleted(camera_id)
         playbacks = getattr(request.app.state, "playbacks", None)
         if playbacks is not None:
@@ -302,9 +317,27 @@ def api_camera_detections(
     db: Session = Depends(get_db),
 ):
     """Текущие люди на камере (для overlay bounding boxes на странице камеры)."""
-    _camera_or_404(db, camera_id)
-    state = _detection_state(request)
-    data = state.camera(camera_id) if state else None
+    with publication_guard(db.get_bind().engine):
+        source = service.camera_snapshot(db, camera_id)
+        if source is None:
+            raise HTTPException(404, "Camera not found")
+        state = _detection_state(request)
+        data = state.camera(camera_id) if state else None
+        manager = getattr(request.app.state, "manager", None)
+        reader = manager.get(camera_id) if manager is not None else None
+        packet = reader.buffer.latest() if reader is not None else None
+        configuration = db.get(AttendanceCamera, camera_id)
+        runtime = db.get(AttendanceRuntime, 1)
+        if (data is not None and (not source.enabled or packet is None
+                or not reader.is_alive() or reader.status() is not CameraStatus.ONLINE
+                or data.get("source_revision") != source.source_revision
+                or packet.source_revision != source.source_revision
+                or data.get("stream_id") != packet.stream_id)):
+            data = None
+        if (data is not None and (configuration is None or runtime is None
+                or data.get("calibration_revision") != configuration.revision
+                or data.get("gallery_revision") != runtime.gallery_revision)):
+            data = None
     if data is None:
         return {
             "camera_id": camera_id,
@@ -331,10 +364,14 @@ def api_camera_tracks(
     global_manager = getattr(worker, "global_manager", None) if worker else None
     if global_manager is None:
         return {"camera_id": camera_id, "multi_camera_tracking": False, "tracks": []}
+    live = api_camera_detections(camera_id, request, db)
+    current = {(track["visit_id"], track["track_id"], live.get("tracking_generation"))
+               for track in live["tracks"] if track.get("visit_id") is not None}
     return {
         "camera_id": camera_id,
         "multi_camera_tracking": True,
-        "tracks": global_manager.camera_tracks(camera_id),
+        "tracks": [track for track in global_manager.camera_tracks(camera_id)
+                   if (track["visit_id"], track["track_id"], track["tracking_generation"]) in current],
     }
 
 

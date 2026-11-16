@@ -1,7 +1,9 @@
 """SQLAlchemy engine + сессии для SQLite (data/app.db)."""
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from threading import Lock, RLock
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -9,6 +11,11 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from app.config import BASE_DIR, settings
 
 logger = logging.getLogger("app.database")
+
+# Weak keys let temporary/disposed engines disappear without a permanent registry.
+# The registry mutex is never held while waiting for an engine's publication lock.
+_publication_locks = WeakKeyDictionary()
+_publication_locks_mutex = Lock()
 
 
 class Base(DeclarativeBase):
@@ -68,13 +75,31 @@ def get_db():
 
 
 @contextmanager
-def immediate_session(bind: Engine):
+def publication_guard(engine: Engine):
+    """Fence token-changing commits against post-inference result publication.
+
+    Reentrant for a caller combining a pending-work check with a guarded mutation.
+    Never surround native inference or ordinary background database writes.
+    """
+    with _publication_locks_mutex:
+        lock = _publication_locks.get(engine)
+        if lock is None:
+            lock = RLock()
+            _publication_locks[engine] = lock
+    with lock:
+        yield
+
+
+@contextmanager
+def immediate_session(bind: Engine, *, publish: bool = False):
     """Own a SQLite write transaction, locking before the first read.
 
     The Session commits only its savepoint; the Connection owns the durable
     commit. Even an inner Session.commit() remains rollbackable on failure.
+    Opt-in publication fencing covers connection acquisition through durable
+    commit/rollback. Ordinary journal, event and telemetry writers stay independent.
     """
-    with bind.connect() as connection:
+    with (publication_guard(bind) if publish else nullcontext()), bind.connect() as connection:
         try:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             with Session(bind=connection, join_transaction_mode="create_savepoint",

@@ -246,7 +246,7 @@ class SetupTransferService:
                 if not _empty(db.connection()):
                     raise TransferError("TRANSFER_DESTINATION_NOT_EMPTY", 409)
             faces, preparation = self._prepare_faces(document)
-            with immediate_session(self.engine) as db:
+            with immediate_session(self.engine, publish=True) as db:
                 _schema(db.connection())
                 prior = _receipt(db, request_id, digest)
                 if prior is not None:

@@ -56,6 +56,7 @@ EDITABLE = {
     "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
+    "journal_image_keep_days",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",
@@ -265,6 +266,7 @@ def test_each_editable_field_accepts_valid_value_and_remains_pending():
         "min_recognition_confidence": .72, "min_confirmations": 4,
         "face_recognition_retry_interval": .4, "live_face_min_size": 64,
         "live_face_margin": .12, "live_face_window": 3., "live_face_recheck_interval": 3.,
+        "journal_image_keep_days": 45,
         "attendance_max_frame_gap": 1., "attendance_face_threshold": .65,
         "attendance_face_margin": .12, "attendance_face_confirmations": 4,
         "attendance_face_window": 2., "attendance_face_interval": .5,
@@ -300,6 +302,7 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
         "live_face_min_size": [0, 1.5, 4097], "live_face_margin": [-.01, 1.01, float("inf")],
         "live_face_window": [0, 60.1, float("nan")],
         "live_face_recheck_interval": [0, 60.1, float("inf")],
+        "journal_image_keep_days": [0, 366, 1.5, True],
         "attendance_frame_max_age": [0, float("nan")], "attendance_max_frame_gap": [0, float("inf")],
         "attendance_face_threshold": [-.01, 1.01, float("nan")],
         "attendance_face_margin": [-.01, 1.01, float("inf")],
@@ -518,6 +521,33 @@ def diagnostics():
         state.diagnostics = module.DiagnosticsService(state, f.engine, f.active)
         f.app.include_router(debug_api.router)
         yield f
+
+
+@test
+def test_journal_scene_diagnostics_never_export_tokens_images_or_raw_failure_text():
+    with diagnostics() as f:
+        raw = dict(state="JOURNAL_DEGRADED", error_code=URL, pending_commands=4,
+                   pending_updates=float("nan"), pending_barriers=True,
+                   blocked_generations=2, reserved_generations=3, active_visits=5,
+                   pending_acknowledgements=1, accepting=False, writer_alive=True,
+                   thumbnail=TOKEN, snapshot=COOKIE, visit_id=AUTH)
+        f.app.state.human_journal = SimpleNamespace(health_snapshot=lambda: raw)
+        f.app.state.scene_segmenter = SimpleNamespace(last_inference_seconds=float("nan"))
+        f.app.state.scene_assistance = SimpleNamespace(health_snapshot=lambda: {
+            "running": 1, "queued": 1, "records": 2, "accepting": True, "worker_alive": True,
+            "snapshot": TOKEN, "job_id": COOKIE})
+        f.app.state.scene_error = URL
+        view = f.client.json("GET", "/api/debug/status")
+        no_secrets(view)
+        assert view["journal"]["state"] == "JOURNAL_DEGRADED"
+        assert view["journal"]["error_code"] == "JOURNAL_DEGRADED"
+        assert view["journal"]["pending_commands"] == 4
+        assert view["journal"]["pending_updates"] is None and view["journal"]["pending_barriers"] is None
+        assert view["scene"]["error_code"] == "SCENE_MODEL_UNAVAILABLE"
+        assert view["scene"]["last_inference_seconds"] is None
+        assert view["scene"]["running"] == 1 and view["scene"]["queued"] == 1
+        assert not {"snapshot", "job_id", "thumbnail", "visit_id"} & view["journal"].keys()
+        assert not {"snapshot", "job_id"} & view["scene"].keys()
 
 
 @test

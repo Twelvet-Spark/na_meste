@@ -1,21 +1,54 @@
 {% extends "base.html" %}
 {% set active_page = 'global' %}
 
-{% block title %}Архив Re-ID{% endblock %}
+{% block title %}Журнал людей{% endblock %}
 
 {% block topbar_right %}
   <span id="summary" class="muted"></span>
 {% endblock %}
 
 {% block content %}
-  <main class="container wide global-archive">
-    <section class="panel">
+  <main class="container wide global-archive attendance-workspace">
+    <div class="page-heading">
+      <div><h1>Журнал людей</h1><p class="muted">Наблюдения людей на камерах, в том числе без распознанного лица. Это не записи рабочего времени.</p></div>
+      <a class="btn" href="/presence">Рабочее время</a>
+    </div>
+    <nav class="attendance-tabs" role="tablist" aria-label="Разделы журнала">
+      <button class="btn" type="button" id="tab-visits" role="tab" aria-controls="panel-visits" aria-selected="true">Наблюдения</button>
+      <button class="btn" type="button" id="tab-archive" role="tab" aria-controls="panel-archive" aria-selected="false" tabindex="-1">Межкамерный архив</button>
+    </nav>
+    <section class="panel attendance-tabpanel" id="panel-visits" role="tabpanel" aria-labelledby="tab-visits">
+      <div class="panel-head"><h2>Наблюдения на камерах</h2><button class="btn" type="button" id="visits-refresh">Обновить список</button></div>
+      <p class="archive-notice muted">Одна запись — один принятый трек на одной камере. «Предварительное» означает, что пока было мало наблюдений. Внешнее сходство между камерами не подтверждает сотрудника. Изображения хранятся ограниченное время; данные наблюдения остаются.</p>
+      <form id="visits-filters" class="attendance-filters">
+        <label class="field">Камера<select id="visits-camera" name="camera_id"><option value="">Все камеры</option></select></label>
+        <label class="field">Сотрудник<select id="visits-employee" name="employee_id"><option value="">Все сотрудники</option></select></label>
+        <label class="field">Последнее наблюдение от (UTC)<input type="datetime-local" name="from" step="1"></label>
+        <label class="field">Последнее наблюдение до (UTC)<input type="datetime-local" name="to" step="1"></label>
+        <label class="field checkbox-field"><input type="checkbox" name="unknown_only"> Только неизвестные</label>
+        <div class="attendance-actions"><button class="btn primary" type="submit">Показать</button><button class="btn" type="reset">Сбросить</button></div>
+      </form>
+      <p id="visits-filter-status" class="form-status" role="status" aria-live="polite"></p>
+      <p id="visits-status" class="form-status" role="status" aria-live="polite">Загружаем наблюдения…</p>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Список наблюдений">
+        <table class="table" id="visits-table">
+          <caption>Свежие наблюдения сверху. Время указано в UTC.</caption>
+          <thead><tr><th>Наблюдение</th><th>Камера</th><th>Личность</th><th>Первое / последнее наблюдение</th><th>Длительность</th><th>Состояние / завершение</th><th>Изображения</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="visits-empty" class="empty" hidden>Наблюдений по этим фильтрам нет. Проверьте выбранный период или настройки анализа камер.</p>
+      <div class="attendance-actions">
+        <button class="btn" type="button" id="visits-more" hidden>Показать ещё</button>
+        <span id="visits-count" class="muted"></span>
+      </div>
+    </section>
+    <section class="panel attendance-tabpanel" id="panel-archive" role="tabpanel" aria-labelledby="tab-archive" hidden>
       <div class="panel-head">
         <h2>Архив глобальных наблюдений</h2>
         <span class="muted">Только чтение · не рабочие часы</span>
       </div>
       <p class="archive-notice muted">Необязательный Re-ID связывает наблюдения по внешности, но не подтверждает личность или рабочее время. После перезапуска сохранённые записи не меняются, а новые наблюдения получают новые global_id. Объединение и ручная привязка недоступны. <a href="/presence">Перейти к учёту рабочего времени</a>.</p>
-
       <div class="filters">
         <input type="search" id="f-search" aria-label="Поиск глобальной личности" placeholder="Поиск: G#184 или имя сотрудника" autocomplete="off">
         <select id="f-status" aria-label="Сохранённый статус">
@@ -24,12 +57,10 @@
           <option value="NEW">NEW</option>
           <option value="LOST">LOST</option>
         </select>
-        <select id="f-camera" aria-label="Последняя сохранённая камера">
-          <option value="">Все камеры</option>
-        </select>
+        <select id="f-camera" aria-label="Последняя сохранённая камера"><option value="">Все камеры</option></select>
       </div>
-
-      <div class="table-wrap">
+      <p id="archive-status" class="form-status" role="status" aria-live="polite"></p>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Межкамерный архив">
         <table class="table" id="persons-table">
           <thead>
             <tr>
@@ -48,4 +79,5 @@
 
 {% block scripts %}
   <script src="/static/js/global_persons.js"></script>
+  <script src="/static/js/human_visits.js"></script>
 {% endblock %}

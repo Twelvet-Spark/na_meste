@@ -7,6 +7,13 @@
     <div><h1>Настройки</h1><p class="muted">Изменения применятся только после обычного перезапуска приложения. Текущая работа камер и записи не прерывается при сохранении.</p></div>
     <a class="btn" href="/debug">Открыть диагностику</a>
   </header>
+  <section class="panel" aria-labelledby="runtime-heading">
+    <div class="panel-head"><h2 id="runtime-heading">AI текущего запуска</h2><button type="button" class="btn" id="runtime-refresh">Обновить состояние AI</button></div>
+    <p id="runtime-status" class="muted small" role="status">Загрузка состояния…</p>
+    <dl id="runtime-facts" class="attendance-facts"></dl>
+    <details><summary>Обработка камер</summary><ul id="runtime-cameras"></ul></details>
+    <p class="muted small">Это состояние работающего процесса, а не черновик настроек ниже. Подробные причины и очереди — в диагностике.</p>
+  </section>
   <section class="panel" id="setup-transfer" aria-labelledby="transfer-heading">
     <h2 id="transfer-heading">Перенос на другой компьютер</h2>
     <p>Камеры с паролями, настройки архива, рабочие места, сотрудники и сохранённые образцы лиц. <strong>Без видео и истории.</strong> Исходные фотографии не хранятся — переносятся миниатюры лиц и данные распознавания.</p>

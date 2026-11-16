@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import String, cast, func, or_
 from sqlalchemy.orm import Session
 
+from app.api.human_visits import router as human_visits_router
 from app.database.database import get_db
 from app.database.models import (
     Camera, Employee, GlobalEvent, GlobalObservation, GlobalPerson,
@@ -18,6 +19,7 @@ from app.time_utils import iso_local
 
 
 router = APIRouter(prefix="/api/global-persons", tags=["global-persons"])
+router.include_router(human_visits_router)
 
 LIST_CAP = 500          # максимум строк списка
 TRAJECTORY_CAP = 5000   # максимум наблюдений в траектории

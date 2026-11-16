@@ -305,7 +305,7 @@ def create_camera(db: Session, data: CameraCreate) -> CameraSource:
     engine = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(engine) as writer:
+        with immediate_session(engine, publish=True) as writer:
             snapshot = _create_camera(writer, data)
         db.expire_all()
         return snapshot
@@ -320,7 +320,7 @@ def create_camera_batch(db: Session, data: CameraBatch) -> tuple[dict, list[Came
     engine = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(engine) as writer:
+        with immediate_session(engine, publish=True) as writer:
             prior = writer.get(OperatorRequest, str(data.request_id))
             if prior is not None:
                 if prior.operation != "camera.batch" or prior.payload_sha256 != digest:
@@ -355,7 +355,7 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
     db.rollback()
     changed: set[str] = set()
     try:
-        with immediate_session(engine) as writer:
+        with immediate_session(engine, publish=True) as writer:
             current = writer.get(Camera, camera_id)
             if current is None:
                 raise HTTPException(404, "Camera not found")
@@ -400,13 +400,17 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
         raise HTTPException(503, "Database unavailable; camera was not changed") from exc
 
 
-def delete_camera(db: Session, camera: Camera | CameraSource) -> CameraDeletion:
+def delete_camera(db: Session, camera: Camera | CameraSource, *, has_pending=None) -> CameraDeletion:
     """Delete without history loss and capture the ordered publication tombstone."""
     camera_id, name = camera.id, camera.name
     bind = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(bind) as writer:
+        with immediate_session(bind, publish=True) as writer:
+            # The same publication fence protects worker admission. Keep this
+            # check inside the transaction, not around post-commit publication.
+            if has_pending is not None and has_pending(camera_id):
+                raise HTTPException(409, "Camera has pending journal work; disable instead")
             from app.database.models import RecordingSession, RecordingSegment
             current = writer.get(Camera, camera_id)
             if current is None:

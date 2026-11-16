@@ -230,19 +230,19 @@ def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace
     return PreparedFace(filename, embedding.tobytes(), thumbnail, face_engine.model_id, face_engine.alignment_id)
 
 
-def committed_request(db, request_id, digest):
+def committed_request(db, request_id, digest, *, operation):
     row = db.get(OperatorRequest, str(request_id))
-    if row is not None and (row.operation != "employee.create" or row.payload_sha256 != digest):
+    if row is not None and (row.operation != operation or row.payload_sha256 != digest):
         raise HTTPException(409, "Этот request_id уже использован с другими данными")
     return row.result if row is not None else None
 
 
-def _advance_gallery(db):
+def advance_gallery(db):
     db.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
         gallery_revision=AttendanceRuntime.gallery_revision + 1, commission_id=None))
 
 
-def _check_faces(db, employee_id, prepared_faces, model_id):
+def check_prepared_faces(db, employee_id, prepared_faces, model_id):
     gallery = EmbeddingStore(model_id)
     gallery.refresh(db)
     errors = []
@@ -260,7 +260,7 @@ def _check_faces(db, employee_id, prepared_faces, model_id):
         raise photo_failure(errors)
 
 
-def _insert_faces(db, employee_id, prepared_faces):
+def insert_prepared_faces(db, employee_id, prepared_faces):
     samples = [EmployeeFace(employee_id=employee_id, embedding=row.embedding,
                             thumbnail=row.thumbnail, created_at=utcnow()) for row in prepared_faces]
     db.add_all(samples)
@@ -268,6 +268,7 @@ def _insert_faces(db, employee_id, prepared_faces):
     db.add_all(FaceModelMetadata(face_id=face.id, model_id=prepared.model_id,
                                  alignment_id=prepared.alignment_id, created_at=utcnow())
                for face, prepared in zip(samples, prepared_faces))
+    return samples
 
 
 def create_employee_with_faces(db: Session, data: EmployeeCreate, prepared_faces, payload_sha256,
@@ -275,22 +276,22 @@ def create_employee_with_faces(db: Session, data: EmployeeCreate, prepared_faces
     bind = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(bind) as writer:
-            replay = committed_request(writer, data.request_id, payload_sha256)
+        with immediate_session(bind, publish=True) as writer:
+            replay = committed_request(writer, data.request_id, payload_sha256, operation="employee.create")
             if replay is not None:
                 return writer.get(Employee, replay["id"])
             if not 1 <= len(prepared_faces) <= 15:
                 raise HTTPException(422, "Нужно от 1 до 15 фотографий")
             validate_assignments(writer, data.workplace_ids)
-            _check_faces(writer, None, prepared_faces, model_id)
+            check_prepared_faces(writer, None, prepared_faces, model_id)
             employee = Employee(first_name=data.first_name, last_name=data.last_name,
                                 name=f"{data.last_name} {data.first_name}", external_id=data.external_id,
                                 active=data.active, revision=1, created_at=utcnow(), updated_at=utcnow())
             writer.add(employee)
             writer.flush()
-            _insert_faces(writer, employee.id, prepared_faces)
+            insert_prepared_faces(writer, employee.id, prepared_faces)
             replace_assignments(writer, employee.id, data.workplace_ids)
-            _advance_gallery(writer)
+            advance_gallery(writer)
             writer.flush()
             writer.add(OperatorRequest(id=str(data.request_id), operation="employee.create",
                                        payload_sha256=payload_sha256,
@@ -306,23 +307,23 @@ def replace_employee_faces(db: Session, employee_id, expected_revision, keep_fac
     bind = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(bind) as writer:
+        with immediate_session(bind, publish=True) as writer:
             current = writer.get(Employee, employee_id)
             _check_revision(current, expected_revision)
             owned = {row[0] for row in writer.query(EmployeeFace.id).filter_by(employee_id=employee_id)}
             if (len(keep_face_ids) != len(set(keep_face_ids)) or not set(keep_face_ids) <= owned
                     or not 1 <= len(keep_face_ids) + len(prepared_faces) <= 15):
                 raise HTTPException(422, "Итоговый набор должен содержать 1–15 собственных фотографий без повторов")
-            _check_faces(writer, employee_id, prepared_faces, model_id)
+            check_prepared_faces(writer, employee_id, prepared_faces, model_id)
             # Insert before deleting so SQLite cannot recycle an omitted thumbnail ID.
-            _insert_faces(writer, employee_id, prepared_faces)
+            insert_prepared_faces(writer, employee_id, prepared_faces)
             writer.flush()
             removed = owned - set(keep_face_ids)
             if removed:
                 writer.query(EmployeeFace).filter(EmployeeFace.id.in_(removed)).delete(synchronize_session=False)
             current.revision += 1
             current.updated_at = utcnow()
-            _advance_gallery(writer)
+            advance_gallery(writer)
             writer.flush()
         db.expire_all()
         return current
@@ -341,7 +342,7 @@ def update_employee(db: Session, employee: Employee, data: EmployeeUpdate) -> Em
     employee_id, bind = employee.id, db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(bind) as writer:
+        with immediate_session(bind, publish=True) as writer:
             current = writer.get(Employee, employee_id)
             _check_revision(current, data.expected_revision)
             values = data.model_dump(exclude_unset=True, exclude={"expected_revision", "workplace_ids"})
@@ -353,7 +354,7 @@ def update_employee(db: Session, employee: Employee, data: EmployeeUpdate) -> Em
                 replace_assignments(writer, employee_id, data.workplace_ids)
             current.revision += 1
             current.updated_at = utcnow()
-            _advance_gallery(writer)
+            advance_gallery(writer)
             writer.flush()
         db.expire_all()
         return current
@@ -365,7 +366,7 @@ def delete_employee(db: Session, employee: Employee):
     employee_id, bind = employee.id, db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(bind) as writer:
+        with immediate_session(bind, publish=True) as writer:
             current = writer.get(Employee, employee_id)
             if current is None:
                 raise HTTPException(404, "Сотрудник не найден")
@@ -380,7 +381,7 @@ def delete_employee(db: Session, employee: Employee):
             writer.query(EmployeeFace).filter_by(employee_id=employee_id).delete()
             writer.query(EmployeeWorkplace).filter_by(employee_id=employee_id).delete()
             writer.delete(current)
-            _advance_gallery(writer)
+            advance_gallery(writer)
         db.expire_all()
     except SQLAlchemyError as exc:
         raise HTTPException(503, "База данных недоступна") from exc

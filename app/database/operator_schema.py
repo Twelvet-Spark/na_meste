@@ -274,12 +274,12 @@ def install(connection, installed=0):
         for ddl in V1_TABLES.values():
             connection.exec_driver_sql(ddl)
         connection.exec_driver_sql(
-            "INSERT INTO operator_schema (id,version,updated_at) VALUES (1,1,?)", (utcnow(),))
+            "INSERT INTO operator_schema (id,version,updated_at) VALUES (1,1,?)", (utcnow().isoformat(sep=" "),))
         installed = 1
     if installed == 1:
         connection.exec_driver_sql(V2_TABLES["camera_archives"])
         connection.exec_driver_sql(
-            "UPDATE operator_schema SET version=2,updated_at=? WHERE id=1", (utcnow(),))
+            "UPDATE operator_schema SET version=2,updated_at=? WHERE id=1", (utcnow().isoformat(sep=" "),))
         installed = 2
     if installed == 2:
         for name, ddl in V3_TABLES.items():
@@ -288,7 +288,7 @@ def install(connection, installed=0):
         for ddl in V3_INDEXES.values():
             connection.exec_driver_sql(ddl)
         connection.exec_driver_sql(
-            "UPDATE operator_schema SET version=3,updated_at=? WHERE id=1", (utcnow(),))
+            "UPDATE operator_schema SET version=3,updated_at=? WHERE id=1", (utcnow().isoformat(sep=" "),))
         installed = 3
     if installed == 3:
         for name, ddl in V4_TABLES.items():
@@ -298,4 +298,4 @@ def install(connection, installed=0):
             if name not in V3_INDEXES:
                 connection.exec_driver_sql(ddl)
         connection.exec_driver_sql(
-            "UPDATE operator_schema SET version=4,updated_at=? WHERE id=1", (utcnow(),))
+            "UPDATE operator_schema SET version=4,updated_at=? WHERE id=1", (utcnow().isoformat(sep=" "),))

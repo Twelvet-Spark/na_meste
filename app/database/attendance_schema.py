@@ -140,7 +140,7 @@ def _backup(connection) -> Path:
 
 
 def _seed(connection) -> None:
-    now = utcnow()
+    now = utcnow().isoformat(sep=" ")
     connection.execute(models.AttendanceRuntime.__table__.insert().prefix_with("OR IGNORE"),
                        {"id": 1, "schema_version": SCHEMA_VERSION, "gallery_revision": 0})
     connection.exec_driver_sql(

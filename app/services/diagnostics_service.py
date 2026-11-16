@@ -33,6 +33,8 @@ SAFE_CODES = frozenset({
     "MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID",
     "FACE_MODEL_UNAVAILABLE", "GALLERY_UNAVAILABLE", "GALLERY_CHANGED",
     "JOURNAL_DEGRADED", "CAPACITY_DEGRADED", "DECODE_SOFTWARE_FALLBACK",
+    "JOURNAL_WRITE_FAILED", "JOURNAL_CAPACITY_EXCEEDED", "JOURNAL_GAP", "JOURNAL_UNFLUSHED",
+    "SCENE_BUSY", "SCENE_INFERENCE_FAILED", "SCENE_NATIVE_WORK_UNRESOLVED",
     "DECODE_HARDWARE_INIT_FAILED",
     "SCENE_MODEL_UNAVAILABLE", "ENROLLMENT_BUSY", "LEGACY_MODEL_SETTINGS_IGNORED",
 })
@@ -256,6 +258,13 @@ class DiagnosticsService:
     def _models(self):
         """Project startup state only: no paths, provenance URLs or biometrics."""
         bundle = getattr(self.state, "model_bundle", None)
+        from sqlalchemy.orm import Session
+        from app.database.models import AttendanceRuntime
+        with Session(self.engine) as db:
+            runtime = db.get(AttendanceRuntime, 1)
+            revision = runtime.gallery_revision if runtime is not None else None
+        store = getattr(self.state, "embedding_store", None)
+        loaded_revision = getattr(store, "revision", None)
         statuses = getattr(bundle, "component_status", {}) if bundle is not None else {}
         statuses = statuses if type(statuses) is dict else {}
         components = {}
@@ -289,12 +298,42 @@ class DiagnosticsService:
             "alignment_id": ("arcface-5pt-112-v1"
                              if getattr(bundle, "alignment_id", None) == "arcface-5pt-112-v1" else None),
             "component_status": components,
+            "gallery_revision": number(revision, integer=True),
+            "loaded_gallery_revision": number(loaded_revision, integer=True),
+            "gallery_current": (revision is not None and revision == loaded_revision
+                                and model_identifier(getattr(store, "model_id", None)) is not None
+                                and getattr(store, "model_id", None) == getattr(bundle, "face_model_id", None)),
             "error_code": next((components[key] for key in MODEL_COMPONENTS[:3]
                                 if components[key] != "READY"), None),
             "gallery_migration": migration,
             "legacy_model_settings_ignored": ignored,
             "legacy_model_settings_code": "LEGACY_MODEL_SETTINGS_IGNORED" if ignored else None,
         }
+
+    def _journal(self):
+        journal = getattr(self.state, "human_journal", None)
+        if journal is None:
+            return {"state": "UNAVAILABLE", "error_code": "JOURNAL_DEGRADED"}
+        raw = journal.health_snapshot()
+        result = {key: number(raw.get(key), integer=True) for key in (
+            "pending_commands", "pending_updates", "pending_barriers", "blocked_generations",
+            "reserved_generations", "active_visits", "pending_acknowledgements")}
+        result.update(state=raw.get("state") if raw.get("state") in ("OK", "JOURNAL_DEGRADED") else "UNAVAILABLE",
+                      error_code=safe_code(raw["error_code"], "JOURNAL_DEGRADED") if raw.get("error_code") else None,
+                      accepting=raw.get("accepting") is True, writer_alive=raw.get("writer_alive") is True)
+        return result
+
+    def _scene(self):
+        model = getattr(self.state, "scene_segmenter", None)
+        service = getattr(self.state, "scene_assistance", None)
+        raw = service.health_snapshot() if service is not None else {}
+        return dict(model_available=model is not None,
+                    error_code=safe_code(getattr(self.state, "scene_error", None), "SCENE_MODEL_UNAVAILABLE")
+                               if getattr(self.state, "scene_error", None) else None,
+                    last_inference_seconds=number(getattr(model, "last_inference_seconds", None)),
+                    running=number(raw.get("running"), integer=True), queued=number(raw.get("queued"), integer=True),
+                    records=number(raw.get("records"), integer=True), accepting=raw.get("accepting") is True,
+                    worker_alive=raw.get("worker_alive") is True)
 
     def _cameras(self):
         from sqlalchemy.orm import Session
@@ -330,7 +369,7 @@ class DiagnosticsService:
                     row["inference"].update(
                         reason_codes=[safe_code(code) for code in measurement.get("reason_codes", [])],
                         stage_times_ms={key: number(measurement.get("stage_times_ms", {}).get(key))
-                                        for key in ("person", "face_detection", "face_recognition", "tracking", "appearance")},
+                                        for key in ("person", "face_detection", "face_recognition", "tracking", "appearance", "journal")},
                         model_ids={key: model_identifier(measurement.get("model_ids", {}).get(key))
                                    for key in ("bundle", "person", "face", "body")},
                         providers=provider_summary(measurement.get("providers")))
@@ -410,6 +449,8 @@ class DiagnosticsService:
                     "alignment_id": None, "component_status": {}, "gallery_migration": None,
                     "legacy_model_settings_ignored": [], "legacy_model_settings_code": None}),
                 "attendance": attendance, "cameras": cameras, "camera_error": camera_error,
+                "journal": self._isolated(self._journal, {"state": "UNAVAILABLE", "error_code": "DIAGNOSTICS_UNAVAILABLE"}),
+                "scene": self._isolated(self._scene, {"model_available": False, "error_code": "DIAGNOSTICS_UNAVAILABLE"}),
                 "recordings": self._isolated(self._recordings, {"sessions": [], "storage": None}),
                 "processes": self._isolated(self._processes, {"recorders": [], "playbacks": []}), "archive": archive}
 

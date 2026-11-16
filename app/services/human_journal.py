@@ -899,6 +899,16 @@ class HumanJournal:
             len(self._barriers) + int(command is not None and command.kind == 'BARRIER'),
         )
 
+    def has_camera_work(self, camera_id: int) -> bool:
+        """Include reserved generations: a future gap barrier still needs its FK."""
+        with self._condition:
+            return any(gen.camera_id == camera_id for gen in self._generations.values())
+
+    def blocked_generations(self) -> tuple:
+        with self._condition:
+            return tuple((gen.camera_id, gen.generation, gen.gap_started_at)
+                         for gen in self._generations.values() if gen.blocked)
+
     def health_snapshot(self) -> dict:
         with self._condition:
             commands, updates, barriers = self._counts()

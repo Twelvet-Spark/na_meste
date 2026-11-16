@@ -23,7 +23,7 @@ class GalleryChangedError(RuntimeError):
         super().__init__(self.code)
 
 
-def _aligned_jpeg(blob: bytes | None) -> np.ndarray | None:
+def decode_aligned_thumbnail(blob: bytes | None) -> np.ndarray | None:
     if not isinstance(blob, bytes) or not blob:
         return None
     try:
@@ -50,7 +50,7 @@ def reembed_aligned_thumbnails(face_engine, thumbnails: list[bytes | None]) -> l
     for start in range(0, len(thumbnails), 4):
         indices, images = [], []
         for index in range(start, min(start + 4, len(thumbnails))):
-            image = _aligned_jpeg(thumbnails[index])
+            image = decode_aligned_thumbnail(thumbnails[index])
             if image is not None:
                 indices.append(index)
                 images.append(image)
@@ -111,7 +111,7 @@ def rebuild_gallery(engine, face_engine) -> dict:
     if not changed:
         return report
 
-    with immediate_session(engine) as writer:
+    with immediate_session(engine, publish=True) as writer:
         runtime = writer.get(AttendanceRuntime, 1)
         current_employees = dict(writer.query(Employee.id, Employee.revision).all())
         if runtime.gallery_revision != gallery_revision or current_employees != employee_revisions:

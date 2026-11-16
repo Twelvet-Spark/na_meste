@@ -334,7 +334,7 @@ class AttendanceService:
     def commission(self, payload):
         """Approve the measured site setup, never infer trial results from AI."""
         try:
-            with immediate_session(self.engine) as db:
+            with immediate_session(self.engine, publish=True) as db:
                 request, replay = self._request(db, "commission", payload)
                 if replay:
                     return request.result

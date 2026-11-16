@@ -242,27 +242,34 @@ function savedGateOverlay(event, kind, image, frame, generation) {
       last = Math.min(last, Math.max(entry, exit));
     }
   }
-  const observed = ['ENTRY', 'EXIT'].includes(raw.direction);
-  const direction = observed ? raw.direction : calibration.role;
-  if (first <= last && ['ENTRY', 'EXIT'].includes(direction)) {
+  // The historical image/crop is the only coordinate reference here. Compute
+  // the normal after projection: normalized-image normals are not pixel normals.
+  if (first <= last) {
     const midpoint = (first + last) / 2;
-    const center = [a[0] + dx * midpoint, a[1] + dy * midpoint];
-    const sign = Math.sign(interiorSide) * (direction === 'EXIT' ? -1 : 1);
-    const reach = Math.min(.1, (crop[2] - crop[0]) / 4, (crop[3] - crop[1]) / 4);
-    const nx = -dy / length * sign * reach, ny = dx / length * sign * reach;
-    const tail = project([center[0] - nx, center[1] - ny]);
-    const tip = project([center[0] + nx, center[1] + ny]);
+    const center = project([a[0] + dx * midpoint, a[1] + dy * midpoint]);
+    const interior = project(inside);
+    const px = to[0] - from[0], py = to[1] - from[1], pixelLength = Math.hypot(px, py);
+    const sign = Math.sign((interior[0] - center[0]) * -py + (interior[1] - center[1]) * px);
+    const reach = Math.min(40, width / 8, height / 8);
+    const nx = -py / pixelLength * sign * reach, ny = px / pixelLength * sign * reach;
+    const tail = [center[0] - nx, center[1] - ny];
+    const tip = [center[0] + nx, center[1] + ny];
     const angle = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
     const head = Math.min(14, Math.hypot(tip[0] - tail[0], tip[1] - tail[1]) / 3);
     const left = [tip[0] - head * Math.cos(angle - .45), tip[1] - head * Math.sin(angle - .45)];
     const right = [tip[0] - head * Math.cos(angle + .45), tip[1] - head * Math.sin(angle + .45)];
     stroke(`M ${tail.join(' ')} L ${tip.join(' ')} M ${left.join(' ')} L ${tip.join(' ')} L ${right.join(' ')}`);
+    const caption = svgNode('text', { x: center[0] + 6, y: center[1] - reach - 8,
+      fill: 'var(--vid-warn)', stroke: 'var(--md-inverse-surface)', 'stroke-width': 3,
+      'paint-order': 'stroke', 'font-size': 13 });
+    caption.textContent = 'Снаружи → внутрь';
+    drawing.append(caption);
   }
   svg.append(definitions, drawing);
   frame.append(svg);
   const coordinates = (values) => values.map((value) => value.toFixed(3)).join(', ');
   const description = el('p', null, 'attendance-geometry muted');
-  description.textContent = `Сохранённая линия: (${coordinates(a)}) — (${coordinates(b)}); фрагмент: (${coordinates(crop)}). Калибровка ${calibration.revision}, источник ${calibration.source_revision}. ${first > last ? 'Линия вне этого фрагмента. ' : ''}${observed ? `Стрелка — исходное направление: ${label(direction)}.` : `Направление прохода не установлено; стрелка — направление калибровки: ${label(direction)}.`} Роль камеры при записи: ${label(calibration.role)}.`;
+  description.textContent = `Сохранённая линия: (${coordinates(a)}) — (${coordinates(b)}); фрагмент: (${coordinates(crop)}). Калибровка ${calibration.revision}, источник ${calibration.source_revision}. ${first > last ? 'Линия вне этого фрагмента. ' : 'Стрелка: Снаружи → внутрь (внутренняя сторона сохранённой линии). '}${['ENTRY', 'EXIT'].includes(raw.direction) ? `Исходное направление прохода: ${label(raw.direction)}.` : 'Направление прохода не установлено.'} Роль камеры при записи: ${label(calibration.role)}.`;
   return description;
 }
 function clearImages() { for (const url of state.imageUrls) URL.revokeObjectURL(url); state.imageUrls = []; }

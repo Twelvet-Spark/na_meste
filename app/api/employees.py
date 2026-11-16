@@ -14,6 +14,7 @@ from starlette.formparsers import MultiPartException
 
 from app.api.operator_security import require_operator_request
 from app.database.database import get_db
+from app.database.models import AttendanceRuntime
 from app.services import employee_service as service
 
 MAX_PHOTO_BYTES = 15 * 1024 * 1024
@@ -95,10 +96,12 @@ def _view(request, db, employee):
     worker = getattr(request.app.state, "ai_worker", None)
     live = getattr(worker, "service", None)
     live_faces = getattr(live, "faces", None)
+    durable_revision = db.query(AttendanceRuntime.gallery_revision).filter_by(id=1).scalar()
     result["face_runtime_available"] = (
         engine is not None and store is not None and live_faces is not None
         and getattr(live, "store", None) is store and _model_id(request) is not None
-        and engine.model_id == live_faces.model_id == store.model_id == _model_id(request))
+        and engine.model_id == live_faces.model_id == store.model_id == _model_id(request)
+        and durable_revision is not None and store.revision == durable_revision)
     return result
 
 
@@ -156,14 +159,14 @@ def _create(request, db, metadata, contents, lock):
     payload = {"metadata": canonical, "files": [hashlib.sha256(content).hexdigest() for _name, content in contents]}
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
                                        separators=(",", ":")).encode("utf-8")).hexdigest()
-    replay = service.committed_request(db, metadata.request_id, digest)
+    replay = service.committed_request(db, metadata.request_id, digest, operation="employee.create")
     db.rollback()
     if replay is not None:
         return replay
     prepared = _prepare(contents, request, lock)
     service.create_employee_with_faces(db, metadata, prepared, digest, model_id=_model_id(request))
     # Always return the transaction's frozen result, including a racing replay.
-    result = service.committed_request(db, metadata.request_id, digest)
+    result = service.committed_request(db, metadata.request_id, digest, operation="employee.create")
     _refresh(request, db)
     return result
 

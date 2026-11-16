@@ -1,0 +1,348 @@
+"""Real worker/journal/SQLite seams; synthetic model outputs, never identity accuracy."""
+import sys
+from contextlib import contextmanager, ExitStack
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from sqlalchemy.orm import Session
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from app.ai.global_tracker import GlobalIdentityManager
+from app.api import cameras
+from app.database.database import immediate_session
+from app.database.models import AttendanceCamera, AttendanceRuntime, Camera, GlobalPerson, HumanVisit, HumanJournalGap
+from app.services.attendance_monitor import AttendanceMonitor
+from app.services.human_journal import HumanJournal
+from test_attendance_lifecycle import Clock, FRAME, worker_for
+from test_attendance_service import database
+from test_human_journal import idle
+from test_multi_camera_worker import contexts, publish
+from test_runtime_recovery import add_camera
+
+
+class Body:
+    def __init__(self):
+        self.calls = []
+        self.mutate = None
+
+    def embed(self, crops):
+        assert all(crop.shape == (256, 128, 3) and crop.flags.owndata for crop in crops)
+        self.calls.append(len(crops))
+        if self.mutate is not None:
+            self.mutate()
+        result = np.zeros((len(crops), 512), np.float32)
+        for index, crop in enumerate(crops):
+            result[index, int(crop.mean() >= 127)] = 1.
+        return result
+
+
+@contextmanager
+def fixture(*, body=None, journal_options=None):
+    with database() as (engine, attendance):
+        clock = Clock()
+        worker, manager, detector, _queue = worker_for(engine, attendance, clock)
+        add_camera(engine, manager, 3)
+        journal = HumanJournal(engine, now=clock.utcnow, monotonic=clock.monotonic,
+                               **(journal_options or {}))
+        worker.journal = journal
+        worker.reid = body
+        worker.global_manager = GlobalIdentityManager() if body is not None else None
+        idle(journal)
+        with ExitStack() as stack:
+            for context in contexts(clock):
+                stack.enter_context(context)
+            try:
+                yield engine, attendance, clock, worker, manager, detector, journal
+            finally:
+                worker.flush('SHUTDOWN')
+                result = journal.close()
+                assert result.drained, result
+
+
+def request_for(worker, manager, journal):
+    app = FastAPI()
+    app.state.manager = manager
+    app.state.ai_worker = worker
+    app.state.detection_state = worker.state
+    app.state.human_journal = journal
+    return SimpleNamespace(app=app)
+
+
+def test_first_hit_provisional_without_face_or_body_and_ack_only_live_link():
+    with fixture() as (engine, _attendance, clock, worker, manager, _detector, journal):
+        worker.service.faces = None
+        worker.service.min_hits = 2
+        with journal._condition:
+            publish(manager, clock, 3)
+            assert worker.step()
+            assert worker.state.camera(3)['tracks'] == []
+        idle(journal)
+        with Session(engine) as db:
+            row = db.query(HumanVisit).one()
+            visit_id = row.id
+            assert row.status == 'PROVISIONAL' and row.employee_id is None and row.global_id is None
+            assert row.snapshot is not None and row.face_thumbnail is None
+        clock.advance(.2)
+        with journal._condition:
+            publish(manager, clock, 3)
+            assert worker.step()
+        idle(journal)
+        worker.step()
+        view = worker.state.camera(3)
+        assert view['tracks'][0]['visit_id'] == visit_id
+        assert view['tracks'][0]['employee_id'] is None
+        assert (view['source_revision'], view['stream_id'], view['frame_seq']) == (1, 'stream-a', 2)
+        assert (view['frame_width'], view['frame_height']) == (640, 480)
+        observed = datetime.fromisoformat(view['observed_at'])
+        assert observed.utcoffset() == timedelta(0) and observed.replace(tzinfo=None) == clock.utc
+
+
+def test_pending_visit_protects_camera_before_async_writer_can_commit():
+    with fixture() as (engine, _attendance, clock, worker, manager, _detector, journal):
+        request = request_for(worker, manager, journal)
+        with journal._condition:
+            publish(manager, clock, 3)
+            worker.step()
+            with Session(engine) as db:
+                assert db.query(HumanVisit).count() == 0
+                try:
+                    cameras.api_delete_camera(3, db=db, manager=SimpleNamespace(stop=lambda _: None), request=request)
+                except HTTPException as exc:
+                    assert exc.status_code == 409
+                else:
+                    raise AssertionError('Admitted but uncommitted visit lost its camera FK')
+                assert db.get(Camera, 3) is not None
+        idle(journal)
+        with Session(engine) as db:
+            assert db.query(HumanVisit).one().camera_id == 3
+
+
+def test_old_stream_ack_never_becomes_a_live_visit_link():
+    with fixture() as (engine, _attendance, clock, worker, manager, _detector, journal):
+        with journal._condition:
+            publish(manager, clock, 3, stream='old')
+            worker.step()
+            first = worker.state.camera(3)
+            assert first['tracks'][0]['visit_id'] is None
+            clock.advance(.2)
+            publish(manager, clock, 3, stream='new')
+        idle(journal)
+        request = request_for(worker, manager, journal)
+        with Session(engine) as db:
+            assert cameras.api_camera_detections(3, request, db)['tracks'] == []
+        with journal._condition:
+            worker.step()
+            second = worker.state.camera(3)
+            assert second['tracking_generation'] != first['tracking_generation']
+            assert second['tracks'][0]['visit_id'] is None
+        idle(journal)
+        worker.step()
+        with Session(engine) as db:
+            rows = db.query(HumanVisit).all()
+            assert len(rows) == 2 and rows[0].id != rows[1].id
+            assert worker.state.camera(3)['tracks'][0]['visit_id'] in {row.id for row in rows}
+
+
+def test_committed_source_or_gallery_change_during_native_discards_entire_outcome():
+    for mutation in ('source', 'gallery'):
+        with fixture() as (engine, _attendance, clock, worker, manager, _detector, journal):
+            process = worker.service.process_batch
+            def native(inputs):
+                outcomes = process(inputs)
+                with immediate_session(engine, publish=True) as db:
+                    if mutation == 'source':
+                        db.get(AttendanceCamera, 3).source_revision += 1
+                    else:
+                        db.get(AttendanceRuntime, 1).gallery_revision += 1
+                return outcomes
+            with patch.object(worker.service, 'process_batch', side_effect=native):
+                publish(manager, clock, 3)
+                assert worker.step()
+            idle(journal)
+            assert worker.state.camera(3) is None
+            with Session(engine) as db:
+                assert db.query(HumanVisit).count() == 0
+
+
+def test_body_parent_and_live_binding_exist_only_after_atomic_link_ack():
+    body = Body()
+    with fixture(body=body) as (engine, _attendance, clock, worker, manager, _detector, journal):
+        with journal._condition:
+            publish(manager, clock, 3)
+            worker.step()
+            track = worker.state.camera(3)['tracks'][0]
+            assert track['visit_id'] is None and track['global_id'] is None
+            assert worker.global_manager.snapshot() == []
+            assert body.calls == [1]
+        idle(journal)
+        worker.step()
+        track = worker.state.camera(3)['tracks'][0]
+        with Session(engine) as db:
+            row = db.query(HumanVisit).one()
+            assert track['visit_id'] == row.id and track['global_id'] == row.global_id
+            assert db.get(GlobalPerson, row.global_id) is not None
+            assert row.employee_id is None
+        first_id, first_generation = track['global_id'], worker.state.camera(3)['tracking_generation']
+        clock.advance(.2)
+        manager.get(3).buffer.put(np.full_like(FRAME, 255), stream_id='different-person', source_revision=1,
+                                  received_at=clock.utc, received_mono=clock.mono)
+        with journal._condition:
+            worker.step()
+            assert worker.state.camera(3)['tracks'][0]['global_id'] is None
+        idle(journal)
+        worker.step()
+        second = worker.state.camera(3)
+        assert second['tracking_generation'] != first_generation
+        assert second['tracks'][0]['global_id'] != first_id
+
+
+def test_appearance_mutation_during_native_cannot_create_an_old_source_parent():
+    body = Body()
+    with fixture(body=body) as (engine, _attendance, clock, worker, manager, _detector, journal):
+        def mutate():
+            with immediate_session(engine, publish=True) as db:
+                db.get(AttendanceCamera, 3).source_revision += 1
+        body.mutate = mutate
+        publish(manager, clock, 3)
+        worker.step()
+        idle(journal)
+        with Session(engine) as db:
+            assert db.query(HumanVisit).count() == 1
+            assert db.query(GlobalPerson).count() == 0
+        assert worker.global_manager.snapshot() == []
+
+
+def test_one_due_body_chunk_is_bounded_and_coalesced_across_many_cameras():
+    body = Body()
+    with fixture(body=body) as (engine, _attendance, clock, worker, manager, _detector, journal):
+        for camera_id in range(4, 23):
+            add_camera(engine, manager, camera_id)
+        for camera_id in range(3, 23):
+            publish(manager, clock, camera_id)
+        for _ in range(10):
+            worker.step()
+        idle(journal)
+        worker.step()
+        assert sum(body.calls) == 20 and max(body.calls) <= 16
+        assert len(worker._appearance_pending) == 0
+        with Session(engine) as db:
+            assert db.query(HumanVisit).count() == 20
+            assert all(row.global_id is not None for row in db.query(HumanVisit))
+
+
+def test_saturated_generation_gap_recovers_once_before_new_tracking_admission():
+    with fixture(journal_options={'lifecycle_capacity': 1}) as (
+            engine, attendance, clock, worker, manager, detector, journal):
+        def two_people(frames):
+            return [[(np.array([10., 10., 100., 200.]), .99),
+                     (np.array([300., 100., 400., 300.]), .99)] for _ in frames]
+        with patch.object(detector, 'detect_batch', side_effect=two_people), journal._condition:
+            publish(manager, clock, 3)
+            worker.step()
+            generation = worker._journal_generations[3]
+            assert journal.health_snapshot()['state'] == 'JOURNAL_DEGRADED'
+            assert any('JOURNAL_GAP' in fault.reason_codes for fault in attendance.health.pending_faults())
+        idle(journal)
+        worker.step()
+        assert 3 not in worker._journal_generations
+        with Session(engine) as db:
+            assert db.query(HumanJournalGap).one().tracking_generation == generation
+            assert db.query(HumanVisit).one().end_reason == 'JOURNAL_GAP'
+        clock.advance(.2)
+        publish(manager, clock, 3)
+        worker.step()
+        assert worker._journal_generations[3] != generation
+
+
+def test_monitor_purges_expired_visit_images_even_without_live_ai_worker():
+    with fixture() as (engine, attendance, clock, worker, manager, _detector, journal):
+        publish(manager, clock, 3)
+        worker.step()
+        idle(journal)
+        worker.flush('AI_UNAVAILABLE')
+        idle(journal)
+        clock.advance(31 * 86400)
+        monitor = AttendanceMonitor(attendance, journal=journal, now=clock.utcnow, monotonic=clock.monotonic)
+        monitor.tick()
+        idle(journal)
+        with Session(engine) as db:
+            row = db.query(HumanVisit).one()
+            assert row.snapshot is None and row.images_purged_at is not None
+            assert row.status == 'CLOSED' and row.camera_id == 3
+
+
+def test_completion_age_includes_journal_capture_and_publication_work():
+    with fixture() as (_engine, _attendance, clock, worker, manager, _detector, journal):
+        observe = journal.observe
+        def slow_capture(*args):
+            result = observe(*args)
+            clock.advance(.35)
+            return result
+        with patch.object(journal, 'observe', side_effect=slow_capture):
+            publish(manager, clock, 3)
+            worker.step()
+        metric = worker.inference_snapshot()[3]
+        assert abs(metric['completion_age_seconds'] - .35) < 1e-8
+        assert metric['stage_times_ms']['journal'] >= 350. - 1e-6
+
+
+def test_gallery_or_calibration_commit_hides_cached_identities_before_next_worker_step():
+    for mutation in ('gallery', 'calibration'):
+        with fixture() as (engine, _attendance, clock, worker, manager, _detector, journal):
+            publish(manager, clock, 3)
+            worker.step()
+            request = request_for(worker, manager, journal)
+            with Session(engine) as db:
+                assert cameras.api_camera_detections(3, request, db)['tracks']
+            with immediate_session(engine, publish=True) as db:
+                if mutation == 'gallery':
+                    db.get(AttendanceRuntime, 1).gallery_revision += 1
+                else:
+                    db.get(AttendanceCamera, 3).revision += 1
+            with Session(engine) as db:
+                assert cameras.api_camera_detections(3, request, db)['tracks'] == []
+
+
+def test_crowded_camera_cannot_starve_another_camera_at_crop_capacity():
+    body = Body()
+    with fixture(body=body) as (engine, _attendance, clock, worker, manager, detector, journal):
+        add_camera(engine, manager, 4)
+        def crowded(frames):
+            result = []
+            for frame in frames:
+                boxes = [(np.array([(i%14)*40., (i//14)*35., (i%14)*40.+30., (i//14)*35.+60.]), .99)
+                         for i in range(140)] if frame.mean() < 127 else [(np.array([10.,10.,80.,100.]), .99)]
+                result.append(boxes)
+            return result
+        with patch.object(detector, 'detect_batch', side_effect=crowded):
+            publish(manager, clock, 3)
+            manager.get(4).buffer.put(np.full_like(FRAME, 255), stream_id='quiet-camera', source_revision=1,
+                                      received_at=clock.utc, received_mono=clock.mono)
+            worker.step()
+            assert len(worker._appearance_pending) <= 128 and max(body.calls) <= 16
+            idle(journal)
+            # At most one more bounded chunk before the quiet camera's first
+            # acknowledgement; not 140 crowded-camera embeddings first.
+            worker.step()
+            with Session(engine) as db:
+                quiet = db.query(HumanVisit).filter_by(camera_id=4).one()
+                assert quiet.global_id is not None
+            assert sum(body.calls) <= 32
+
+
+if __name__ == '__main__':
+    import traceback
+    cases = [value for name, value in list(globals().items()) if name.startswith('test_') and callable(value)]
+    failed = 0
+    for case in cases:
+        try:
+            case(); print('PASS', case.__name__)
+        except Exception:
+            failed += 1; traceback.print_exc()
+    print(f'{len(cases)-failed}/{len(cases)} worker journal cases passed')
+    raise SystemExit(bool(failed))

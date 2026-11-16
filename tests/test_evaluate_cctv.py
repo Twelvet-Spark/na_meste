@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from types import SimpleNamespace
 from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
@@ -385,6 +386,128 @@ class MetricsTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+
+class ProductionAccountingTests(unittest.TestCase):
+    def test_unpublished_or_wrong_generation_batch_never_counts_as_analysis(self):
+        metrics = {1: CameraMeasurements(1, 5, False)}
+        accounting = runner.ProductionAccounting(metrics, None, None)
+        packet = SimpleNamespace(stream_id="stream", source_revision=1, seq=7, received_mono=31)
+        outcome = SimpleNamespace(tracking_generation="generation", observed_tracks=[])
+        item = SimpleNamespace(camera_id=1, packet=packet)
+        accounting.batch([item], [outcome], 31.1)
+        self.assertEqual(metrics[1].analyses, [])
+        accounting.published(1, packet, "retired-generation", 31.2)
+        self.assertEqual(metrics[1].analyses, [])
+        accounting.published(1, packet, "generation", 31.4)
+        accounting.published(1, packet, "generation", 31.5)
+        self.assertEqual(metrics[1].analyses, [AnalysisSample(31, 31.1, 31.4)])
+        accounting.batch([item], [outcome], 32)
+        accounting.batch([], [], 33)
+        accounting.published(1, packet, "generation", 33.1)
+        self.assertEqual(len(metrics[1].analyses), 1)
+        accounting.measurement_end = 34
+        accounting.batch([item], [outcome], 33.5)
+        accounting.published(1, packet, "generation", 34.1)
+        self.assertEqual(len(metrics[1].analyses), 1)
+
+    def test_journal_health_keeps_recovered_degradation_and_growth_history(self):
+        accounting = runner.ProductionAccounting({}, None, None)
+        for stamp, state, pending in ((0, "OK", 0), (31, "JOURNAL_DEGRADED", 2),
+                                      (32, "JOURNAL_DEGRADED", 3), (33, "OK", 0)):
+            accounting.health(stamp, dict(state=state, pending_commands=pending,
+                                          pending_updates=0, pending_barriers=0))
+        report = accounting.health_report(34)
+        self.assertEqual(report["degraded_intervals"], [{"started_mono": 31, "ended_mono": 33}])
+        self.assertEqual(report["peak_pending"], 3)
+        self.assertFalse(report["persistent_growth"])
+        for stamp in range(40, 102):
+            accounting.health(stamp, dict(state="OK", pending_commands=stamp,
+                                          pending_updates=0, pending_barriers=0))
+        self.assertTrue(accounting.health_report(102)["persistent_growth"])
+
+    def test_journal_integrity_checks_missing_duplicate_and_unbounded_events(self):
+        import sqlite3
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.executescript("""
+                CREATE TABLE human_visits(id TEXT, camera_id INTEGER, tracking_generation TEXT,
+                    track_id INTEGER, source_revision INTEGER, stream_id TEXT, status TEXT);
+                CREATE TABLE human_visit_events(id TEXT, visit_id TEXT, dedupe_key TEXT,
+                    type TEXT, payload TEXT);
+                CREATE TABLE human_journal_gaps(id TEXT);
+            """)
+            expected = {(1, "generation", 1): dict(source_revision=1, stream_id="stream", event_budget=2)}
+            missing = runner.journal_integrity(db, expected)
+            self.assertEqual(missing["missing_visits"], 1)
+            db.execute("INSERT INTO human_visits VALUES ('visit',1,'generation',1,1,'stream','CLOSED')")
+            for index, kind in enumerate(("FIRST_SEEN", "CLOSED"), 1):
+                db.execute("INSERT INTO human_visit_events VALUES (?,?,?,?,?)",
+                           (str(index), "visit", str(index), kind, json.dumps({"transition_seq": index})))
+            clean = runner.journal_integrity(db, expected)
+            self.assertEqual(clean["status"], "PASS")
+            db.execute("INSERT INTO human_visit_events VALUES ('3','visit','3','LOST','{\"transition_seq\":3}')")
+            self.assertEqual(runner.journal_integrity(db, expected)["unbounded_event_visits"], 1)
+            db.execute("INSERT INTO human_visits VALUES ('duplicate',1,'generation',1,1,'stream','CLOSED')")
+            self.assertEqual(runner.journal_integrity(db, expected)["duplicate_visits"], 1)
+
+    def test_capacity_rejects_loss_degradation_and_unevaluated_concurrency(self):
+        good = {"camera_id": 1, "attendance": True, "analyzed_fps": 10,
+                "p95_completion_age_seconds": .2,
+                "worst_rolling_60s": {"analyzed_fps": 10, "p95_completion_age_seconds": .3}}
+        for fault in ("JOURNAL_LOSS", "JOURNAL_DEGRADED", "OUT_OF_MEMORY", "PERSISTENT_QUEUE_GROWTH"):
+            result = acceptance_gates([good], duration_seconds=900, copies=1,
+                                      gpu_inventory=[], integration_needs=[], runtime_failures=[fault])
+            self.assertEqual(result["capacity"]["status"], "FAIL")
+            self.assertIn(fault, result["capacity"]["failures"])
+        result = acceptance_gates([good], duration_seconds=900, copies=1, gpu_inventory=[],
+                                  integration_needs=["ENROLLMENT_CONCURRENT_LOAD_NOT_EXERCISED"])
+        self.assertEqual(result["capacity"]["status"], "NOT_EVALUATED")
+
+
+class ConcurrentEvidenceTests(unittest.TestCase):
+    def test_face_stage_uses_each_frame_total_not_sum_of_component_percentiles(self):
+        report = runner.stage_timings([
+            {"stage_times_ms": {"face_detection": 2., "face_recognition": 8.}},
+            {"stage_times_ms": {"face_detection": 8., "face_recognition": 2.}}])
+        self.assertEqual(report["face"]["p95_ms"], 10.)
+        self.assertIsNone(report["journal"]["p95_ms"])
+
+    def test_profiles_require_executed_heavy_cuda_nodes_not_provider_registration(self):
+        self.assertEqual(runner.profile_summary([], ["CUDAExecutionProvider"])["status"], "NOT_EVALUATED")
+        events = [dict(cat="Node", args=dict(op_name="Conv", provider="CPUExecutionProvider"))]
+        self.assertEqual(runner.profile_summary(events, ["CUDAExecutionProvider"])["status"], "FAIL")
+        events[0]["args"]["provider"] = "CUDAExecutionProvider"
+        self.assertEqual(runner.profile_summary(events, ["CUDAExecutionProvider"])["status"], "PASS")
+
+    def test_concurrent_impact_excludes_warmup_and_shutdown_work(self):
+        metrics = {1: CameraMeasurements(1, 5, False)}
+        metrics[1].analyses = [AnalysisSample(9, 10, 11), AnalysisSample(30.9, 31, 31.5),
+                               AnalysisSample(33, 33.1, 33.5), AnalysisSample(89, 89.5, 91)]
+        report = runner.concurrent_impact(metrics, [
+            dict(started_mono=10, completed_mono=12), dict(started_mono=31.2, completed_mono=32),
+            dict(started_mono=89, completed_mono=92)], 0, 90)
+        self.assertEqual(report["overlapping_analyses"], 1)
+        self.assertAlmostEqual(report["cameras"][0]["p95_completion_age_seconds"], .6)
+
+    def test_scene_prompts_are_explicit_clip_bound_and_normalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clip = root / "clip.mkv"
+            clip.write_bytes(b"local fixture")
+            source = runner.Clip(clip, "view", 0, None, None)
+            manifest = runner.Manifest(root / "manifest.json", (source,), (), ())
+            probes = {clip: ClipProbe(1920, 1080, 15, 60, "fixture")}
+            path = root / "prompts.json"
+            prompt = dict(clip_path="clip.mkv", source_camera_key="view", time_seconds=20,
+                          kind="floor", positive_points=[[.2, .8]], negative_points=[], box=None)
+            path.write_text(json.dumps(dict(version=1, prompts=[prompt])), encoding="utf-8")
+            result = runner.load_scene_prompts(path, manifest, probes)
+            self.assertEqual(result[0]["clip_path"], clip)
+            for change in (dict(time_seconds=60), dict(positive_points=[[1.1, .5]]),
+                           dict(source_camera_key="unreviewed-view"), dict(kind="automatic-floor")):
+                path.write_text(json.dumps(dict(version=1, prompts=[{**prompt, **change}])), encoding="utf-8")
+                with self.assertRaises(EvaluationError):
+                    runner.load_scene_prompts(path, manifest, probes)
 
 
 class ReplayTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from app.ai.doorway import DoorwayCalibration
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.rtsp.dahua import normalize_host
+from app.scene_geometry import validate_geometry
 
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_BODY_BYTES = MAX_FILE_BYTES + 16 * 1024
@@ -197,17 +198,7 @@ class TransferSceneGeometry(Record):
 
     @model_validator(mode="after")
     def structure(self):
-        polygons = [obj.polygon for obj in self.objects]
-        if self.floor is not None:
-            polygons.append(self.floor)
-        if any(len({tuple(point) for point in polygon}) < 3 for polygon in polygons):
-            raise ValueError("insufficient distinct vertices")
-        if len({obj.id for obj in self.objects}) != len(self.objects):
-            raise ValueError("duplicate object identifier")
-        if self.metric is not None and self.floor is None:
-            raise ValueError("metric without floor")
-        if len(json.dumps(self.model_dump(), ensure_ascii=False, allow_nan=False).encode("utf-8")) > 128 * 1024:
-            raise ValueError("scene too large")
+        validate_geometry(self.model_dump())
         return self
 
 

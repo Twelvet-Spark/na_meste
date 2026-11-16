@@ -1,40 +1,28 @@
-"""Тесты системы глобальных личностей: GlobalIdentityManager + REST API.
+"""Read-only historical global archive and pure matcher isolation regressions.
 
-Запуск (без pytest, только зависимости проекта):
-
-    venv/Scripts/python tests/test_global_persons.py      # Windows
-    venv/bin/python tests/test_global_persons.py          # macOS / Linux
-
-Проверяется:
-- создание identity, межкамерный матч, camera_transition;
-- last_seen_at в БД обновляется (не застревает на моменте создания);
-- employee_id попадает в БД при распознавании уже привязанного трека;
-- событие person_lost при истечении gallery_ttl;
-- неизменяемый архив после перезапуска, отсутствие ручных мутаций;
-- защита исторических связей при удалении камер/сотрудников;
-- API: фильтры списка, аватар, имена камер в переходах, траектория.
+Run: .venv/Scripts/python.exe tests/test_global_persons.py
+Appearance proposal/acknowledgement policy is covered by test_global_proposals.py.
 """
 import sys
-import time
 import traceback
-from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cv2
 import numpy as np
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event, select
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.ai.global_tracker import GlobalIdentityManager
+from app.ai.global_tracker import EmbeddingItem, GlobalIdentityManager
 from app.api import global_persons as api
 from app.database.database import Base
 from app.database import models as db_models  # noqa: F401 — регистрация таблиц
@@ -43,62 +31,74 @@ from app.database.models import (
 )
 from app.time_utils import utcnow
 
-# ------------------------------------------------------------------ стенды
 
-class FakeReID:
-    """Re-ID по расписанию: embed() возвращает заранее заданный вектор."""
-
-    def __init__(self):
-        self.vector = None
-
-    def set_person(self, index: int) -> None:
-        vec = np.zeros(512, dtype=np.float32)
-        vec[index] = 1.0
-        self.vector = vec
-
-    def embed(self, crops):
-        return np.stack([self.vector] * len(crops))
+def archive_vector():
+    vector = np.zeros(512, dtype=np.float32)
+    vector[0] = 1.
+    return vector
 
 
-@dataclass
-class Det:
-    track_id: int
-    employee_id: int = None
-    bbox: tuple = (0.3, 0.2, 0.45, 0.85)
-    global_id: int = None
+def appearance_item(*, camera_id=1, generation=1, now=1., embedding=None):
+    return EmbeddingItem(
+        visit_id=str(uuid5(NAMESPACE_URL, f"archive-test/{camera_id}/{generation}")),
+        camera_id=camera_id,
+        tracking_generation=str(uuid5(NAMESPACE_URL, f"archive-generation/{camera_id}/{generation}")),
+        track_id=1, source_revision=1, stream_id=f"archive-stream-{camera_id}-{generation}",
+        packet_seq=1, observed_at=utcnow(), received_mono=now,
+        bbox=(.3, .2, .45, .85), aspect=3., crop_quality=.9,
+        embedding=archive_vector() if embedding is None else embedding, employee_id=None,
+    )
 
 
-class Outcome:
-    def __init__(self, *dets):
-        self.detections = list(dets)
+def link_ack(proposal, global_id):
+    return SimpleNamespace(
+        kind="LINK_COMMITTED", visit_id=proposal.visit_id, camera_id=proposal.camera_id,
+        tracking_generation=proposal.tracking_generation, track_id=proposal.track_id,
+        source_revision=proposal.source_revision, stream_id=proposal.stream_id,
+        packet_seq=proposal.packet_seq, link_key=proposal.link_key, global_id=global_id,
+        reason=None,
+    )
 
-
-FRAME = np.zeros((720, 1280, 3), dtype=np.uint8)
 
 _engine = create_engine(
-    "sqlite://",
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
+    "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
 )
 SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False)
 
 
-def fresh():
-    """Чистая БД + камеры/сотрудники + менеджер. Возвращает (manager, reid)."""
+def fresh_archive():
+    """Seed legacy read-only history explicitly; the matcher no longer writes it."""
     Base.metadata.drop_all(_engine)
     Base.metadata.create_all(_engine)
+    stamp = utcnow()
+    ok, encoded = cv2.imencode(".jpg", np.zeros((80, 80, 3), dtype=np.uint8))
+    assert ok
+    snapshot = encoded.tobytes()
     with SessionFactory() as db:
         db.add_all([
-            Camera(id=1, name="Камера 1", nvr_host="h", username="u",
-                   password="p", channel=1),
-            Camera(id=2, name="Камера 2", nvr_host="h", username="u",
-                   password="p", channel=2),
+            Camera(id=1, name="Камера 1", nvr_host="h", username="u", password="p", channel=1),
+            Camera(id=2, name="Камера 2", nvr_host="h", username="u", password="p", channel=2),
             Employee(id=7, name="Иван Петров"),
         ])
+        db.flush()
+        db.add_all([
+            GlobalPerson(id=1, status="ACTIVE", last_camera_id=2, last_track_id=3,
+                         created_at=stamp, last_seen_at=stamp + timedelta(seconds=6)),
+            GlobalPerson(id=2, status="NEW", employee_id=7, last_camera_id=2, last_track_id=2,
+                         created_at=stamp + timedelta(seconds=5),
+                         last_seen_at=stamp + timedelta(seconds=5)),
+        ])
+        db.flush()
+        for identifier, global_id, camera_id, track_id, seconds in (
+                (1, 1, 1, 1, 0), (2, 1, 2, 3, 6), (3, 2, 2, 2, 5)):
+            db.add(GlobalObservation(
+                id=identifier, global_id=global_id, camera_id=camera_id, track_id=track_id,
+                embedding=archive_vector().tobytes(), snapshot=snapshot,
+                created_at=stamp + timedelta(seconds=seconds)))
+        db.add(GlobalEvent(
+            global_id=1, camera_id=2, track_id=3, event_type="camera_transition",
+            payload='{"from_camera":1,"to_camera":2}', created_at=stamp + timedelta(seconds=6)))
         db.commit()
-    reid = FakeReID()
-    manager = GlobalIdentityManager(SessionFactory, reid, topology=None)
-    return manager, reid
 
 
 def expect_http(code: int, fn, *args, **kwargs):
@@ -120,99 +120,10 @@ def test(fn):
     return fn
 
 
-@test
-def test_new_identity_and_cross_camera_match():
-    manager, reid = fresh()
-    reid.set_person(0)
-
-    d1 = Det(track_id=1)
-    manager.process(1, Outcome(d1), FRAME, now=0.5)
-    assert d1.global_id == 1, "первый трек должен создать G#1"
-
-    time.sleep(0.01)  # чтобы last_seen_at строго позже created_at
-    d2 = Det(track_id=7)
-    manager.process(2, Outcome(d2), FRAME, now=5.0)
-    assert d2.global_id == 1, "та же внешность на другой камере — тот же global_id"
-
-    reid.set_person(1)  # другой человек
-    d3 = Det(track_id=9)
-    manager.process(1, Outcome(d3), FRAME, now=10.0)
-    assert d3.global_id == 2, "другая внешность — новая identity"
-
-    with SessionFactory() as db:
-        persons = {p.id: p for p in db.query(GlobalPerson).all()}
-        assert set(persons) == {1, 2}
-        p1 = persons[1]
-        assert p1.status == "ACTIVE"          # matched → ACTIVE
-        assert p1.last_camera_id == 2
-        assert p1.last_seen_at > p1.created_at, \
-            "last_seen_at должен обновляться (баг: застревал на создании)"
-        events = db.query(GlobalEvent).filter_by(
-            global_id=1, event_type="camera_transition").all()
-        assert len(events) == 1
-        import json
-        payload = json.loads(events[0].payload)
-        assert payload["from_camera"] == 1 and payload["to_camera"] == 2
-        observations = db.query(GlobalObservation).filter_by(global_id=1).count()
-        assert observations == 2, "по одному наблюдению на привязку трека"
-
-
-@test
-def test_employee_persisted_mid_track():
-    """Сотрудник распознан ПОСЛЕ привязки трека — employee_id должен попасть
-    в global_persons сразу, а не при следующей привязке."""
-    manager, reid = fresh()
-    reid.set_person(2)
-
-    d = Det(track_id=20)
-    manager.process(1, Outcome(d), FRAME, now=20.0)
-    assert d.global_id == 1
-    with SessionFactory() as db:
-        assert db.get(GlobalPerson, 1).employee_id is None
-
-    d2 = Det(track_id=20, employee_id=7)   # тот же трек, распознали лицом
-    manager.process(1, Outcome(d2), FRAME, now=23.5)   # > reid_embedding_interval
-    with SessionFactory() as db:
-        person = db.get(GlobalPerson, 1)
-        assert person.employee_id == 7, \
-            "смена employee_id должна писаться в БД немедленно"
-        assert person.last_seen_at > person.created_at
-
-
-@test
-def test_person_lost_event():
-    manager, reid = fresh()
-    reid.set_person(0)
-    manager.process(1, Outcome(Det(track_id=1)), FRAME, now=0.5)
-
-    manager.sweep(now=10_000.0)   # gallery_ttl=600 давно истёк
-
-    with SessionFactory() as db:
-        person = db.get(GlobalPerson, 1)
-        assert person.status == "LOST"
-        lost = db.query(GlobalEvent).filter_by(
-            global_id=1, event_type="person_lost").all()
-        assert len(lost) == 1, "истечение identity должно писать person_lost"
-        import json
-        payload = json.loads(lost[0].payload)
-        assert payload["last_camera"] == 1
-        assert payload["duration_seconds"] > 0
-    assert 1 not in manager._identities, "identity уходит из памяти"
-
-
-
 
 @test
 def test_list_filters_and_fields():
-    manager, reid = fresh()
-    reid.set_person(0)
-    manager.process(1, Outcome(Det(track_id=1)), FRAME, now=0.5)
-    time.sleep(0.01)
-    reid.set_person(1)
-    manager.process(2, Outcome(Det(track_id=2, employee_id=7)), FRAME, now=5.0)
-    time.sleep(0.01)
-    reid.set_person(0)   # G#1 снова замечен на камере 2 → ACTIVE
-    manager.process(2, Outcome(Det(track_id=3)), FRAME, now=6.0)
+    fresh_archive()
 
     with SessionFactory() as db:
         rows = api.api_list_global_persons(db=db)
@@ -247,9 +158,7 @@ def test_list_filters_and_fields():
 
 @test
 def test_photo_endpoints():
-    manager, reid = fresh()
-    reid.set_person(0)
-    manager.process(1, Outcome(Det(track_id=1)), FRAME, now=0.5)
+    fresh_archive()
     with SessionFactory() as db:
         db.add(GlobalPerson(id=99, status="LOST"))
         db.commit()
@@ -263,11 +172,7 @@ def test_photo_endpoints():
 
 @test
 def test_timeline_names_and_trajectory():
-    manager, reid = fresh()
-    reid.set_person(0)
-    manager.process(1, Outcome(Det(track_id=1)), FRAME, now=0.5)
-    time.sleep(0.01)
-    manager.process(2, Outcome(Det(track_id=2)), FRAME, now=5.0)
+    fresh_archive()
 
     with SessionFactory() as db:
         items = api.api_global_timeline(1, db=db)
@@ -295,8 +200,7 @@ def archived_database():
     from test_attendance_service import database
 
     with database() as (engine, service):
-        reid = FakeReID()
-        reid.set_person(0)
+        vector = archive_vector()
         recent, old = utcnow(), utcnow() - timedelta(days=999)
         with immediate_session(engine) as db:
             for identifier in (11, 12, 13, 14):
@@ -313,10 +217,10 @@ def archived_database():
             db.flush()
             db.add_all([
                 GlobalObservation(id=51, global_id=41, camera_id=12, track_id=8,
-                                  embedding=reid.vector.tobytes(), snapshot=b"archived-photo",
+                                  embedding=vector.tobytes(), snapshot=b"archived-photo",
                                   created_at=recent),
                 GlobalObservation(id=52, global_id=9001, camera_id=12, track_id=9,
-                                  embedding=reid.vector.tobytes(), snapshot=b"old-photo",
+                                  embedding=vector.tobytes(), snapshot=b"old-photo",
                                   created_at=old),
                 GlobalEvent(id=61, global_id=41, camera_id=13, track_id=8,
                             event_type="person_seen", payload='{"score":0.9}', created_at=recent),
@@ -324,7 +228,7 @@ def archived_database():
                             event_type="person_lost", payload='{"duration_seconds":10}',
                             created_at=old),
             ])
-        yield engine, service, reid
+        yield engine, service, vector
 
 
 def archive_rows(engine):
@@ -455,32 +359,34 @@ def test_global_archive_rejects_mutations_and_preserves_gets_and_photos():
 
 
 @test
-def test_restart_freezes_existing_gallery_and_allocates_above_absolute_maximum():
-    with archived_database() as (engine, _service, reid):
+def test_restart_never_loads_archived_vectors_or_allocates_an_integer_id():
+    with archived_database() as (engine, _service, vector):
         before = archive_rows(engine)
-        factory = sessionmaker(bind=engine, expire_on_commit=False)
-        manager = GlobalIdentityManager(factory, reid)
+        manager = GlobalIdentityManager()
         assert manager.snapshot() == [], "Persisted identities are archive, not a live gallery"
-        first = Det(track_id=1, employee_id=2)
-        manager.process(1, Outcome(first), FRAME, now=1.)
-        assert first.global_id == 9002, "Even an ancient maximum ID must not be reused"
-        manager.process(2, Outcome(Det(track_id=2, employee_id=2)), FRAME, now=5.)
-        manager.sweep(now=100_000.)
-        after = archive_rows(engine)
-        for original, current in zip(before, after):
-            assert all(row in current for row in original), "Startup archive changed"
+        value = appearance_item(embedding=vector)
+        proposal = manager.process_embeddings([value])[0]
+        assert proposal.global_id is None and manager.global_id_for(value.visit_id) is None
+        # Stand in only for the persistence boundary: SQLite, not this manager,
+        # allocates the actual parent ID. Full LINKED atomicity has journal tests.
         with Session(engine) as db:
-            live = db.get(GlobalPerson, 9002)
-            assert live.employee_id == 2 and live.last_camera_id == 2
-            assert db.query(GlobalObservation).filter_by(global_id=9002).count() == 2
-        # A second restart freezes this process's rows too, without loading them.
+            parent = GlobalPerson(status="ACTIVE")
+            db.add(parent)
+            db.flush()
+            assigned_id = parent.id
+            db.commit()
+        assert assigned_id == 9002
+        manager.acknowledge(link_ack(proposal, assigned_id))
+        assert manager.global_id_for(value.visit_id) == assigned_id
+        manager.drop_camera(1)
+        manager.sweep(100_000.)
+        for original, current in zip(before, archive_rows(engine)):
+            assert all(row in current for row in original), "Startup archive changed"
         frozen = archive_rows(engine)
-        restarted = GlobalIdentityManager(factory, reid)
-        second = Det(track_id=3)
-        restarted.process(1, Outcome(second), FRAME, now=100_001.)
-        assert second.global_id == 9003
-        for original, current in zip(frozen, archive_rows(engine)):
-            assert all(row in current for row in original)
+        restarted = GlobalIdentityManager()
+        new = restarted.process_embeddings([appearance_item(generation=2, now=100_001.)])[0]
+        assert new.global_id is None and restarted.snapshot() == []
+        assert archive_rows(engine) == frozen
 
 
 @test
@@ -488,9 +394,9 @@ def test_idle_worker_never_retention_purges_persisted_global_archive():
     from app.ai.worker import AIWorker, DetectionState
     from app.rtsp.manager import ReaderManager
 
-    with archived_database() as (engine, attendance, reid):
+    with archived_database() as (engine, attendance, _vector):
         before = archive_rows(engine)
-        manager = GlobalIdentityManager(sessionmaker(bind=engine), reid)
+        manager = GlobalIdentityManager()
         # No readers means no model invocation. Run the real worker maintenance
         # path past multiple hourly intervals, not a direct obsolete cleanup call.
         worker = AIWorker(ReaderManager(), SimpleNamespace(store=SimpleNamespace(revision=7)),
@@ -503,24 +409,27 @@ def test_idle_worker_never_retention_purges_persisted_global_archive():
 
 
 @test
-def test_global_id_seed_database_failure_cannot_fall_back_to_one():
-    with archived_database() as (engine, _service, reid):
+def test_matcher_never_queries_or_mutates_sql_or_invokes_a_model():
+    with archived_database() as (engine, _service, vector):
         before = archive_rows(engine)
 
-        def fail_seed(_conn, _cursor, statement, parameters, _context, _many):
-            if statement.lstrip().upper().startswith("SELECT") and "global_persons" in statement:
-                raise OperationalError(statement, parameters, RuntimeError("seed unavailable"))
+        def forbid_sql(*_args):
+            raise AssertionError("Pure appearance matcher attempted SQL")
 
-        event.listen(engine, "before_cursor_execute", fail_seed)
+        event.listen(engine, "before_cursor_execute", forbid_sql)
         try:
-            try:
-                GlobalIdentityManager(sessionmaker(bind=engine), reid)
-            except (OperationalError, RuntimeError):
-                pass
-            else:
-                raise AssertionError("An unseeded optional manager must not be published")
+            with patch("app.ai.reid.PersonReID.embed",
+                       side_effect=AssertionError("Matcher attempted inference")):
+                manager = GlobalIdentityManager()
+                proposal = manager.process_embeddings([appearance_item(embedding=vector)])[0]
+                assert proposal.global_id is None
+                manager.acknowledge(link_ack(proposal, 8701))
+                assert manager.global_id_for(proposal.visit_id) == 8701
+                manager.drop_camera(1)
+                manager.sweep(100_000.)
+                assert GlobalIdentityManager().snapshot() == []
         finally:
-            event.remove(engine, "before_cursor_execute", fail_seed)
+            event.remove(engine, "before_cursor_execute", forbid_sql)
         assert archive_rows(engine) == before
 
 

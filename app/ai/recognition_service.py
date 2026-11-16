@@ -15,6 +15,7 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 import numpy as np
+from sqlalchemy.orm import Session
 
 from app.ai.face_detector import ALIGNMENT_ID, FaceEngine
 from app.ai.face_quality import FaceQuality, measure_face_quality, quality_reasons
@@ -27,6 +28,7 @@ from app.rtsp.reader import FramePacket
 
 if TYPE_CHECKING:
     from app.ai.detector import PersonDetector
+    from sqlalchemy import Engine
 
 logger = logging.getLogger("app.ai.service")
 _CONFIRMATION_MAX_AGE = 0.75
@@ -79,6 +81,7 @@ class DetectionResult:
     person_score: float = 0.
     fresh_face_evidence: FaceEvidence | None = None
     identity_reason_codes: tuple[str, ...] = ()
+    visit_id: str | None = None
 
 
 @dataclass
@@ -171,9 +174,53 @@ class RecognitionService:
         self._last_packets: dict[int, tuple[int, str, int]] = {}
         self._face_runs: dict[tuple[int, int], _FaceRun] = {}
         self._store_revision = store.revision if store is not None else None
+        self._expected_gallery_revision: int | None = None
+        self._last_gallery_refresh = float("-inf")
         self._face_turn = 0
         self._face_camera_served: dict[int, int] = {}
         self._lock = threading.Lock()
+
+    def set_expected_gallery_revision(self, revision: int) -> None:
+        """Set the durable admission token read by the worker before a batch.
+
+        A committed employee edit invalidates votes even if publishing the new
+        in-memory gallery failed. The worker rechecks the durable token after
+        native inference, under publication_guard, before applying any outcome.
+        """
+        with self._lock:
+            previous = (self._store_revision if self._expected_gallery_revision is None
+                        else self._expected_gallery_revision)
+            self._expected_gallery_revision = revision
+            if revision != previous:
+                for tracker in self._trackers.values():
+                    for track in tracker.tracks:
+                        track.clear_identity()
+                self._face_runs.clear()
+            self._invalidate_gallery()
+
+    def refresh_gallery(self, engine: Engine, *, now: float | None = None) -> bool:
+        """Retry a stale gallery at most once/second, outside publication_guard.
+
+        The inference owner calls this after setting the durable revision and
+        before process_batch. A failed refresh never disables person tracking.
+        """
+        with self._lock:
+            if self.store is None:
+                return False
+            expected = self._expected_gallery_revision
+            if expected is None or self.store.revision == expected:
+                return True
+            now = time.monotonic() if now is None else now
+            if now - self._last_gallery_refresh < 1.:
+                return False
+            self._last_gallery_refresh = now
+            try:
+                with Session(engine) as db:
+                    self.store.refresh(db)
+            except Exception:
+                logger.warning("GALLERY_UNAVAILABLE: durable gallery refresh failed")
+            self._invalidate_gallery()
+            return self.store.revision == expected
 
     def process_batch(self, inputs: list[RecognitionInput]) -> list[FrameOutcome]:
         """One detector call, camera-local observations and one bounded face chunk."""
@@ -389,6 +436,9 @@ class RecognitionService:
             return "FACE_MODEL_UNAVAILABLE"
         if self.store is None:
             return "GALLERY_UNAVAILABLE"
+        if (self._expected_gallery_revision is not None
+                and self.store.revision != self._expected_gallery_revision):
+            return "GALLERY_UNAVAILABLE"
         if (self.faces.model_id != self.store.model_id
                 or self.faces.alignment_id != ALIGNMENT_ID):
             return "FACE_MODEL_MISMATCH"
@@ -396,7 +446,9 @@ class RecognitionService:
 
     def _invalidate_gallery(self) -> None:
         revision = self.store.revision if self.store is not None else None
-        if revision != self._store_revision:
+        if (revision != self._store_revision
+                or (self._expected_gallery_revision is not None
+                    and revision != self._expected_gallery_revision)):
             for camera_id, tracker in self._trackers.items():
                 for track in tracker.tracks:
                     run = self._face_runs.get((camera_id, track.track_id))

@@ -18,6 +18,10 @@
     FACE_MODEL_UNAVAILABLE: 'Модель лиц недоступна; анонимные наблюдения продолжаются.',
     GALLERY_UNAVAILABLE: 'Галерея лиц недоступна; анонимные наблюдения продолжаются.',
     JOURNAL_DEGRADED: 'Есть разрыв сохранения наблюдений. Проверьте доступ к базе и свободное место.',
+    JOURNAL_GAP: 'Потеря непрерывности журнала; восстановление создаёт новое поколение треков.',
+    JOURNAL_WRITE_FAILED: 'Запись журнала недоступна. Принятые команды ожидают восстановления базы.',
+    JOURNAL_CAPACITY_EXCEEDED: 'Достигнута граница журнала; новые наблюдения не считаются сохранёнными.',
+    SCENE_MODEL_UNAVAILABLE: 'ИИ-подсказки сцены недоступны; ручная разметка работает независимо.',
     PERSISTENCE_ERROR: 'Есть ошибка сохранения учёта. Проверьте доступ к базе и свободное место.',
     DIAGNOSTICS_UNAVAILABLE: 'Состояние модуля временно недоступно. Остальные данные показаны независимо.',
     FFMPEG_UNAVAILABLE: 'FFmpeg / ffprobe недоступны. Администратору нужно проверить установку и путь.',
@@ -94,6 +98,21 @@
     const providers = $('debug-providers'); providers.replaceChildren();
     if (view.ai.error_code) row(providers, 'Провайдеры AI', why(view.ai.error_code));
     else for (const [key, names] of Object.entries(view.ai.providers || {})) row(providers, providerNames[key] || key, names.length ? names.join(', ') : 'Не загружен');
+    const models = view.models || {}, migration = models.gallery_migration || {};
+    facts($('debug-models'), [['Модель набора', models.bundle_id], ['Модель лиц', models.face_model_id],
+      ['Состояние файлов моделей', Object.entries(models.component_status || {}).map(([key, state]) => `${key}: ${state}`).join('; ')],
+      ['Галерея текущего запуска', models.gallery_current ? 'Актуальна' : 'Недоступна / устарела'],
+      ['Версия галереи: база / память', `${text(models.gallery_revision)} / ${text(models.loaded_gallery_revision)}`],
+      ['Пригодных / сохранённых образцов', `${text(migration.usable_faces_count)} / ${text(migration.stored_faces_count)}`],
+      ['Пересчитано / нужны новые фото', `${text(migration.faces_reencoded)} / ${text(migration.faces_need_reenrollment)}`]]);
+    const journal = view.journal || {}, scene = view.scene || {};
+    facts($('debug-journal'), [['Журнал людей', journal.state === 'OK' ? 'Сохранение работает' : journal.error_code ? why(journal.error_code) : 'Нет данных'],
+      ['Ожидают команды / обновления / закрытия', `${text(journal.pending_commands)} / ${text(journal.pending_updates)} / ${text(journal.pending_barriers)}`],
+      ['Заблокированные поколения', journal.blocked_generations], ['Активные визиты', journal.active_visits],
+      ['Поток записи', journal.writer_alive ? 'Работает' : 'Недоступен']]);
+    facts($('debug-scene'), [['ИИ-подсказки сцены', scene.model_available ? 'Модель загружена на CPU' : 'Модель недоступна'],
+      ['Последняя задержка подсказки, с', measure(scene.last_inference_seconds)],
+      ['Выполняется / в очереди', `${text(scene.running)} / ${text(scene.queued)}`]]);
     const cameras = $('debug-cameras'); cameras.replaceChildren();
     $('debug-cameras-message').textContent = view.camera_error ? why(view.camera_error) : view.cameras.length ? `${view.cameras.length} камер` : 'Камер пока нет. Добавьте камеру для проверки потоков.';
     for (const camera of view.cameras) {

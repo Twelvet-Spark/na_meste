@@ -178,7 +178,7 @@ def put_camera_calibration(camera_id: int, payload: CalibrationInput, db: Sessio
     engine = db.get_bind().engine
     db.rollback()
     try:
-        with immediate_session(engine) as writer:
+        with immediate_session(engine, publish=True) as writer:
             config = _configuration(writer, camera_id)
             if (config.revision != payload.expected_revision
                     or config.source_revision != payload.expected_source_revision):

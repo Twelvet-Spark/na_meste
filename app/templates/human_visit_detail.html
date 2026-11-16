@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% set active_page = 'global' %}
+
+{% block title %}Наблюдение человека{% endblock %}
+{% block topbar_right %}<span class="muted">Журнал людей · не рабочие часы</span>{% endblock %}
+
+{% block content %}
+  <main class="container wide global-archive attendance-workspace employee-workspace" id="visit-detail" data-visit-id="{{ visit_id }}">
+    <a class="back-link" href="/global#visits">К журналу людей</a>
+    <div class="page-heading">
+      <div><h1>Наблюдение человека</h1><p class="muted">Один трек на одной камере. Неизвестный человек тоже остаётся в журнале.</p></div>
+      <button class="btn" id="visit-refresh" type="button">Обновить данные и изображения</button>
+    </div>
+    <p id="visit-status" class="form-status" role="status" aria-live="polite">Загружаем наблюдение…</p>
+    <section class="panel" aria-labelledby="visit-info-title">
+      <div class="panel-head"><h2 id="visit-info-title">Сведения</h2><span id="visit-state" class="status"></span></div>
+      <dl class="attendance-facts" id="visit-facts"></dl>
+      <p class="archive-notice muted">Наблюдение и внешнее сходство между камерами не являются рабочим временем. Сегментация сцены и образец лица не подтверждают приход или уход. <a href="/presence">Перейти к рабочему времени</a>.</p>
+    </section>
+    <section class="panel" aria-labelledby="visit-images-title">
+      <div class="panel-head"><h2 id="visit-images-title">Сохранённые изображения</h2><span class="muted">После срока хранения остаются только данные</span></div>
+      <div class="attendance-evidence">
+        <figure>
+          <figcaption>Представительный снимок человека</figcaption>
+          <img id="visit-photo" alt="Сохранённый снимок человека" hidden>
+          <p class="muted" id="visit-photo-status">Загружаем…</p>
+        </figure>
+        <figure>
+          <figcaption>Выровненный образец лица</figcaption>
+          <img id="visit-face" alt="Сохранённый образец лица для проверки оператором" hidden>
+          <p class="muted" id="visit-face-status">Загружаем…</p>
+        </figure>
+      </div>
+      <dl class="attendance-facts" id="visit-image-facts"></dl>
+    </section>
+    <section class="panel" aria-labelledby="sample-title" id="sample-panel">
+      <div class="panel-head"><h2 id="sample-title">Добавить проверенный образец сотрудника</h2></div>
+      <p class="archive-notice">Выберите сотрудника только после личной проверки лица на изображении. Образец будет добавлен к существующим фотографиям, а не заменит их. Модель не выбирает сотрудника за вас. Изменение галереи отменяет допуски камер к учёту рабочего времени до повторной проверки.</p>
+      <p id="sample-eligibility" class="form-status" role="status"></p>
+      <p><a id="sample-enrollment" href="/employees">Открыть обычное добавление фотографий сотрудника</a></p>
+      <form id="sample-form" autocomplete="off">
+        <fieldset id="sample-fields" class="plain-fieldset" disabled>
+          <legend class="sr-only">Проверенный образец сотрудника</legend>
+          <label class="field">Сотрудник<select id="sample-employee" required><option value="">Выберите сотрудника вручную</option></select></label>
+          <p id="sample-employee-status" class="field-help muted"></p>
+          <label class="setup-check"><input type="checkbox" id="sample-confirm" required> Я проверил(а), что на показанном образце именно выбранный сотрудник, и разрешаю добавить этот образец.</label>
+          <div class="form-actions">
+            <button class="btn primary" type="submit" id="sample-submit" disabled>Добавить проверенный образец</button>
+            <button class="btn" type="button" id="sample-reconcile" hidden>Загрузить текущую версию сотрудника</button>
+          </div>
+        </fieldset>
+      </form>
+      <p id="sample-status" class="form-status" role="status" aria-live="polite"></p>
+      <button class="btn" type="button" id="sample-retry-employees" hidden>Загрузить список сотрудников</button>
+    </section>
+    <section class="panel" aria-labelledby="visit-events-title">
+      <div class="panel-head"><h2 id="visit-events-title">События наблюдения</h2><span class="muted">Время в UTC</span></div>
+      <p id="visit-events-status" class="form-status" role="status" aria-live="polite"></p>
+      <ol id="visit-events" class="attendance-audit"></ol>
+    </section>
+  </main>
+{% endblock %}
+
+{% block scripts %}<script src="/static/js/human_visit_detail.js"></script>{% endblock %}

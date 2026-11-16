@@ -18,6 +18,7 @@ EDITABLE = (
     "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
+    "journal_image_keep_days",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",

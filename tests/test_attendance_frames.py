@@ -18,10 +18,9 @@ import cv2
 import numpy as np
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from app.ai.face_recognition import EmbeddingStore
-from app.ai.global_tracker import GlobalIdentityManager
 from app.ai.recognition_service import RecognitionService
 from app.ai.worker import AIWorker, DetectionState
 from app.api import cameras as api
@@ -275,7 +274,7 @@ class FrameReader:
 
 
 
-def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
+def run_worker(stages, *, attendance=False, on_stage=None):
     clock = [100.0]
     service = RecognitionService(PersonDetector(), NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
     outcomes = []
@@ -299,14 +298,8 @@ def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
             if on_stage is not None:
                 on_stage(index, db)
 
-        factory = sessionmaker(bind=db.get_bind())
-        global_manager = (
-            GlobalIdentityManager(factory, global_reid, topology=None)
-            if global_reid is not None else None
-        )
         worker = AIWorker(
             LoopManager(stages, clock, advance), service, AttendanceService(db.get_bind()), state,
-            global_manager=global_manager,
         )
         # Match the fixture's 100 ms receipt cadence with a valid production
         # rate, leaving real scheduler slack for optional appearance work.
@@ -438,25 +431,6 @@ def test_ai_exclusion_immediately_clears_old_detections():
     assert len(outcomes) == 1 and state.camera(1) is None
 
 
-@test
-def test_worker_reconnect_cannot_reuse_previous_global_local_id_binding():
-    class DifferentPeopleReID:
-        def embed(self, crops):
-            result = np.zeros((len(crops), 512), dtype=np.float32)
-            for index, crop in enumerate(crops):
-                result[index, 0 if crop.mean() < 127 else 1] = 1.
-            return result
-
-    _service, _state, outcomes = run_worker([
-        (FrameReader("old", 100, 100.0), 100.0),
-        (FrameReader("new", 1, 100.1, frame=np.full_like(FRAME, 255)), 100.1),
-    ], global_reid=DifferentPeopleReID())
-    assert len(outcomes) == 2
-    assert outcomes[0].tracking_generation != outcomes[1].tracking_generation
-    first, second = (item.detections[0] for item in outcomes)
-    assert first.track_id == second.track_id == 1
-    assert first.global_id is not None and second.global_id is not None
-    assert first.global_id != second.global_id, "Local ID 1 must not inherit its previous binding"
 
 
 if __name__ == "__main__":

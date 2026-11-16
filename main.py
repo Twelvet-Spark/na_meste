@@ -10,6 +10,8 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
+from dataclasses import asdict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -20,6 +22,7 @@ from app.ai.face_recognition import EmbeddingStore
 from app.ai.model_bundle import ModelBundle
 from app.ai.providers import provider_label
 from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
+from app.ai.scene_segmenter import SceneSegmenter
 from app.api.attendance import router as attendance_router
 from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
@@ -30,6 +33,7 @@ from app.api.recordings import router as recordings_router
 from app.api.settings import router as settings_router
 from app.api.debug import router as debug_router
 from app.api.setup_transfer import router as setup_transfer_router
+from app.api.scenes import router as scenes_router
 from app.config import BASE_DIR, settings
 from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
@@ -46,6 +50,10 @@ from app.services.settings_service import SettingsService
 from app.services.diagnostics_service import DiagnosticsService, SafeLogFilter
 from app.services.setup_transfer_service import SetupTransferService
 from app.services.gallery_migration import rebuild_gallery
+from app.services.human_journal import HumanJournal
+from app.services.visit_sample_service import VisitSampleService
+from app.services.scene_service import SceneService
+from app.services.scene_assistance import SceneAssistanceService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +97,19 @@ async def lifespan(app: FastAPI):
     app.state.setup_transfer = None
     app.state.diagnostics = DiagnosticsService(app.state, engine, settings)
     app.state.manager = ReaderManager()
+    app.state.scene_service = SceneService(engine, app.state.manager)
+    app.state.scene_segmenter = None
+    app.state.scene_error = None
+    if bundle is not None:
+        try:
+            app.state.scene_segmenter = SceneSegmenter(bundle)
+        except Exception as exc:
+            app.state.scene_error = getattr(exc, "code", "SCENE_MODEL_UNAVAILABLE")
+            logger.error("Scene assistance unavailable: %s", app.state.scene_error)
+    else:
+        app.state.scene_error = "SCENE_MODEL_UNAVAILABLE"
+    app.state.scene_assistance = SceneAssistanceService(
+        app.state.scene_service, app.state.scene_segmenter)
     app.state.recordings = None
     app.state.recording_error = None
     try:
@@ -128,6 +149,9 @@ async def lifespan(app: FastAPI):
     app.state.detection_state = None
     app.state.attendance = AttendanceService(
         engine, notifier=notifier, now=utcnow, model_bundle=bundle)
+    app.state.human_journal = HumanJournal(
+        engine, lost_timeout=settings.track_lost_timeout,
+        image_keep_days=settings.journal_image_keep_days)
     if app.state.face_engine is not None:
         try:
             app.state.gallery_migration = rebuild_gallery(engine, app.state.face_engine)
@@ -143,18 +167,22 @@ async def lifespan(app: FastAPI):
                     provider_label(app.state.face_engine.providers()["recognition"]))
     else:
         app.state.gallery_migration = {"error_code": "FACE_MODEL_UNAVAILABLE"}
+    app.state.visit_sample_service = VisitSampleService(
+        engine, app.state.face_engine, app.state.face_model_id,
+        app.state.enrollment_lock, store=app.state.embedding_store)
     if bundle is not None:
         app.state.setup_transfer = SetupTransferService(
             engine, face_model_id=bundle.face_model_id,
             face_engine=app.state.face_engine, enrollment_semaphore=app.state.enrollment_lock)
-    app.state.attendance.health.set_providers(loaded_providers(enroll=app.state.face_engine))
+    app.state.attendance.health.set_providers(loaded_providers(
+        enroll=app.state.face_engine, scene=app.state.scene_segmenter))
 
     if settings.ai_enabled:
         try:
             worker = build_ai_worker(
                 app.state.manager, app.state.attendance, app.state.embedding_store,
                 bundle=bundle, session_factory=SessionLocal, notifier=notifier,
-                enroll_engine=app.state.face_engine)
+                enroll_engine=app.state.face_engine, journal=app.state.human_journal)
             if worker is not None:
                 worker.start()
                 app.state.ai_worker = worker
@@ -166,6 +194,12 @@ async def lifespan(app: FastAPI):
             app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])
     else:
         logger.info("AI отключён (AI_ENABLED=false)")
+    worker = app.state.ai_worker
+    app.state.attendance.health.set_providers(loaded_providers(
+        detector=worker.service.detector if worker is not None else None,
+        live=worker.service.faces if worker is not None else None,
+        enroll=app.state.face_engine, reid=worker.reid if worker is not None else None,
+        scene=app.state.scene_segmenter))
 
     with SessionLocal() as session:
         saved_sources = [
@@ -180,6 +214,7 @@ async def lifespan(app: FastAPI):
         app.state.attendance,
         write_queue=app.state.ai_worker.write_queue if app.state.ai_worker is not None else None,
         manager=app.state.manager, worker=app.state.ai_worker,
+        journal=app.state.human_journal,
     )
     try:
         app.state.attendance_monitor.startup()
@@ -211,6 +246,12 @@ async def lifespan(app: FastAPI):
         # stop timestamp before stopping readers or notification delivery.
         if app.state.ai_worker is not None:
             app.state.ai_worker.stop()
+        app.state.scene_close_result = asdict(app.state.scene_assistance.close())
+        if not app.state.scene_close_result["closed"]:
+            logger.error("Scene native work unresolved at shutdown: %s", app.state.scene_close_result)
+        app.state.journal_close_result = asdict(app.state.human_journal.close())
+        if not app.state.journal_close_result["drained"]:
+            logger.error("Journal shutdown incomplete: %s", app.state.journal_close_result)
         app.state.attendance_monitor.stop()
         if app.state.telegram is not None:
             app.state.telegram.stop()
@@ -226,6 +267,7 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "app" / "templates")
 
 app.include_router(cameras_router)
+app.include_router(scenes_router)
 app.include_router(employees_router)
 app.include_router(workplaces_router)
 app.include_router(presence_router)
@@ -295,6 +337,14 @@ async def presence_page(request: Request):
 @app.get("/global", include_in_schema=False)
 async def global_persons_page(request: Request):
     return templates.TemplateResponse(request, "global_persons.html", {})
+
+
+@app.get("/global/visits/{visit_id}", include_in_schema=False)
+async def human_visit_page(request: Request, visit_id: UUID):
+    return templates.TemplateResponse(request, "human_visit_detail.html", {
+        "visit_id": str(visit_id),
+        "workplace_utc_offset_minutes": settings.attendance_utc_offset_minutes,
+    }, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/global/{global_id}", include_in_schema=False)

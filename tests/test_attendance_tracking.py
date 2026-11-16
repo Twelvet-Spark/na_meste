@@ -5,18 +5,21 @@ Run: .venv/Scripts/python.exe tests/test_attendance_tracking.py
 import sys
 import tempfile
 import traceback
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from app.ai.face_recognition import EmbeddingStore
-from app.ai.global_tracker import GlobalIdentityManager
-from app.ai.recognition_service import DetectionResult, FrameOutcome, RecognitionInput, RecognitionService
+from app.ai.global_tracker import EmbeddingItem, GlobalIdentityManager
+from app.ai.recognition_service import RecognitionInput, RecognitionService
 from app.ai.tracker import ByteTracker
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import Camera, GlobalEvent, GlobalObservation, GlobalPerson
@@ -205,22 +208,6 @@ def test_recognition_never_displays_cached_employee_after_ambiguous_overlap():
                for item in outcome.track_lifecycle)
 
 
-class ReID:
-    def __init__(self):
-        self.index = 0
-
-    def embed(self, crops):
-        vector = np.zeros(512, dtype=np.float32)
-        vector[self.index] = 1.
-        return np.stack([vector] * len(crops))
-
-
-def outcome(track_id=1):
-    return FrameOutcome(detections=[DetectionResult(
-        track_id=track_id, employee_id=None, employee_name=None, confidence=None,
-        bbox=(.1, .1, .6, .95), state="unknown")])
-
-
 @test
 def test_camera_reset_drops_global_binding_not_persisted_global_history():
     with tempfile.TemporaryDirectory() as directory:
@@ -237,24 +224,58 @@ def test_camera_reset_drops_global_binding_not_persisted_global_history():
                 db.add(Camera(id=1, name="Door", nvr_host="unused", username="u",
                               password="p", channel=1))
                 db.commit()
-            reid = ReID()
-            manager = GlobalIdentityManager(factory, reid, topology=None)
-            first = outcome()
-            manager.process(1, first, FRAME, now=10.)
-            first_id = first.detections[0].global_id
-            assert first_id is not None
-            with factory() as db:
-                counts = (db.query(GlobalPerson).count(), db.query(GlobalObservation).count(),
-                          db.query(GlobalEvent).count())
+                db.add(GlobalPerson(id=41, last_camera_id=1, last_track_id=8, status="LOST"))
+                db.flush()
+                db.add(GlobalObservation(global_id=41, camera_id=1, track_id=8,
+                                         embedding=b"archived-vector", snapshot=b"archived-image"))
+                db.add(GlobalEvent(global_id=41, camera_id=1, track_id=8,
+                                   event_type="person_lost", payload='{"duration_seconds":5}'))
+                db.commit()
+
+            def archive():
+                with engine.connect() as connection:
+                    return tuple(tuple(connection.execute(select(model.__table__)).all())
+                                 for model in (GlobalPerson, GlobalObservation, GlobalEvent))
+
+            before = archive()
+            vector = np.zeros(512, dtype=np.float32)
+            vector[0] = 1.
+            value = EmbeddingItem(
+                visit_id=str(uuid5(NAMESPACE_URL, "tracking-visit/1")),
+                camera_id=1, tracking_generation=str(uuid5(NAMESPACE_URL, "tracking-generation/1")),
+                track_id=1, source_revision=1, stream_id="tracking-stream-1", packet_seq=1,
+                observed_at=STAMP, received_mono=10., bbox=(.1, .1, .6, .95),
+                aspect=2., crop_quality=.9, embedding=vector, employee_id=None,
+            )
+            manager = GlobalIdentityManager()
+            first = manager.process_embeddings([value])[0]
+
+            def acknowledgement(proposal):
+                return SimpleNamespace(
+                    kind="LINK_COMMITTED", visit_id=proposal.visit_id, camera_id=1,
+                    tracking_generation=proposal.tracking_generation, track_id=1,
+                    source_revision=1, stream_id=proposal.stream_id, packet_seq=proposal.packet_seq,
+                    link_key=proposal.link_key, global_id=41, reason=None,
+                )
+
+            manager.acknowledge(acknowledgement(first))
+            assert manager.global_id_for(value.visit_id) == 41
+            old_pending = manager.process_embeddings([
+                replace(value, packet_seq=2, received_mono=10.1)])[0]
             manager.drop_camera(1)
-            assert manager.camera_tracks(1) == []
-            with factory() as db:
-                assert counts == (db.query(GlobalPerson).count(), db.query(GlobalObservation).count(),
-                                  db.query(GlobalEvent).count())
-            reid.index = 1
-            second = outcome()
-            manager.process(1, second, FRAME, now=10.1)
-            assert second.detections[0].global_id != first_id
+            assert manager.camera_tracks(1) == [] and manager.global_id_for(value.visit_id) is None
+            manager.acknowledge(acknowledgement(old_pending))
+            assert manager.global_id_for(value.visit_id) is None
+            vector = np.zeros(512, dtype=np.float32)
+            vector[1] = 1.
+            new_generation = replace(
+                value, visit_id=str(uuid5(NAMESPACE_URL, "tracking-visit/2")),
+                tracking_generation=str(uuid5(NAMESPACE_URL, "tracking-generation/2")),
+                stream_id="tracking-stream-2", received_mono=10.2, embedding=vector)
+            second = manager.process_embeddings([new_generation])[0]
+            assert second.global_id is None, "A recycled local track ID does not inherit a binding"
+            assert manager.global_id_for(new_generation.visit_id) is None
+            assert archive() == before, "Dropping local generations never mutates persisted history"
         finally:
             engine.dispose()
 
