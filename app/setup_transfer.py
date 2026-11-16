@@ -14,6 +14,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from PIL import Image
+from app.ai.doorway import DoorwayCalibration
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.rtsp.dahua import normalize_host
@@ -91,12 +92,8 @@ class CalibrationRecord(Record):
         if any(v is not None for v in values):
             if any(v is None for v in values):
                 raise ValueError("incomplete geometry")
-            if any(len(p) != 2 or any(not 0 <= v <= 1 for v in p) for p in points):
-                raise ValueError("invalid coordinates")
-            a, b, c = points
-            cross = (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
-            if a == b or abs(cross) < 1e-9:
-                raise ValueError("degenerate geometry")
+            DoorwayCalibration(self.camera_id, self.role or "ENTRY", 0, 1,
+                               *points, self.reference_width, self.reference_height)
         return self
 
 

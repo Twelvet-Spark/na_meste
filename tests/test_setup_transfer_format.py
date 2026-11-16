@@ -114,6 +114,8 @@ def malformed_links_geometry_and_fields_are_rejected():
         lambda d: d["workplaces"].append({"id": 10, "name": "МОСКВА", "active": True}),
         lambda d: d["cameras"][0].update(id=True),
         lambda d: d["cameras"][0].update(nvr_host="http://bad/path"),
+        lambda d: d["calibrations"][0].update(line_end=[0.201, 0.3]),
+        lambda d: d["calibrations"][0].update(inside_point=[0.5, 0.301]),
         lambda d: d["cameras"][0].update(channel=65),
         lambda d: d["archives"][0].update(utc_offset_minutes=841),
         lambda d: d["calibrations"][0].update(line_start=[float("nan"), 0]),

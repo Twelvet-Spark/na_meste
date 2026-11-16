@@ -1,4 +1,8 @@
 """Мониторинг камер Dahua (RTSP) и присутствия сотрудников (AI).
+from app.api.setup_transfer import router as setup_transfer_router
+from app.services.setup_transfer_service import SetupTransferService
+    app.state.setup_transfer = SetupTransferService(engine, embedding_model=settings.insightface_model)
+app.include_router(setup_transfer_router)
 
 Запуск:
     python main.py
