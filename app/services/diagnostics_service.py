@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
+from app.services.attendance_health import PROVIDER_KEYS
+
 SAFE_CODES = frozenset({
     "OPERATOR_SETTINGS_SAVED", "OPERATOR_EVENT", "RUNTIME_WARNING", "UNEXPECTED_ERROR",
     "DIAGNOSTICS_UNAVAILABLE", "STREAM_UNAVAILABLE", "FFMPEG_UNAVAILABLE", "LIBX264_UNAVAILABLE",
@@ -28,15 +30,20 @@ SAFE_CODES = frozenset({
     "PLAYBACK_FAILED", "PLAYBACK_TIMEOUT", "PLAYBACK_PARTIAL", "PLAYBACK_EXPIRED", "PLAYBACK_CANCELLED",
     "NO_RECORDING_AT_TIME", "RECORDING_UNAVAILABLE", "RECORDING_STOPPED", "RECORDING_ALREADY_ACTIVE",
     "CONNECTING", "CONNECTION_LOST", "NO_PROGRESS", "ENCODER_FAILED", "PARTIAL_OUTPUT",
+    "MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID",
+    "FACE_MODEL_UNAVAILABLE", "GALLERY_UNAVAILABLE", "GALLERY_CHANGED",
+    "JOURNAL_DEGRADED", "CAPACITY_DEGRADED", "DECODE_SOFTWARE_FALLBACK",
+    "SCENE_MODEL_UNAVAILABLE", "ENROLLMENT_BUSY", "LEGACY_MODEL_SETTINGS_IGNORED",
 })
-PROVIDER_KEYS = ("yolo", "live_face_detection", "live_face_recognition",
-                 "enroll_face_detection", "enroll_face_recognition", "reid")
 PROVIDERS = frozenset({"CPUExecutionProvider", "CUDAExecutionProvider", "TensorrtExecutionProvider",
                       "DmlExecutionProvider", "OpenVINOExecutionProvider", "CoreMLExecutionProvider"})
 CAMERA_STATES = frozenset({"ONLINE", "OFFLINE", "CONNECTING", "RECONNECTING", "ERROR"})
 SESSION_STATES = frozenset({"STARTING", "RECORDING", "RECONNECTING", "STOPPING", "STOPPED",
                             "COMPLETED", "FAILED", "INTERRUPTED"})
 PLAYBACK_STATES = frozenset({"PREPARING", "READY", "ENDED", "FAILED", "CANCELLED", "EXPIRED"})
+MODEL_COMPONENTS = ("person", "face_detection", "face_recognition", "body", "scene")
+MODEL_STATUSES = frozenset({"READY", "MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID"})
+LEGACY_MODEL_SETTINGS = ("YOLO_MODEL", "INSIGHTFACE_MODEL", "INSIGHTFACE_ROOT", "REID_MODEL")
 _URL = re.compile(r"\b(?:rtsp|rtsps|https?)://[^\s<>\"']+", re.IGNORECASE)
 _HEADERS = re.compile(r"\b(?:authorization|proxy-authorization|cookie|set-cookie)[\"']?\s*[:=][^\r\n]*", re.IGNORECASE)
 _CREDENTIAL = re.compile(r"\b(?:token|password|passwd|secret|telegram_bot_token)[\"']?\s*[:=][^\r\n]*", re.IGNORECASE)
@@ -95,6 +102,10 @@ def provider_summary(value):
     return {key: [item for item in value.get(key, ()) if type(item) is str and item in PROVIDERS]
             if isinstance(value.get(key, ()), (list, tuple)) else [] for key in PROVIDER_KEYS}
 
+
+
+def model_identifier(value):
+    return value if type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) else None
 
 # Keep logging's standard metadata, not arbitrary request/header/body extras.
 # In particular, color_message and cached message are independent rendering paths.
@@ -241,6 +252,49 @@ class DiagnosticsService:
                 "pending_write_count": number(health.get("pending_write_count"), integer=True),
                 "providers": provider_summary(health.get("providers")), "error_code": None}
 
+    def _models(self):
+        """Project startup state only: no paths, provenance URLs or biometrics."""
+        bundle = getattr(self.state, "model_bundle", None)
+        statuses = getattr(bundle, "component_status", {}) if bundle is not None else {}
+        statuses = statuses if type(statuses) is dict else {}
+        components = {}
+        for component in MODEL_COMPONENTS:
+            status = statuses.get(component)
+            components[component] = (status if type(status) is str and status in MODEL_STATUSES
+                                     else "MODEL_MISSING" if bundle is None else "MODEL_CONTRACT_INVALID")
+        raw_migration = getattr(self.state, "gallery_migration", None)
+        migration = None
+        if type(raw_migration) is dict:
+            migration = {
+                key: number(raw_migration.get(key), integer=True) for key in (
+                    "stored_faces_count", "usable_faces_count", "faces_reencoded", "faces_need_reenrollment",
+                )
+            }
+            remediation = raw_migration.get("employees_needing_photos")
+            migration.update(
+                face_model_id=model_identifier(raw_migration.get("face_model_id")),
+                alignment_id=("arcface-5pt-112-v1"
+                              if raw_migration.get("alignment_id") == "arcface-5pt-112-v1" else None),
+                employees_needing_photos_count=len(remediation) if type(remediation) in (list, tuple) else None,
+                error_code=(safe_code(raw_migration["error_code"], "GALLERY_UNAVAILABLE")
+                            if raw_migration.get("error_code") else None),
+            )
+        ignored = getattr(self.state, "legacy_model_settings_ignored", ())
+        ignored = ignored if type(ignored) in (tuple, list) else ()
+        ignored = [name for name in LEGACY_MODEL_SETTINGS if name in ignored]
+        return {
+            "bundle_id": model_identifier(getattr(bundle, "bundle_id", None)),
+            "face_model_id": model_identifier(getattr(bundle, "face_model_id", None)),
+            "alignment_id": ("arcface-5pt-112-v1"
+                             if getattr(bundle, "alignment_id", None) == "arcface-5pt-112-v1" else None),
+            "component_status": components,
+            "error_code": next((components[key] for key in MODEL_COMPONENTS[:3]
+                                if components[key] != "READY"), None),
+            "gallery_migration": migration,
+            "legacy_model_settings_ignored": ignored,
+            "legacy_model_settings_code": "LEGACY_MODEL_SETTINGS_IGNORED" if ignored else None,
+        }
+
     def _cameras(self):
         from sqlalchemy.orm import Session
         from app.database.models import Camera
@@ -332,6 +386,9 @@ class DiagnosticsService:
                 "tools": self._isolated(tools, {"ffmpeg_available": False, "ffprobe_available": False}),
                 "ai": {"enabled": self.active.ai_enabled, "providers": attendance["providers"],
                        "error_code": attendance.get("error_code")},
+                "models": self._isolated(self._models, {"bundle_id": None, "face_model_id": None,
+                    "alignment_id": None, "component_status": {}, "gallery_migration": None,
+                    "legacy_model_settings_ignored": [], "legacy_model_settings_code": None}),
                 "attendance": attendance, "cameras": cameras, "camera_error": camera_error,
                 "recordings": self._isolated(self._recordings, {"sessions": [], "storage": None}),
                 "processes": self._isolated(self._processes, {"recorders": [], "playbacks": []}), "archive": archive}

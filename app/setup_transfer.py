@@ -1,21 +1,17 @@
 """Versioned, authenticated setup transfer; never SQL, pickle, archives or video."""
 import base64
 import binascii
-import io
 import json
 import os
-import warnings
+from uuid import UUID
 from datetime import datetime
 from typing import Annotated, Literal
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from PIL import Image
 from app.ai.doorway import DoorwayCalibration
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-import numpy as np
-from app.ai.face_recognition import normalized_embedding
 
 from app.rtsp.dahua import normalize_host
 
@@ -25,6 +21,11 @@ HEADER = b"NMSETUP\x00\x01"
 OVERHEAD = 8 + 1 + 16 + 12 + 16
 ID = Annotated[int, Field(strict=True, ge=1, le=2**53-1)]
 Port = Annotated[int, Field(strict=True, ge=1, le=65535)]
+FaceModelID = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
+ALIGNMENT_ID = "arcface-5pt-112-v1"
+Coordinate = Annotated[float, Field(ge=0, le=1)]
+Point = Annotated[list[Coordinate], Field(min_length=2, max_length=2)]
+Polygon = Annotated[list[Point], Field(min_length=3, max_length=128)]
 
 
 class TransferError(Exception):
@@ -121,7 +122,7 @@ class EmployeeRecord(DatedRecord):
     _updated = field_validator("updated_at")(_date)
 
 
-class FaceRecord(DatedRecord):
+class LegacyFaceRecord(DatedRecord):
     id: ID
     employee_id: ID
     embedding: str = Field(repr=False, min_length=2732, max_length=2732)
@@ -133,10 +134,8 @@ class FaceRecord(DatedRecord):
         raw = decode_binary(value)
         if len(raw) != 2048:
             raise ValueError("invalid embedding")
-        with np.errstate(over="ignore", invalid="ignore"):
-            usable = normalized_embedding(np.frombuffer(raw, dtype="<f4"))
-        if usable is None:
-            raise ValueError("invalid embedding")
+        # Shape/encoding is a wire constraint; validity in the destination vector
+        # space is decided during preparation, never inferred from legacy bytes.
         return value
 
     @field_validator("thumbnail")
@@ -147,18 +146,76 @@ class FaceRecord(DatedRecord):
         raw = decode_binary(value)
         if len(raw) > 1024*1024:
             raise ValueError("image too large")
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(raw)) as image:
-                    if image.format not in {"JPEG", "PNG"} or image.width*image.height > 1_000_000 or getattr(image, "is_animated", False):
-                        raise ValueError("invalid image")
-                    image.verify()
-                with Image.open(io.BytesIO(raw)) as image:
-                    image.load()
-        except Exception:
-            raise ValueError("invalid image") from None
+        # Unusable legacy thumbnails are retained as bounded opaque bytes. Only the
+        # shared aligned-JPEG preparation helper may turn them into usable samples.
         return value
+
+
+class FaceRecord(LegacyFaceRecord):
+    face_model_id: FaceModelID | None
+    alignment_id: str | None = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def provenance(self):
+        if (self.face_model_id is None) != (self.alignment_id is None):
+            raise ValueError("incomplete provenance")
+        return self
+
+
+class SceneObjectRecord(Record):
+    id: str = Field(min_length=36, max_length=36)
+    label: str = Field(min_length=1, max_length=80)
+    polygon: Polygon
+
+    @field_validator("id")
+    @classmethod
+    def object_id(cls, value):
+        if str(UUID(value)) != value:
+            raise ValueError("invalid object identifier")
+        return value
+
+
+class SceneMetricRecord(Record):
+    corners: list[Point] = Field(min_length=4, max_length=4)
+    width_m: float = Field(gt=0, le=1000)
+    depth_m: float = Field(gt=0, le=1000)
+
+    @field_validator("corners")
+    @classmethod
+    def distinct_corners(cls, value):
+        if len({tuple(point) for point in value}) != 4:
+            raise ValueError("duplicate metric corner")
+        return value
+
+
+class TransferSceneGeometry(Record):
+    """Transfer's bounded wire contract; geometric authority is app.scene_geometry."""
+    version: Annotated[int, Field(strict=True, ge=1, le=1)]
+    floor: Polygon | None
+    objects: list[SceneObjectRecord] = Field(max_length=32)
+    metric: SceneMetricRecord | None
+
+    @model_validator(mode="after")
+    def structure(self):
+        polygons = [obj.polygon for obj in self.objects]
+        if self.floor is not None:
+            polygons.append(self.floor)
+        if any(len({tuple(point) for point in polygon}) < 3 for polygon in polygons):
+            raise ValueError("insufficient distinct vertices")
+        if len({obj.id for obj in self.objects}) != len(self.objects):
+            raise ValueError("duplicate object identifier")
+        if self.metric is not None and self.floor is None:
+            raise ValueError("metric without floor")
+        if len(json.dumps(self.model_dump(), ensure_ascii=False, allow_nan=False).encode("utf-8")) > 128 * 1024:
+            raise ValueError("scene too large")
+        return self
+
+
+class SceneRecord(Record):
+    camera_id: ID
+    reference_width: int = Field(gt=0)
+    reference_height: int = Field(gt=0)
+    geometry: TransferSceneGeometry
 
 
 class AssignmentRecord(Record):
@@ -172,21 +229,19 @@ class TransferCounts(Record):
     employees: int
     faces: int
     assignments: int
+    scenes: int
 
 
-class SetupDocument(Record):
-    transfer_version: Literal[1]
+class _SetupRecords(Record):
     exported_at: str
     attendance_schema_version: Literal[1]
-    operator_schema_version: Literal[3]
-    embedding_model: str = Field(min_length=1, max_length=100)
     embedding_encoding: Literal["float32-le-512"]
     cameras: list[CameraRecord] = Field(max_length=10000)
     archives: list[ArchiveRecord] = Field(max_length=10000)
     calibrations: list[CalibrationRecord] = Field(max_length=10000)
     workplaces: list[WorkplaceRecord] = Field(max_length=10000)
     employees: list[EmployeeRecord] = Field(max_length=10000)
-    faces: list[FaceRecord] = Field(max_length=150000, repr=False)
+    faces: list[LegacyFaceRecord] = Field(max_length=150000, repr=False)
     assignments: list[AssignmentRecord] = Field(max_length=100000)
     _export_date = field_validator("exported_at")(_date)
 
@@ -201,7 +256,7 @@ class SetupDocument(Record):
         employees = unique(self.employees, "id")
         workplaces = unique(self.workplaces, "id")
         unique(self.faces, "id")
-        for rows in (self.archives, self.calibrations):
+        for rows in (self.archives, self.calibrations, getattr(self, "scenes", [])):
             if not unique(rows, "camera_id") <= cameras:
                 raise ValueError("missing camera")
         if any(r.employee_id not in employees for r in self.faces):
@@ -214,7 +269,25 @@ class SetupDocument(Record):
         return self
 
     def counts(self) -> TransferCounts:
-        return TransferCounts(**{key: len(getattr(self, key)) for key in TransferCounts.model_fields})
+        return TransferCounts(**{key: len(getattr(self, key, [])) for key in TransferCounts.model_fields})
+
+
+class LegacySetupDocument(_SetupRecords):
+    """Authenticated v1 data only; its package name never selects a runtime model."""
+    transfer_version: Literal[1]
+    operator_schema_version: Literal[3]
+    embedding_model: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+class SetupDocument(_SetupRecords):
+    transfer_version: Literal[2]
+    operator_schema_version: Literal[4]
+    face_model_id: FaceModelID
+    faces: list[FaceRecord] = Field(max_length=150000, repr=False)
+    scenes: list[SceneRecord] = Field(max_length=10000)
+
+
+TransferDocument = SetupDocument | LegacySetupDocument
 
 
 def decode_binary(value: str) -> bytes:
@@ -241,7 +314,7 @@ def _bounded_json(payload: bytes):
     # the syntax/UTF-8 authority, including escapes and duplicate keys.
     limits = {"cameras": 10000, "archives": 10000, "calibrations": 10000,
               "workplaces": 10000, "employees": 10000, "faces": 150000,
-              "assignments": 100000}
+              "assignments": 100000, "scenes": 10000}
     stack = []  # kind, item/member count, awaiting array item, maximum
     quoted = escaped = False
     start = 0
@@ -293,16 +366,26 @@ def _bounded_json(payload: bytes):
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
 
 
-def validate_document(payload: bytes, *, expected_model: str) -> SetupDocument:
+def validate_document(payload: bytes, *, expected_face_model_id: str | None = None) -> TransferDocument:
     try:
         raw = _bounded_json(payload)
-        if isinstance(raw, dict) and any(raw.get(k) != v for k, v in (
-            ("transfer_version", 1), ("attendance_schema_version", 1),
-            ("operator_schema_version", 3), ("embedding_encoding", "float32-le-512"))):
+        if not isinstance(raw, dict):
+            raise TransferError("TRANSFER_INVALID")
+        version = raw.get("transfer_version")
+        schema_version = {1: 3, 2: 4}.get(version) if type(version) is int else None
+        if schema_version is None or any(type(raw.get(k)) is not type(v) or raw.get(k) != v for k, v in (
+            ("attendance_schema_version", 1), ("operator_schema_version", schema_version),
+            ("embedding_encoding", "float32-le-512"))):
             raise TransferError("TRANSFER_INCOMPATIBLE")
-        result = SetupDocument.model_validate(raw)
-        if result.embedding_model != expected_model:
-            raise TransferError("TRANSFER_MODEL_MISMATCH")
+        model = SetupDocument if version == 2 else LegacySetupDocument
+        result = model.model_validate(raw)
+        if version == 2 and expected_face_model_id is not None:
+            if result.face_model_id != expected_face_model_id or any(
+                face.face_model_id is not None and (
+                    face.face_model_id != expected_face_model_id or face.alignment_id != ALIGNMENT_ID
+                ) for face in result.faces
+            ):
+                raise TransferError("TRANSFER_MODEL_MISMATCH")
         return result
     except TransferError:
         raise
@@ -317,7 +400,7 @@ def _key(password: str, salt: bytes) -> bytes:
     return Scrypt(salt=salt, length=32, n=32768, r=8, p=1).derive(raw)
 
 
-def encode_transfer(document: SetupDocument, password: str) -> bytes:
+def encode_transfer(document: TransferDocument, password: str) -> bytes:
     # iterencode avoids constructing an over-limit serialized string before checking.
     output = bytearray()
     for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(document.model_dump()):
@@ -326,13 +409,13 @@ def encode_transfer(document: SetupDocument, password: str) -> bytes:
             raise TransferError("TRANSFER_TOO_LARGE", 413)
         output.extend(encoded)
     # Models may have been constructed unsafely by a caller; the export must still validate.
-    validate_document(output, expected_model=document.embedding_model)
+    validate_document(output)
     salt, nonce = os.urandom(16), os.urandom(12)
     header = HEADER + salt + nonce
     return header + AESGCM(_key(password, salt)).encrypt(nonce, bytes(output), header)
 
 
-def decode_transfer(blob: bytes, password: str, *, expected_model: str) -> SetupDocument:
+def decode_transfer(blob: bytes, password: str, *, expected_face_model_id: str | None = None) -> TransferDocument:
     if len(blob) > MAX_FILE_BYTES:
         raise TransferError("TRANSFER_TOO_LARGE", 413)
     if len(blob) < OVERHEAD or blob[:8] != HEADER[:8]:
@@ -343,4 +426,4 @@ def decode_transfer(blob: bytes, password: str, *, expected_model: str) -> Setup
         plaintext = AESGCM(_key(password, blob[9:25])).decrypt(blob[25:37], blob[37:], blob[:37])
     except InvalidTag:
         raise TransferError("TRANSFER_PASSWORD_OR_FILE_INVALID") from None
-    return validate_document(plaintext, expected_model=expected_model)
+    return validate_document(plaintext, expected_face_model_id=expected_face_model_id)

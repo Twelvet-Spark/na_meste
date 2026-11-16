@@ -2,18 +2,25 @@
 import base64
 import hashlib
 import json
+import re
 import threading
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
+import numpy as np
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
+from app.ai.face_recognition import is_normalized_embedding
 
 from app.database import attendance_schema, operator_schema
 from app.database.database import immediate_session
-from app.database.models import (AttendanceCamera, AttendanceRuntime, Camera, CameraArchive,
-                                 Employee, EmployeeFace, EmployeeWorkplace, OperatorRequest, Workplace)
-from app.setup_transfer import (MAX_FILE_BYTES, SetupDocument, TransferError, decode_binary,
+from app.database.models import (AttendanceCamera, AttendanceRuntime, Camera, CameraArchive, CameraScene,
+                                 Employee, EmployeeFace, EmployeeWorkplace, FaceModelMetadata,
+                                 OperatorRequest, Workplace)
+from app.services.gallery_migration import reembed_aligned_thumbnails
+from app.setup_transfer import (ALIGNMENT_ID, MAX_FILE_BYTES, TransferError, decode_binary,
                                 decode_transfer, encode_transfer, validate_document)
 
 # Explicit projection: adding a database column cannot silently expand the export.
@@ -23,8 +30,9 @@ PROJECTIONS = {
     "calibrations": (AttendanceCamera, ("camera_id", "role", "line_start", "line_end", "inside_point", "reference_width", "reference_height"), 10000),
     "workplaces": (Workplace, ("id", "name", "active"), 10000),
     "employees": (Employee, ("id", "name", "first_name", "last_name", "external_id", "active", "created_at", "updated_at"), 10000),
-    "faces": (EmployeeFace, ("id", "employee_id", "embedding", "thumbnail", "created_at"), 150000),
+    "faces": (EmployeeFace, ("id", "employee_id", "embedding", "thumbnail", "created_at", "face_model_id", "alignment_id"), 150000),
     "assignments": (EmployeeWorkplace, ("employee_id", "workplace_id"), 100000),
+    "scenes": (CameraScene, ("camera_id", "reference_width", "reference_height", "geometry"), 10000),
 }
 
 
@@ -46,7 +54,7 @@ def _dates(record):
 
 def _schema(connection):
     try:
-        if not attendance_schema._preflight(connection) or operator_schema.preflight(connection) != 3:
+        if not attendance_schema._preflight(connection) or operator_schema.preflight(connection) != 4:
             raise TransferError("TRANSFER_INCOMPATIBLE")
     except TransferError:
         raise
@@ -65,7 +73,7 @@ def _empty(connection):
     return True
 
 
-def _warnings(document):
+def _warnings(document, preparation):
     warnings = ["TRANSFER_NO_HISTORY_OR_VIDEO", "TRANSFER_RECOMMISSION_REQUIRED"]
     counts = {}
     for face in document.faces:
@@ -74,14 +82,95 @@ def _warnings(document):
         warnings.append("TRANSFER_LEGACY_REMEDIATION")
     if any(face.thumbnail is None for face in document.faces):
         warnings.append("TRANSFER_MISSING_THUMBNAILS")
+    if preparation["faces_need_reenrollment"]:
+        warnings.append("TRANSFER_FACES_NEED_REENROLLMENT")
+    if preparation["scenes_need_review"]:
+        warnings.append("TRANSFER_SCENES_NEED_REVIEW")
     return warnings
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedTransferFace:
+    embedding: bytes
+    thumbnail: bytes | None
+    model_id: str | None
+    alignment_id: str | None
+
+
+
+
+@contextmanager
+def _enrollment_slot(semaphore):
+    if semaphore is not None and not semaphore.acquire(blocking=False):
+        raise TransferError("ENROLLMENT_BUSY", 503)
+    try:
+        yield
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+def _receipt(db, request_id, digest):
+    prior = db.get(OperatorRequest, str(request_id))
+    if prior is None:
+        return None
+    if prior.operation != "setup.import" or prior.payload_sha256 != digest:
+        raise TransferError("TRANSFER_REQUEST_CONFLICT", 409)
+    return dict(prior.result)
+
+
 class SetupTransferService:
-    def __init__(self, engine, *, embedding_model: str):
-        self.engine, self.embedding_model = engine, embedding_model
+    def __init__(self, engine, *, face_model_id: str, face_engine=None, enrollment_semaphore=None):
+        if not isinstance(face_model_id, str) or re.fullmatch(r"[0-9a-f]{64}", face_model_id) is None:
+            raise TransferError("TRANSFER_MODEL_UNAVAILABLE", 503)
+        self.engine, self.face_model_id = engine, face_model_id
+        self.face_engine = face_engine
+        self.enrollment_semaphore = enrollment_semaphore
         self.restart_required = False
         self.operation_lock = threading.Lock()
+
+    def _prepare_faces(self, document):
+        """One preview/commit path; no writer transaction may surround inference."""
+        prepared, needing = [], []
+        for index, row in enumerate(document.faces):
+            embedding = decode_binary(row.embedding)
+            thumbnail = decode_binary(row.thumbnail) if row.thumbnail is not None else None
+            proven = (getattr(row, "face_model_id", None) == self.face_model_id
+                      and getattr(row, "alignment_id", None) == ALIGNMENT_ID
+                      and is_normalized_embedding(np.frombuffer(embedding, dtype="<f4")))
+            prepared.append(_PreparedTransferFace(
+                embedding, thumbnail, self.face_model_id if proven else None, ALIGNMENT_ID if proven else None))
+            if not proven:
+                needing.append(index)
+        reencoded = 0
+        if needing:
+            engine = self.face_engine
+            if (engine is not None and (engine.model_id != self.face_model_id
+                                       or engine.alignment_id != ALIGNMENT_ID)):
+                engine = None
+            # No model/lease is needed to retain bytes that cannot be embedded.
+            # The shared helper rejects missing engines only after finding a
+            # valid aligned JPEG, before any model execution.
+            lease = (_enrollment_slot(self.enrollment_semaphore) if engine is not None else nullcontext())
+            with lease:
+                try:
+                    vectors = reembed_aligned_thumbnails(
+                        engine, [prepared[index].thumbnail for index in needing])
+                    if len(vectors) != len(needing):
+                        raise ValueError("invalid preparation result")
+                    for index, vector in zip(needing, vectors):
+                        if vector is None:
+                            continue
+                        if not is_normalized_embedding(vector):
+                            raise ValueError("invalid prepared embedding")
+                        prepared[index] = _PreparedTransferFace(
+                            np.asarray(vector, dtype="<f4").tobytes(), prepared[index].thumbnail,
+                            self.face_model_id, ALIGNMENT_ID)
+                        reencoded += 1
+                except Exception:
+                    raise TransferError("TRANSFER_MODEL_UNAVAILABLE", 503) from None
+        return prepared, {"faces_reencoded": reencoded, "faces_need_reenrollment": len(needing) - reencoded,
+                          "scenes_need_review": len(getattr(document, "scenes", []))}
 
     def status(self) -> dict:
         try:
@@ -98,9 +187,9 @@ class SetupTransferService:
 
     def export(self, password: str) -> bytes:
         try:
-            payload = {"transfer_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(),
-                       "attendance_schema_version": 1, "operator_schema_version": 3,
-                       "embedding_model": self.embedding_model, "embedding_encoding": "float32-le-512"}
+            payload = {"transfer_version": 2, "exported_at": datetime.now(timezone.utc).isoformat(),
+                       "attendance_schema_version": 1, "operator_schema_version": 4,
+                       "face_model_id": self.face_model_id, "embedding_encoding": "float32-le-512"}
             budget = 0
             with self.engine.connect() as connection:
                 connection.exec_driver_sql("BEGIN")
@@ -108,7 +197,15 @@ class SetupTransferService:
                 for key, (model, names, maximum) in PROJECTIONS.items():
                     rows = []
                     # Bound row count and use streaming iteration, not query.all().
-                    query = select(*(getattr(model, name) for name in names)).limit(maximum + 1)
+                    if key == "faces":
+                        query = select(
+                            EmployeeFace.id, EmployeeFace.employee_id, EmployeeFace.embedding,
+                            EmployeeFace.thumbnail, EmployeeFace.created_at,
+                            FaceModelMetadata.model_id, FaceModelMetadata.alignment_id,
+                        ).outerjoin(FaceModelMetadata, FaceModelMetadata.face_id == EmployeeFace.id)
+                    else:
+                        query = select(*(getattr(model, name) for name in names))
+                    query = query.limit(maximum + 1)
                     for row in connection.execute(query):
                         if len(rows) == maximum:
                             raise TransferError("TRANSFER_TOO_LARGE", 413)
@@ -119,7 +216,7 @@ class SetupTransferService:
                         rows.append(value)
                     payload[key] = rows
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-            document = validate_document(data, expected_model=self.embedding_model)
+            document = validate_document(data)
             return encode_transfer(document, password)
         except TransferError:
             raise
@@ -127,23 +224,33 @@ class SetupTransferService:
             raise TransferError("TRANSFER_STORAGE_UNAVAILABLE", 503) from None
 
     def preview(self, blob: bytes, password: str) -> dict:
-        document = decode_transfer(blob, password, expected_model=self.embedding_model)
+        document = decode_transfer(blob, password, expected_face_model_id=self.face_model_id)
+        _, preparation = self._prepare_faces(document)
         return {"sha256": hashlib.sha256(blob).hexdigest(), "counts": document.counts().model_dump(),
-                "warnings": _warnings(document), "destination_empty": self.status()["destination_empty"]}
+                **preparation, "warnings": _warnings(document, preparation),
+                "destination_empty": self.status()["destination_empty"]}
 
     def import_setup(self, blob: bytes, password: str, *, request_id: UUID, expected_sha256: str) -> tuple[dict, bool]:
-        document = decode_transfer(blob, password, expected_model=self.embedding_model)
+        document = decode_transfer(blob, password, expected_face_model_id=self.face_model_id)
         digest = hashlib.sha256(blob).hexdigest()
         if digest != expected_sha256:
             raise TransferError("TRANSFER_DIGEST_MISMATCH", 409)
         try:
+            # Authenticate before replay, but do not require a model or regenerate
+            # samples after a matching receipt has already frozen the result.
+            with Session(self.engine) as db:
+                _schema(db.connection())
+                prior = _receipt(db, request_id, digest)
+                if prior is not None:
+                    return prior, True
+                if not _empty(db.connection()):
+                    raise TransferError("TRANSFER_DESTINATION_NOT_EMPTY", 409)
+            faces, preparation = self._prepare_faces(document)
             with immediate_session(self.engine) as db:
                 _schema(db.connection())
-                prior = db.get(OperatorRequest, str(request_id))
+                prior = _receipt(db, request_id, digest)
                 if prior is not None:
-                    if prior.operation != "setup.import" or prior.payload_sha256 != digest:
-                        raise TransferError("TRANSFER_REQUEST_CONFLICT", 409)
-                    return dict(prior.result), True
+                    return prior, True
                 if not _empty(db.connection()):
                     raise TransferError("TRANSFER_DESTINATION_NOT_EMPTY", 409)
                 for row in document.cameras:
@@ -160,17 +267,24 @@ class SetupTransferService:
                     db.add(AttendanceCamera(**values, enabled=False, revision=0, source_revision=1))
                 for row in document.archives:
                     db.add(CameraArchive(**row.model_dump(), revision=0))
-                for row in document.faces:
+                for row in getattr(document, "scenes", []):
+                    db.add(CameraScene(**row.model_dump(), source_revision=0, revision=1))
+                for row, face in zip(document.faces, faces):
                     values = _dates(row)
-                    values["embedding"] = decode_binary(row.embedding)
-                    values["thumbnail"] = decode_binary(row.thumbnail) if row.thumbnail is not None else None
+                    values.pop("face_model_id", None)
+                    values.pop("alignment_id", None)
+                    values["embedding"], values["thumbnail"] = face.embedding, face.thumbnail
                     db.add(EmployeeFace(**values))
+                db.flush()
+                for row, face in zip(document.faces, faces):
+                    if face.model_id is not None:
+                        db.add(FaceModelMetadata(face_id=row.id, model_id=face.model_id, alignment_id=face.alignment_id))
                 for row in document.assignments:
                     db.add(EmployeeWorkplace(**row.model_dump()))
                 db.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
                     gallery_revision=AttendanceRuntime.gallery_revision + 1))
                 result = {"committed": True, "counts": document.counts().model_dump(), "restart_required": True,
-                          "warnings": _warnings(document)}
+                          **preparation, "warnings": _warnings(document, preparation)}
                 db.add(OperatorRequest(id=str(request_id), operation="setup.import", payload_sha256=digest,
                                        result=result))
             self.restart_required = True

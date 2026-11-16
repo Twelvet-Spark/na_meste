@@ -16,7 +16,9 @@
     TRANSFER_PASSWORD_OR_FILE_INVALID: 'Неверный пароль или повреждённый файл. Проверьте пароль и выберите исходный файл снова.',
     TRANSFER_INVALID: 'Файл или запрос некорректен. Используйте файл переноса, созданный этим приложением.',
     TRANSFER_INCOMPATIBLE: 'Версия файла или базы несовместима. Установите одинаковую версию приложения на обоих компьютерах.',
-    TRANSFER_MODEL_MISMATCH: 'Модель лиц отличается. На обоих компьютерах должна использоваться та же модель.',
+    TRANSFER_MODEL_MISMATCH: 'Файл содержит несовместимые данные модели. Проверьте файл переноса и диагностику.',
+    TRANSFER_MODEL_UNAVAILABLE: 'Для подготовки миниатюр недоступна модель лиц. Проверьте диагностику и повторите проверку файла.',
+    ENROLLMENT_BUSY: 'Обработка фотографий уже выполняется. Подождите и повторите проверку; файл и пароль сохранены.',
     TRANSFER_DESTINATION_NOT_EMPTY: 'Импорт запрещён: установка уже содержит данные. Используйте новую пустую установку; существующие данные не изменены.',
     TRANSFER_DIGEST_MISMATCH: 'Файл изменился после проверки. Проверьте его заново.',
     TRANSFER_REQUEST_CONFLICT: 'Этот запрос уже использован для другого файла. Очистите форму и проверьте файл заново.',
@@ -30,10 +32,12 @@
     TRANSFER_NO_HISTORY_OR_VIDEO: 'История, видео и настройки этого компьютера не переносятся.',
     TRANSFER_RECOMMISSION_REQUIRED: 'Учёт на импортированных камерах выключен до проверки калибровки и повторного ввода в эксплуатацию.',
     TRANSFER_LEGACY_REMEDIATION: 'Есть старые карточки с неполными именами или набором фото вне 1–15. Они сохранятся для исправления.',
-    TRANSFER_MISSING_THUMBNAILS: 'У части сохранённых образцов нет миниатюр; данные распознавания сохранятся.',
+    TRANSFER_MISSING_THUMBNAILS: 'У части образцов нет миниатюр. Неподтверждённые старые векторы сохранятся, но не участвуют в распознавании.',
+    TRANSFER_FACES_NEED_REENROLLMENT: 'Есть непригодные для текущей модели образцы. После импорта замените их новыми фотографиями; исходные фото не хранятся.',
+    TRANSFER_SCENES_NEED_REVIEW: 'Сцены импортируются как устаревшие. Проверьте геометрию на новом снимке и сохраните её явно.',
     TRANSFER_RESTART_FOR_GALLERY: 'Данные сохранены, но галерея не обновилась. Требуется обычный перезапуск.',
   };
-  const labels = { cameras: 'Камеры', workplaces: 'Рабочие места', employees: 'Сотрудники', faces: 'Образцы лиц', assignments: 'Назначения рабочих мест' };
+  const labels = { cameras: 'Камеры', workplaces: 'Рабочие места', employees: 'Сотрудники', faces: 'Сохранённые образцы лиц', assignments: 'Назначения рабочих мест', scenes: 'Сцены камер' };
   let preview = null, requestId = null, busy = false, attempted = false;
   const urls = new Set();
   const explain = (error) => errors[error.detail] || 'Соединение прервано или ответ не получен. Если импорт уже был отправлен, повторите его без смены файла и пароля: повтор не создаст дубликаты.';
@@ -125,7 +129,12 @@
       invalidate();
       const result = await api('/api/setup-transfer/preview', { method: 'POST', body: formData() });
       preview = result; requestId = newRequestId();
-      list($('transfer-counts'), Object.entries(labels).map(([key, label]) => `${label}: ${result.counts[key]}`));
+      list($('transfer-counts'), [
+        ...Object.entries(labels).map(([key, label]) => `${label}: ${result.counts[key]}`),
+        `Перекодировано миниатюр: ${result.faces_reencoded}`,
+        `Нужно заменить образцов: ${result.faces_need_reenrollment}`,
+        `Сцен для проверки: ${result.scenes_need_review}`,
+      ]);
       list($('transfer-warnings'), result.warnings.map((code) => warnings[code]).filter(Boolean));
       $('transfer-preview').hidden = false;
       message(output, result.destination_empty ? 'Проверка завершена. Сверьте состав и подтвердите импорт.' : errors.TRANSFER_DESTINATION_NOT_EMPTY, result.destination_empty ? '' : 'error');

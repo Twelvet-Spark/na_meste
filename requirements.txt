@@ -12,11 +12,9 @@ cryptography>=46
 
 # AI
 onnx>=1.16
-insightface>=2.0
+scipy>=1.13
+scikit-image>=0.26
 # CPU- и GPU-дистрибутивы ORT предоставляют один модуль; не оставляйте оба.
-# Если зависимости InsightFace установили CPU-пакет, для NVIDIA выполните:
-#   python -m pip uninstall -y onnxruntime
-#   python -m pip install --no-deps --force-reinstall onnxruntime-gpu
 onnxruntime-gpu>=1.19
 # CUDA/cuDNN должны соответствовать конкретной сборке ORT, не только её версии.
 # Официальная таблица: https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements

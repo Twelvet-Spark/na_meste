@@ -43,8 +43,9 @@
   const stateNames = { ONLINE: 'В сети', OFFLINE: 'Не в сети', CONNECTING: 'Подключение', RECONNECTING: 'Переподключение', ERROR: 'Ошибка',
     STARTING: 'Запускается', RECORDING: 'Записывается', STOPPING: 'Останавливается', STOPPED: 'Остановлено', COMPLETED: 'Завершено', FAILED: 'Ошибка', INTERRUPTED: 'Прервано',
     PREPARING: 'Подготовка', READY: 'Готово', ENDED: 'Завершено', CANCELLED: 'Отменено', EXPIRED: 'Истекло' };
-  const providerNames = { yolo: 'Детектор людей', live_face_detection: 'Детектор лиц в потоке', live_face_recognition: 'Распознавание лиц в потоке',
-    enroll_face_detection: 'Детектор лиц при добавлении фото', enroll_face_recognition: 'Распознавание при добавлении фото', reid: 'Межкамерное сопоставление' };
+  const providerNames = { person_detection: 'Детектор людей', live_face_detection: 'Детектор лиц в потоке', live_face_recognition: 'Распознавание лиц в потоке',
+    enroll_face_detection: 'Детектор лиц при добавлении фото', enroll_face_recognition: 'Распознавание при добавлении фото', reid: 'Межкамерное сопоставление',
+    scene_encoder: 'Сегментация сцены — энкодер (CPU)', scene_decoder: 'Сегментация сцены — декодер (CPU)' };
   let loading = false, sequence = 0, lastUpdate = null, generation = 0;
   const events = [];
   const text = (value) => value === null || value === undefined ? 'Нет данных' : String(value);

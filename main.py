@@ -9,6 +9,7 @@
 import logging
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.ai.face_recognition import EmbeddingStore
+from app.ai.model_bundle import ModelBundle
 from app.ai.providers import provider_label
 from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
 from app.api.attendance import router as attendance_router
@@ -43,6 +45,7 @@ from app.media.playback import PlaybackManager
 from app.services.settings_service import SettingsService
 from app.services.diagnostics_service import DiagnosticsService, SafeLogFilter
 from app.services.setup_transfer_service import SetupTransferService
+from app.services.gallery_migration import rebuild_gallery
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,8 +69,24 @@ async def lifespan(app: FastAPI):
     MediaProcessGuard.initialize()
     # Initialize persisted revisions before publishing any camera frames.
     init_db()
+    app.state.model_bundle = None
+    app.state.model_error = None
+    manifest_path = Path(settings.ai_model_manifest)
+    if not manifest_path.is_absolute():
+        manifest_path = BASE_DIR / manifest_path
+    try:
+        app.state.model_bundle = ModelBundle.load(manifest_path)
+    except Exception as exc:
+        app.state.model_error = getattr(exc, "code", "MODEL_CONTRACT_INVALID")
+        logger.error("Model bundle unavailable: %s", app.state.model_error)
+    bundle = app.state.model_bundle
+    app.state.face_model_id = bundle.face_model_id if bundle is not None else None
+    app.state.gallery_migration = None
+    # Policy names, never deployment values: these selectors cannot choose weights.
+    app.state.legacy_model_settings_ignored = (
+        "YOLO_MODEL", "INSIGHTFACE_MODEL", "INSIGHTFACE_ROOT", "REID_MODEL")
     app.state.settings_service = SettingsService(settings, engine)
-    app.state.setup_transfer = SetupTransferService(engine, embedding_model=settings.insightface_model)
+    app.state.setup_transfer = None
     app.state.diagnostics = DiagnosticsService(app.state, engine, settings)
     app.state.manager = ReaderManager()
     app.state.recordings = None
@@ -101,39 +120,47 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Telegram: уведомления отключены (TELEGRAM_BOT_TOKEN не задан)")
 
-    # --- AI: сотрудники/лица/присутствие ---
-    app.state.face_engine = None        # FaceEngine для загрузки фото (det 640)
-    app.state.enrollment_lock = threading.Lock()
+    # One separate enrollment owner and one live owner; no per-request engine.
+    app.state.face_engine = build_enroll_engine(bundle)
+    app.state.enrollment_lock = threading.BoundedSemaphore(1)
     app.state.embedding_store = None
     app.state.ai_worker = None
     app.state.detection_state = None
-    app.state.attendance = AttendanceService(engine, notifier=notifier, now=utcnow)
-
-    try:
-        store = EmbeddingStore()
-        with SessionLocal() as session:
-            store.refresh(session)
-        app.state.embedding_store = store
-        app.state.face_engine = build_enroll_engine()
-        if app.state.face_engine is not None:
-            logger.info("AI Provider: %s",
-                        provider_label(list(app.state.face_engine.app.models.values())[0].session.get_providers()))
-    except Exception:
-        logger.exception("AI-инициализация для сотрудников не удалась — "
-                         "загрузка фото будет недоступна")
+    app.state.attendance = AttendanceService(
+        engine, notifier=notifier, now=utcnow, model_bundle=bundle)
+    if app.state.face_engine is not None:
+        try:
+            app.state.gallery_migration = rebuild_gallery(engine, app.state.face_engine)
+            store = EmbeddingStore(bundle.face_model_id)
+            with SessionLocal() as session:
+                store.refresh(session)
+            app.state.embedding_store = store
+        except Exception as exc:
+            code = getattr(exc, "code", "GALLERY_UNAVAILABLE")
+            app.state.gallery_migration = {"error_code": code}
+            logger.error("Gallery unavailable; anonymous tracking remains available: %s", code)
+        logger.info("Enrollment provider: %s",
+                    provider_label(app.state.face_engine.providers()["recognition"]))
+    else:
+        app.state.gallery_migration = {"error_code": "FACE_MODEL_UNAVAILABLE"}
+    if bundle is not None:
+        app.state.setup_transfer = SetupTransferService(
+            engine, face_model_id=bundle.face_model_id,
+            face_engine=app.state.face_engine, enrollment_semaphore=app.state.enrollment_lock)
     app.state.attendance.health.set_providers(loaded_providers(enroll=app.state.face_engine))
 
     if settings.ai_enabled:
         try:
             worker = build_ai_worker(
                 app.state.manager, app.state.attendance, app.state.embedding_store,
-                session_factory=SessionLocal, notifier=notifier,
-                enroll_engine=app.state.face_engine,
-            )
+                bundle=bundle, session_factory=SessionLocal, notifier=notifier,
+                enroll_engine=app.state.face_engine)
             if worker is not None:
                 worker.start()
                 app.state.ai_worker = worker
                 app.state.detection_state = worker.state
+            else:
+                app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])
         except Exception:
             logger.exception("Live inference unavailable; attendance remains in review/manual mode")
             app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])

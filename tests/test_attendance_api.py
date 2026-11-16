@@ -32,7 +32,8 @@ from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceEvidence, AttendanceRequest,
     AttendanceRuntime, Employee, EmployeeFace, PresenceSession, WorkSession,
 )
-from test_attendance_service import AS_OF, BASE, CUDA_PROVIDERS, crossing, database
+from app.services.attendance_service import AttendanceService
+from test_attendance_service import AS_OF, BASE, CUDA_PROVIDERS, crossing, database, model_bundle_fixture
 from test_attendance_lifecycle import Clock, health_for, warm
 
 TESTS = []
@@ -440,7 +441,8 @@ def test_status_exposes_actual_readiness_providers_metrics_and_unresolved_counts
         status = client.json("GET", "/api/attendance/status")
         assert status["commission_id"] is None and not status["automatic_ready"]
         assert not status["technical_ready"] and status["unresolved_crossings"] == 1
-        assert status["providers"]["yolo"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert status["providers"]["person_detection"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        assert status["providers"]["scene_encoder"] == status["providers"]["scene_decoder"] == []
         assert "pending_write_count" in status and "pending_fault_count" in status
         assert len(status["configuration"]) == 2
         assert "COMMISSIONING_REQUIRED" in status["reasons"]
@@ -458,7 +460,7 @@ def test_commission_valid_attestation_is_atomic_replayable_and_controls_future_c
             record = db.get(AttendanceCommission, first["commission_id"])
             assert record.actor == "Operator" and record.acceptance_record["entry_trials"] == 30
             assert record.acceptance_record["site_confirmed"] is True
-            assert record.configuration_fingerprint["providers"]["yolo"][0] == "CUDAExecutionProvider"
+            assert record.configuration_fingerprint["providers"]["person_detection"][0] == "CUDAExecutionProvider"
             assert db.get(AttendanceRuntime, 1).commission_id == record.id
         second = client.json("POST", "/api/attendance/commission", commission_payload())
         assert second["commission_id"] != first["commission_id"]
@@ -489,10 +491,11 @@ def test_commission_rejects_counts_stale_revisions_cpu_and_unhealthy_metrics():
             client.json("POST", "/api/attendance/commission", commission_payload(**changes), status=422)
         stale = dict(commission_payload(), expected_exit_revision=2)
         client.json("POST", "/api/attendance/commission", stale, status=409)
-        cpu = copy.deepcopy(CUDA_PROVIDERS)
-        cpu["live_face_detection"] = ["CPUExecutionProvider"]
-        health.set_providers(cpu)
-        client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
+        for key in ("person_detection", "live_face_detection", "live_face_recognition",
+                    "enroll_face_detection", "enroll_face_recognition"):
+            for actual in (["CPUExecutionProvider"], ["cuda"], []):
+                health.set_providers(dict(CUDA_PROVIDERS, **{key: actual}))
+                client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
         health.set_providers(CUDA_PROVIDERS)
         health.set_pending_writes(1)
         client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
@@ -502,6 +505,42 @@ def test_commission_rejects_counts_stale_revisions_cpu_and_unhealthy_metrics():
         client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
         with Session(engine) as db:
             assert db.query(AttendanceCommission).count() == db.query(AttendanceRequest).count() == 0
+
+
+@test
+def test_cpu_scene_and_body_providers_do_not_block_or_revoke_cuda_commission():
+    with api() as (client, engine, service):
+        clock, health = commission_ready(engine, service)
+        health.set_providers(dict(CUDA_PROVIDERS, reid=["CPUExecutionProvider"],
+                                  scene_encoder=["CPUExecutionProvider"], scene_decoder=["CPUExecutionProvider"]))
+        approved = client.json("POST", "/api/attendance/commission", commission_payload())
+        assert set(approved["configuration_fingerprint"]["providers"]) == {
+            "person_detection", "live_face_detection", "live_face_recognition",
+            "enroll_face_detection", "enroll_face_recognition",
+        }
+        service.persist_health([], healthy=True, reasons=[], observed_at=clock.utc)
+        status = client.json("GET", "/api/attendance/status")
+        assert status["automatic_ready"]
+        assert status["providers"]["scene_encoder"] == ["CPUExecutionProvider"]
+        health.set_providers(CUDA_PROVIDERS)
+        assert client.json("GET", "/api/attendance/status")["automatic_ready"]
+
+
+@test
+def test_missing_verified_critical_models_cannot_receive_commission_from_cuda_provider_claims():
+    for missing in (None, "person", "face_detection", "face_recognition"):
+        with api() as (client, engine, original):
+            _clock, health = commission_ready(engine, original)
+            bundle = model_bundle_fixture() if missing is not None else None
+            if bundle is not None:
+                bundle.component_status[missing] = "MODEL_MISSING"
+            service = AttendanceService(engine, model_bundle=bundle)
+            service.health = health
+            client.app.state.attendance = service
+            client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
+            with Session(engine) as db:
+                assert db.get(AttendanceRuntime, 1).commission_id is None
+                assert db.query(AttendanceCommission).count() == db.query(AttendanceRequest).count() == 0
 
 
 @test

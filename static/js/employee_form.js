@@ -77,16 +77,19 @@
     }
     reset() { this.release(); this.kept = new Set(this.accepted.map((face) => face.id)); this.render(); this.onChange(); }
     render() {
-      this.count.textContent = `Принято: ${this.accepted.length}/15 · выбрано новых: ${this.staged.length} · итоговый набор: ${this.total}/15`;
+      this.count.textContent = `Сохранено: ${this.accepted.length}/15 · выбрано новых: ${this.staged.length} · итоговый набор: ${this.total}/15`;
       const entries = [
         ...this.accepted.filter((face) => this.kept.has(face.id)).map((face) => ({ face, url: face.thumbnail_url, label: `Сохранённое фото ${face.id}` })),
         ...this.staged,
       ];
       this.grid.replaceChildren(...entries.map((entry, index) => {
         const cell = document.createElement('figure'); cell.className = 'face-cell';
-        const image = document.createElement('img'); image.src = entry.url; image.alt = entry.label || entry.file.name;
+        const image = document.createElement('img'); image.alt = entry.label || entry.file.name;
+        const missing = document.createElement('p'); missing.className = 'muted'; missing.textContent = 'Миниатюра отсутствует'; missing.hidden = true;
+        image.addEventListener('error', () => { image.hidden = true; missing.hidden = false; }, { once: true });
+        image.src = entry.url;
         const label = document.createElement('figcaption'); label.textContent = entry.label || entry.file.name;
-        const kind = document.createElement('span'); kind.className = 'photo-kind muted'; kind.textContent = entry.face ? 'Принято' : 'Не сохранено';
+        const kind = document.createElement('span'); kind.className = 'photo-kind muted'; kind.textContent = entry.face ? 'Сохранено' : 'Не сохранено';
         const actions = document.createElement('div'); actions.className = 'photo-actions';
         const replace = document.createElement('button'); replace.type = 'button'; replace.className = 'btn ghost';
         replace.textContent = 'Заменить'; replace.dataset.photoReplace = '';
@@ -101,7 +104,7 @@
           const next = this.grid.querySelectorAll('[data-photo-replace]')[Math.min(index, this.total - 1)];
           (next || this.input).focus();
         });
-        actions.append(replace, remove); cell.append(image, label, kind, actions);
+        actions.append(replace, remove); cell.append(image, missing, label, kind, actions);
         if (entry.error) {
           const error = document.createElement('p'); error.className = 'photo-error'; error.textContent = entry.error; cell.append(error);
         }

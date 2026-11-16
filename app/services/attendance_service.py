@@ -5,12 +5,13 @@ threads. Raw evidence never changes; effective decisions and derived conflicts
 are separate. Neither absence nor process lifetime is an employee departure.
 """
 import hashlib
+from copy import deepcopy
 import json
 import logging
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from itertools import groupby
-from pathlib import Path
+import re
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import HTTPException
@@ -18,7 +19,7 @@ from sqlalchemy import delete, func
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.attendance_types import EventView, GapView, milliseconds
-from app.config import BASE_DIR, settings
+from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
     AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
@@ -26,11 +27,47 @@ from app.database.models import (
     AttendanceRuntime, Camera, Employee, EmployeeFace, WorkSession,
 )
 from app.services.attendance_evidence import evidence_expires_at, purge_evidence
-from app.services.attendance_health import AttendanceHealth
+from app.services.attendance_health import AttendanceHealth, REQUIRED_PROVIDER_KEYS
 from app.services.attendance_queries import event_view, evaluate_session, gap_view, load_trust_blockers
 from app.time_utils import attendance_iso, utcnow
 
 logger = logging.getLogger("app.attendance")
+
+_CRITICAL_COMPONENTS = ("person", "face_detection", "face_recognition")
+
+
+def _verified_model_identity(bundle):
+    """Copy verified startup declarations once, never inspect files at admission.
+
+    The startup owner supplies ModelBundle.load's result, not a manifest path.
+    Optional body/scene artifacts cannot affect payroll recognition approval.
+    """
+    if bundle is None:
+        return None
+    try:
+        if (bundle.alignment_id != "arcface-5pt-112-v1"
+                or bundle.metadata["alignment_id"] != bundle.alignment_id
+                or type(bundle.face_model_id) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", bundle.face_model_id)):
+            return None
+        models = {}
+        for component in _CRITICAL_COMPONENTS:
+            if bundle.component_status.get(component) != "READY":
+                return None
+            declaration = bundle.metadata["components"][component]
+            preprocessing = declaration["preprocessing_id"]
+            files = declaration["files"]
+            if (type(preprocessing) is not str or not preprocessing
+                    or len(files) != 1 or files[0]["role"] != "model"
+                    or type(files[0]["sha256"]) is not str
+                    or not re.fullmatch(r"[0-9a-f]{64}", files[0]["sha256"])):
+                return None
+            models[component] = {"preprocessing_id": preprocessing,
+                                 "files": {"model": files[0]["sha256"]}}
+        return {"models": models, "face_model_id": bundle.face_model_id,
+                "alignment_id": bundle.alignment_id}
+    except (AttributeError, KeyError, TypeError, IndexError):
+        return None
 
 
 def _json(value):
@@ -58,9 +95,10 @@ def _effective(row):
 
 
 class AttendanceService:
-    def __init__(self, engine, notifier=None, *, now=utcnow):
+    def __init__(self, engine, notifier=None, *, now=utcnow, model_bundle=None):
         self.engine, self.notifier, self._now = engine, notifier, now
         self.health = AttendanceHealth(now=now)
+        self._model_identity = _verified_model_identity(model_bundle)
 
     def configuration_fingerprint(self, db, *, providers=None):
         cameras = []
@@ -73,21 +111,19 @@ class AttendanceService:
                  "face_det_score", "face_blur_min")
         thresholds = {name: getattr(settings, f"attendance_{name}") for name in names}
         providers = self.health.snapshot()["providers"] if providers is None else providers
-        face_root = Path(settings.insightface_root) / "models" / settings.insightface_model
-        paths = [BASE_DIR / settings.yolo_model]
-        face_root = face_root if face_root.is_absolute() else BASE_DIR / face_root
-        paths.extend(sorted(face_root.glob("*.onnx")))
-        if providers["reid"]:
-            paths.append(BASE_DIR / settings.reid_model)
-        models = []
-        for path in paths:
-            try:
-                stat = path.stat()
-                models.append(dict(path=str(path.resolve()), size=stat.st_size, mtime_ns=stat.st_mtime_ns))
-            except OSError:
-                models.append(dict(path=str(path.resolve()), size=None, mtime_ns=None))
-        return dict(version=1, cameras=cameras, thresholds=thresholds, models=models,
-                    face_model=str(face_root.resolve()), providers=providers)
+        providers = {key: list(providers.get(key, ())) for key in REQUIRED_PROVIDER_KEYS}
+        live_names = (
+            "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
+            "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
+        )
+        live_policy = {name: getattr(settings, name) for name in live_names}
+        # Ordinary quality is fixed policy, not enrollment size or attendance overrides.
+        live_policy.update(face_det_score=.8, face_blur_min=20.)
+        identity = deepcopy(self._model_identity) if self._model_identity is not None else {
+            "models": None, "face_model_id": None, "alignment_id": None,
+        }
+        return dict(version=2, cameras=cameras, thresholds=thresholds, live_policy=live_policy,
+                    **identity, math_policy={"cuda_use_tf32": 0}, providers=providers)
 
     def _commission_valid(self, db, *, invalidate=True, providers=None):
         runtime = db.get(AttendanceRuntime, 1)
@@ -96,11 +132,10 @@ class AttendanceService:
         commission = db.get(AttendanceCommission, runtime.commission_id)
         fingerprint = self.configuration_fingerprint(db, providers=providers)
         providers = fingerprint["providers"]
-        cuda = all("CUDAExecutionProvider" in providers[key] for key in (
-            "yolo", "live_face_detection", "live_face_recognition",
-            "enroll_face_detection", "enroll_face_recognition"))
+        cuda = all("CUDAExecutionProvider" in providers[key] for key in REQUIRED_PROVIDER_KEYS)
         roles = {row["role"] for row in fingerprint["cameras"]}
-        valid = (commission is not None and cuda and roles == {"ENTRY", "EXIT"}
+        valid = (self._model_identity is not None and commission is not None
+                 and cuda and roles == {"ENTRY", "EXIT"}
                  and commission.configuration_fingerprint == fingerprint)
         if not valid and invalidate:
             runtime.commission_id = None
@@ -303,6 +338,8 @@ class AttendanceService:
                 request, replay = self._request(db, "commission", payload)
                 if replay:
                     return request.result
+                if self._model_identity is None:
+                    raise HTTPException(422, "Verified person and face models are required")
                 configs = {row.role: row for row in db.query(AttendanceCamera).filter_by(enabled=True)}
                 if set(configs) != {"ENTRY", "EXIT"}:
                     raise HTTPException(422, "Both attendance roles must be configured")
@@ -324,9 +361,7 @@ class AttendanceService:
                     raise HTTPException(422, "Site acceptance trials do not satisfy commissioning requirements")
                 snapshot = self.health.snapshot()
                 providers = snapshot["providers"]
-                cuda = all("CUDAExecutionProvider" in providers[key] for key in (
-                    "yolo", "live_face_detection", "live_face_recognition",
-                    "enroll_face_detection", "enroll_face_recognition"))
+                cuda = all("CUDAExecutionProvider" in providers[key] for key in REQUIRED_PROVIDER_KEYS)
                 role_matches = all(
                     snapshot["roles"].get(role, {}).get("camera_id") == config.camera_id
                     and snapshot["roles"].get(role, {}).get("source_revision") == config.source_revision

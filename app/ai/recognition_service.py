@@ -68,6 +68,7 @@ class DetectionResult:
     association_uncertain: bool = False
     person_score: float = 0.
     fresh_face_evidence: FaceEvidence | None = None
+    identity_reason_codes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -75,8 +76,9 @@ class FrameOutcome:
     detections: list[DetectionResult] = field(default_factory=list)
     tracking_generation: str = ""
     track_lifecycle: list[TrackLifecycle] = field(default_factory=list)
-    # All YOLO person boxes, normalized, even low-score/min-hit-ineligible ones.
+    # All detector person candidates, normalized, including recovery-only scores.
     person_regions: list[tuple[float, float, float, float]] = field(default_factory=list)
+    observed_tracks: list[DetectionResult] = field(default_factory=list)
 
 
 @dataclass
@@ -92,12 +94,11 @@ class RecognitionService:
     def __init__(
         self,
         detector: PersonDetector,
-        face_engine: FaceEngine,
-        store: EmbeddingStore,
-        *,
-        min_confidence: float = .45,
-        min_confirmations: int = 2,
-        retry_interval: float = 2.,
+        face_engine: FaceEngine | None,
+        store: EmbeddingStore | None,
+        min_confidence: float = 0.60,
+        min_confirmations: int = 3,
+        retry_interval: float = 0.5,
         track_lost_timeout: float = 3.,
         min_hits: int = 2,
         tracker_high_threshold: float = .5,
@@ -113,9 +114,9 @@ class RecognitionService:
         self.tracker_high_threshold = tracker_high_threshold
         self._trackers: dict[int, ByteTracker] = {}
         self._generations: dict[int, str] = {}
-        self._face_runs: dict[tuple[int, int], _FaceRun] = {}
         self._last_frame_seq: dict[int, int] = {}
-        self._store_revision = store.revision
+        self._face_runs: dict[tuple[int, int], _FaceRun] = {}
+        self._store_revision = store.revision if store is not None else None
         self._lock = threading.Lock()
 
     def process_frame(
@@ -160,17 +161,19 @@ class RecognitionService:
             for track in tracks:
                 if attendance:
                     self._expire_confirmation(camera_id, track, now)
-                if track.hits < self.min_hits:
-                    continue
                 evidence = None
-                run = self._face_runs.setdefault((camera_id, track.track_id), _FaceRun())
-                interval = settings.attendance_face_interval if attendance else self.retry_interval
-                if (attendance or track.employee_id is None) and now - run.last_attempt >= interval:
-                    run.last_attempt = now
-                    track.last_recog_attempt = now
-                    evidence = self._recognize(track, frame, heads, camera_id, now,
-                                               frame_seq, received_at, attendance, run)
-                outcome.detections.append(self._to_result(track, width, height, evidence))
+                if track.hits >= self.min_hits and self.faces is not None and self.store is not None:
+                    run = self._face_runs.setdefault((camera_id, track.track_id), _FaceRun())
+                    interval = settings.attendance_face_interval if attendance else self.retry_interval
+                    if (attendance or track.employee_id is None) and now - run.last_attempt >= interval:
+                        run.last_attempt = now
+                        track.last_recog_attempt = now
+                        evidence = self._recognize(track, frame, heads, camera_id, now,
+                                                   frame_seq, received_at, attendance, run)
+                result = self._to_result(track, width, height, evidence)
+                outcome.observed_tracks.append(result)
+                if track.hits >= self.min_hits:
+                    outcome.detections.append(result)
             return self._finalize_outcome(camera_id, outcome)
 
     def reset_camera(self, camera_id: int) -> str:
@@ -185,7 +188,7 @@ class RecognitionService:
             return generation
 
     def _invalidate_gallery(self) -> None:
-        revision = self.store.revision
+        revision = self.store.revision if self.store is not None else None
         if revision != self._store_revision:
             for camera_id, tracker in self._trackers.items():
                 for track in tracker.tracks:
@@ -321,7 +324,7 @@ class RecognitionService:
         """Reconcile earlier/cached results after every model call has finished."""
         self._invalidate_gallery()
         tracks = {track.track_id: track for track in self._trackers[camera_id].tracks}
-        for result in outcome.detections:
+        for result in outcome.observed_tracks or outcome.detections:
             evidence = result.fresh_face_evidence
             stale = evidence is not None and evidence.store_revision != self._store_revision
             if stale:
@@ -362,17 +365,22 @@ class RecognitionService:
                 min(1., float(x2 / width)), min(1., float(y2 / height)))
 
     def _to_result(self, track, width, height, evidence=None) -> DetectionResult:
+        reason = ("FACE_MODEL_UNAVAILABLE" if self.faces is None else
+                  "GALLERY_UNAVAILABLE" if self.store is None else None)
         if track.employee_id is not None:
             state, confidence = "recognized", track.employee_conf
         elif track.last_recog_attempt > 0:
             state, confidence = "unknown", track.best_unknown_sim
         else:
             state, confidence = "detecting", None
+        if reason is not None:
+            state, confidence = "unknown", None
         return DetectionResult(
             track_id=track.track_id, employee_id=track.employee_id,
-            employee_name=self.store.employee_name(track.employee_id),
+            employee_name=self.store.employee_name(track.employee_id) if self.store is not None else None,
             confidence=round(confidence, 3) if confidence is not None else None,
             bbox=self._normalized_box(track.bbox, width, height), state=state,
             association_uncertain=track.association_uncertain,
             person_score=track.score, fresh_face_evidence=evidence,
+            identity_reason_codes=(reason,) if reason else (evidence.reason_codes if evidence else ()),
         )

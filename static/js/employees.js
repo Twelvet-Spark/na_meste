@@ -42,7 +42,9 @@
     const thumb = document.createElement('div'); thumb.className = 'employee-thumb';
     const firstFace = employee.faces?.find((face) => face.thumbnail_url);
     if (firstFace) {
-      const image = document.createElement('img'); image.src = firstFace.thumbnail_url; image.alt = ''; image.loading = 'lazy'; thumb.append(image);
+      const image = document.createElement('img'); image.alt = ''; image.loading = 'lazy';
+      image.addEventListener('error', () => { thumb.textContent = 'Нет фото'; }, { once: true });
+      image.src = firstFace.thumbnail_url; thumb.append(image);
     } else { thumb.textContent = 'Нет фото'; }
     const info = document.createElement('div'); info.className = 'employee-info';
     const name = document.createElement('a'); name.className = 'employee-name';
@@ -56,15 +58,16 @@
     });
     info.append(name, meta, chips);
     const readiness = document.createElement('div'); readiness.className = 'employee-readiness';
-    const count = document.createElement('span'); count.className = 'photo-count'; count.textContent = `${employee.faces_count}/15 принято`;
+    const count = document.createElement('span'); count.className = 'photo-count';
+    count.textContent = `Сохранено: ${employee.faces_count}/15 · пригодно: ${employee.usable_faces_count}`;
     const state = document.createElement('span');
     const needsCorrection = employee.needs_name_completion || employee.needs_photo_remediation;
     state.className = `status ${needsCorrection ? 'connecting' : employee.active ? 'online' : 'offline'}`;
-    state.textContent = needsCorrection ? 'Нужно дополнить' : employee.active ? 'Готов к распознаванию' : 'Распознавание отключено';
+    state.textContent = !employee.face_model_id ? 'Модель лиц недоступна' : needsCorrection ? 'Нужно дополнить' : employee.active ? 'Готов к распознаванию' : 'Распознавание отключено';
     readiness.append(count, state);
     if (needsCorrection) {
       const help = document.createElement('span'); help.className = 'small muted';
-      help.textContent = [employee.needs_name_completion ? 'Уточните имя и фамилию' : '', employee.needs_photo_remediation ? 'Исправьте набор фотографий' : ''].filter(Boolean).join(' · ');
+      help.textContent = [employee.needs_name_completion ? 'Уточните имя и фамилию' : '', employee.needs_photo_remediation ? 'Замените непригодные образцы: исходные фото не хранятся' : ''].filter(Boolean).join(' · ');
       readiness.append(help);
     }
     const actions = document.createElement('div'); actions.className = 'employee-row-actions';

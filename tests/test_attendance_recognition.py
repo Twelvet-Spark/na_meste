@@ -25,16 +25,18 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.ai.face_detector import FaceEngine, FaceInfo
+from app.ai.face_detector import FaceInfo
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.recognition_service import RecognitionService
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
-from app.database.models import AttendanceRuntime, Employee, EmployeeFace
+from app.database.models import AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata
 from app.services import employee_service
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4)
+MODEL_ID = "a" * 64
+ALIGNMENT_ID = "arcface-5pt-112-v1"
 FRAME = np.zeros((600, 640, 3), dtype=np.uint8)
 CHECKER = np.repeat(((np.indices((112, 112)).sum(axis=0) % 2) * 255)
                     .astype(np.uint8)[:, :, None], 3, axis=2)
@@ -57,7 +59,7 @@ def face(embedding=None, **changes):
     observation = FaceInfo(
         bbox=np.array([30., 30., 130., 130.], dtype=np.float32),
         det_score=.99, embedding=vector() if embedding is None else embedding,
-        aligned=CHECKER,
+        aligned=CHECKER, model_id=MODEL_ID,
     )
     return replace(observation, **changes)
 
@@ -79,7 +81,11 @@ def database(samples=None, revision=7):
                 db.flush()
                 for owner, embedding in (samples if samples is not None else
                                          [(1, vector()), (2, vector(0., 1.))]):
-                    db.add(EmployeeFace(employee_id=owner, embedding=embedding.tobytes()))
+                    sample = EmployeeFace(employee_id=owner, embedding=embedding.tobytes())
+                    db.add(sample)
+                    db.flush()
+                    db.add(FaceModelMetadata(face_id=sample.id, model_id=MODEL_ID,
+                                             alignment_id=ALIGNMENT_ID))
                 db.get(AttendanceRuntime, 1).gallery_revision = revision
                 db.commit()
             yield engine
@@ -88,7 +94,7 @@ def database(samples=None, revision=7):
 
 
 def load_store(engine):
-    store = EmbeddingStore()
+    store = EmbeddingStore(MODEL_ID)
     with Session(engine) as db:
         store.refresh(db)
     return store
@@ -104,6 +110,9 @@ class Persons:
 
 class Faces:
     """Synthetic model output; honor max_num so truncation cannot hide ambiguity."""
+    model_id = MODEL_ID
+    alignment_id = ALIGNMENT_ID
+
     def __init__(self):
         self.observations = [face()]
 
@@ -548,15 +557,6 @@ def test_quality_measurement_exposes_alignment_failure_without_inventing_blur():
     assert measure_face_quality(face(aligned=np.zeros((112, 112, 3), dtype=np.uint8))).blur == 0.
 
 
-@test
-def test_face_engine_alignment_failure_keeps_aligned_none():
-    model_face = SimpleNamespace(bbox=np.array([10., 10., 110., 110.]), det_score=.99,
-                                 normed_embedding=vector(), kps=np.zeros((5, 2)))
-    engine = FaceEngine.__new__(FaceEngine)
-    engine.app = SimpleNamespace(get=lambda image, max_num=0: [model_face])
-    with patch("insightface.utils.face_align.norm_crop", side_effect=ValueError("bad landmarks")):
-        observed = engine.detect(FRAME)
-    assert len(observed) == 1 and observed[0].aligned is None
 
 
 def photo_bytes():
@@ -580,14 +580,16 @@ def third_face():
 def create_identity(db):
     data = employee_service.EmployeeCreate(first_name="Person", last_name="Third", request_id=uuid4())
     digest = hashlib.sha256(str(data.request_id).encode()).hexdigest()
-    return employee_service.create_employee_with_faces(db, data, [prepared(third_face())], digest)
+    return employee_service.create_employee_with_faces(
+        db, data, [prepared(third_face())], digest, model_id=MODEL_ID)
 
 
 def replace_sample(db, store, sample):
     employee_id, omitted_id = sample.employee_id, sample.id
     keep = [row.id for row in db.query(EmployeeFace).filter_by(employee_id=employee_id) if row.id != omitted_id]
     additions = [] if keep else [prepared(third_face())]
-    employee_service.replace_employee_faces(db, employee_id, db.get(Employee, employee_id).revision, keep, additions)
+    employee_service.replace_employee_faces(
+        db, employee_id, db.get(Employee, employee_id).revision, keep, additions, model_id=MODEL_ID)
     store.refresh(db)
 
 
@@ -597,7 +599,8 @@ def enroll(db, store, observation, employee_id=1):
         return result
     keep = [row.id for row in db.query(EmployeeFace).filter_by(employee_id=employee_id)]
     try:
-        employee_service.replace_employee_faces(db, employee_id, db.get(Employee, employee_id).revision, keep, [result])
+        employee_service.replace_employee_faces(
+            db, employee_id, db.get(Employee, employee_id).revision, keep, [result], model_id=MODEL_ID)
     except HTTPException as exc:
         if exc.status_code != 422:
             raise
@@ -721,6 +724,26 @@ def test_face_enrollment_is_rolled_back_when_gallery_revision_write_fails():
 def test_face_replacement_is_rolled_back_when_gallery_revision_write_fails():
     assert_revision_failure_rolls_back(lambda db, store: replace_sample(
         db, store, db.query(EmployeeFace).filter_by(employee_id=1).one()))
+
+
+@test
+def test_missing_optional_face_or_gallery_keeps_real_provisional_observations():
+    with database() as engine:
+        for faces, store, reason in ((None, load_store(engine), "FACE_MODEL_UNAVAILABLE"),
+                                     (Faces(), None, "GALLERY_UNAVAILABLE")):
+            service = RecognitionService(Persons(), faces, store, min_hits=3)
+            first = process(service, 1, 10.)
+            assert first.detections == []
+            assert [row.track_id for row in first.observed_tracks] == [1]
+            assert first.observed_tracks[0].employee_id is None
+            assert first.observed_tracks[0].identity_reason_codes == (reason,)
+            assert process(service, 1, 10.1).observed_tracks == []
+            process(service, 2, 10.2)
+            third = process(service, 3, 10.4)
+            assert len(third.detections) == len(third.observed_tracks) == 1
+            assert third.detections[0].employee_id is None
+            assert third.detections[0].fresh_face_evidence is None
+            assert third.detections[0].identity_reason_codes == (reason,)
 
 
 if __name__ == "__main__":

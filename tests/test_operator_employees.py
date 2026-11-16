@@ -16,6 +16,7 @@ import time
 import traceback
 import zlib
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 from uuid import uuid4
@@ -33,16 +34,42 @@ from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
 
 from app.api import employees
+from app.ai.face_detector import FaceInfo
 from app.ai.face_recognition import EmbeddingStore
 from app.database.database import get_db, immediate_session
-from app.database.models import AttendanceRuntime, Employee, EmployeeFace
+from app.database.models import (
+    AttendanceCommission, AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata, HumanVisit,
+)
 from operator_test_support import Client, multipart
-from test_attendance_recognition import CHECKER, face, photo_bytes, vector
 from test_operator_storage import database, dump, legacy, schema, STAMP
 
 TESTS = []
 MAX_PHOTO = 15 * 1024 * 1024
 BODY_LIMIT = 226 * 1024 * 1024
+MODEL = "a" * 64
+ALIGNMENT = "arcface-5pt-112-v1"
+CHECKER = np.repeat(((np.indices((112, 112)).sum(axis=0) % 2) * 255)
+                    .astype(np.uint8)[:, :, None], 3, axis=2)
+
+
+def vector(first=1., second=0.):
+    result = np.zeros(512, np.float32)
+    result[:2] = first, second
+    norm = np.linalg.norm(result)
+    return result / norm if norm else result
+
+
+def face(embedding=None, **changes):
+    observation = FaceInfo(np.array([30., 30., 130., 130.], np.float32), .99,
+                           vector() if embedding is None else embedding, CHECKER,
+                           model_id=MODEL)
+    return replace(observation, **changes)
+
+
+def photo_bytes():
+    ok, encoded = cv2.imencode(".png", CHECKER)
+    assert ok
+    return encoded.tobytes()
 
 
 def test(fn):
@@ -52,6 +79,9 @@ def test(fn):
 
 class Faces:
     """External-model boundary recording concurrency/threading without changing SQL."""
+    model_id = MODEL
+    alignment_id = ALIGNMENT
+
     def __init__(self):
         self.observations = [face()]
         self.calls = 0
@@ -91,11 +121,13 @@ def api(*, historical=False):
             legacy(engine, attendance=True)
         schema.initialize_attendance_schema(engine)
         app = FastAPI()
-        model, store = Faces(), EmbeddingStore()
+        model, store = Faces(), EmbeddingStore(MODEL)
         with Session(engine) as db:
             store.refresh(db)
         app.state.face_engine = model
         app.state.embedding_store = store
+        app.state.face_model_id = MODEL
+        app.state.enrollment_lock = threading.BoundedSemaphore(1)
         app.include_router(employees.router)
         # Missing new routes must fail HTTP behavior assertions, not import collection.
         if importlib.util.find_spec("app.api.workplaces") is not None:
@@ -159,6 +191,7 @@ def test_one_and_fifteen_photos_commit_one_employee_and_one_gallery_revision():
             assert result["name"] == "Петров Иван"
             assert result["first_name"] == "Иван" and result["last_name"] == "Петров"
             assert result["revision"] == 1 and result["faces_count"] == count
+            assert result["usable_faces_count"] == count and result["face_model_id"] == MODEL
             assert result["workplaces"] == []
             assert result["needs_name_completion"] is False and result["needs_photo_remediation"] is False
             assert len(result["faces"]) == count
@@ -176,6 +209,9 @@ def test_one_and_fifteen_photos_commit_one_employee_and_one_gallery_revision():
                 sample = db.query(EmployeeFace).first()
                 assert len(sample.embedding) == 512 * 4
                 assert sample.thumbnail != photo_bytes(), "Only aligned JPEG, not original upload, is retained"
+                provenance = db.query(FaceModelMetadata).all()
+                assert len(provenance) == count
+                assert all(row.model_id == MODEL and row.alignment_id == ALIGNMENT for row in provenance)
 
 
 @test
@@ -329,20 +365,14 @@ def test_invalid_final_set_stale_revision_and_foreign_or_duplicate_keeps_preserv
 
 
 @test
-def test_concurrent_face_saves_have_exactly_one_winner_and_preserve_model_serialization():
+def test_concurrent_face_saves_return_busy_before_inference_then_preserve_revision_cas():
     with api() as (client, engine, model, _store, _root):
         original = create(client)
-        model.delay = .03
         body, mime = multipart({"expected_revision": original["revision"], "keep_face_ids": []}, files())
-
-        async def race():
-            return await asyncio.gather(*[
-                client.arequest("PUT", f"/api/employees/{original['id']}/faces", body=body,
-                                headers={"content-type": mime}) for _ in range(2)
-            ])
-
-        results = asyncio.run(race())
-        assert sorted(row[0] for row in results) == [200, 409], results
+        results = enrollment_race(client, model, "PUT", f"/api/employees/{original['id']}/faces", body, mime)
+        assert [row[0] for row in results] == [200, 503], results
+        assert results[1][2]["detail"]["code"] == "ENROLLMENT_BUSY"
+        save_faces(client, original, [], files(), status=409)
         assert gallery_revision(engine) == 2
         assert detail(client, original["id"])["revision"] == original["revision"] + 1
         assert detail(client, original["id"])["faces_count"] == 1
@@ -350,20 +380,15 @@ def test_concurrent_face_saves_have_exactly_one_winner_and_preserve_model_serial
 
 
 @test
-def test_concurrent_same_uuid_creates_one_employee_and_replays_the_winner():
+def test_concurrent_same_uuid_returns_busy_then_replays_original_receipt():
     with api() as (client, engine, model, _store, _root):
-        model.delay = .03
-        body, mime = multipart(metadata(), files())
-
-        async def race():
-            return await asyncio.gather(*[
-                client.arequest("POST", "/api/employees", body=body,
-                                headers={"content-type": mime}) for _ in range(2)
-            ])
-
-        results = asyncio.run(race())
-        assert [row[0] for row in results] == [201, 201], results
-        assert results[0][2] == results[1][2]
+        data = metadata()
+        body, mime = multipart(data, files())
+        results = enrollment_race(client, model, "POST", "/api/employees", body, mime)
+        assert [row[0] for row in results] == [201, 503], results
+        assert results[1][2]["detail"]["code"] == "ENROLLMENT_BUSY"
+        original = results[0][2]
+        assert create(client, data) == original
         assert gallery_revision(engine) == 1
         with Session(engine) as db:
             assert db.query(Employee).count() == 1 and db.query(EmployeeFace).count() == 1
@@ -390,6 +415,10 @@ def test_conflict_committed_during_preparation_is_rechecked_under_writer_lock():
                 connection.exec_driver_sql(
                     "INSERT INTO employee_faces (employee_id,embedding,created_at) VALUES (90,?,?)",
                     (vector().tobytes(), STAMP))
+                face_id = connection.exec_driver_sql("SELECT max(id) FROM employee_faces").scalar_one()
+                connection.exec_driver_sql(
+                    "INSERT INTO face_model_metadata (face_id,model_id,alignment_id,created_at) VALUES (?,?,?,?)",
+                    (face_id, MODEL, ALIGNMENT, STAMP))
                 connection.exec_driver_sql("UPDATE attendance_runtime SET gallery_revision=gallery_revision+1")
                 connection.commit()
 
@@ -553,7 +582,11 @@ def test_legacy_remediation_preserves_history_and_allows_deactivation_before_pho
 def test_legacy_over_capacity_is_untouched_until_final_set_is_explicitly_corrected():
     with api(historical=True) as (client, engine, _model, _store, _root):
         with immediate_session(engine) as db:
-            db.add_all([EmployeeFace(employee_id=41, embedding=vector().tobytes()) for _ in range(16)])
+            for _ in range(16):
+                sample = EmployeeFace(employee_id=41, embedding=vector().tobytes())
+                db.add(sample)
+                db.flush()
+                db.add(FaceModelMetadata(face_id=sample.id, model_id=MODEL, alignment_id=ALIGNMENT))
         old = detail(client, 41)
         assert old["faces_count"] == 16 and old.get("needs_photo_remediation") is True, old
         changed = client.json("PUT", "/api/employees/41", {"expected_revision": old["revision"], "active": False})
@@ -619,6 +652,7 @@ def test_history_free_employee_deletion_removes_faces_tags_and_advances_gallery(
         client.json("GET", f"/api/employees/{created['id']}", status=404)
         with Session(engine) as db:
             assert db.query(EmployeeFace).count() == 0
+            assert db.query(FaceModelMetadata).count() == 0
         with engine.connect() as connection:
             assert connection.exec_driver_sql("SELECT count(*) FROM employee_workplaces").scalar_one() == 0
             assert connection.exec_driver_sql("SELECT count(*) FROM workplaces").scalar_one() == 1
@@ -788,6 +822,135 @@ def test_receive_cap_rejects_content_length_before_consuming_body_and_streamed_o
         assert model.calls == 0 and dump(engine) == before
         # Read-only routes remain usable after a rejected oversized request.
         assert client.json("GET", "/api/employees") == []
+
+
+def enrollment_race(client, model, method, url, body, mime):
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_inference():
+        entered.set()
+        assert release.wait(5), "Concurrent request failed to release enrollment"
+
+    model.hook = hold_inference
+
+    async def race():
+        first = asyncio.create_task(client.arequest(method, url, body=body, headers={"content-type": mime}))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5), "First request did not reach inference"
+            second = await client.arequest(method, url, body=body, headers={"content-type": mime})
+        finally:
+            release.set()
+        return [await first, second]
+
+    try:
+        return asyncio.run(race())
+    finally:
+        model.hook = None
+
+
+@test
+def test_shared_busy_slot_rejects_whole_preparation_without_decoding_and_releases_after_failure():
+    with api() as (client, engine, model, _store, _root):
+        semaphore = client.app.state.enrollment_lock
+        assert semaphore.acquire(blocking=False)
+        before = dump(engine)
+        try:
+            with patch.object(cv2, "imdecode", side_effect=AssertionError("Busy request decoded a photo")):
+                response = create(client, status=503)
+            assert response["detail"]["code"] == "ENROLLMENT_BUSY"
+            assert model.calls == 0 and dump(engine) == before
+        finally:
+            semaphore.release()
+        assert_photo_error(create(client, photos=files(content=b"bad"), status=422), 0)
+        assert create(client)["usable_faces_count"] == 1
+
+
+@test
+def test_views_distinguish_stored_unproven_samples_and_unavailable_runtime_model():
+    with api() as (client, engine, _model, _store, _root):
+        created = create(client, photos=files(2))
+        with immediate_session(engine) as db:
+            db.query(FaceModelMetadata).filter_by(face_id=created["faces"][0]["id"]).delete()
+        current = detail(client, created["id"])
+        assert current["faces_count"] == 2 and current["usable_faces_count"] == 1
+        assert current["needs_photo_remediation"] is True and current["face_model_id"] == MODEL
+        client.app.state.face_engine = None
+        client.app.state.embedding_store = None
+        client.app.state.face_model_id = None
+        current = detail(client, created["id"])
+        assert current["faces_count"] == 2 and current["usable_faces_count"] == 0
+        assert current["face_model_id"] is None and current["needs_photo_remediation"] is True
+
+
+@test
+def test_provenance_rollback_and_gallery_mutations_revoke_commission_atomically():
+    with api() as (client, engine, _model, _store, _root):
+        original = create(client)
+        with immediate_session(engine) as db:
+            commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Test",
+                                              configuration_fingerprint={}, acceptance_record={})
+            db.add(commission)
+            db.flush()
+            db.get(AttendanceRuntime, 1).commission_id = commission.id
+        saved = save_faces(client, original, [], files())
+        with Session(engine) as db:
+            assert db.get(AttendanceRuntime, 1).commission_id is None
+            samples = db.query(EmployeeFace).all()
+            metadata_rows = db.query(FaceModelMetadata).all()
+            assert len(samples) == len(metadata_rows) == 1
+            assert metadata_rows[0].face_id == saved["faces"][0]["id"]
+
+
+@test
+def test_unproven_and_incompatible_vectors_never_supply_duplicate_owner_evidence():
+    for unproven in (True, False):
+        with api() as (client, engine, _model, store, _root):
+            previous = create(client)
+            with immediate_session(engine) as db:
+                provenance = db.get(FaceModelMetadata, previous["faces"][0]["id"])
+                if unproven:
+                    db.delete(provenance)
+                else:
+                    provenance.model_id = "b" * 64
+            current = create(client)
+            assert current["id"] != previous["id"]
+            assert store.match(vector()).employee_id == current["id"]
+            assert detail(client, previous["id"])["needs_photo_remediation"] is True
+
+
+@test
+def test_kept_photo_updates_require_declared_model_but_not_a_loaded_recognizer():
+    with api() as (client, engine, _model, _store, _root):
+        original = create(client)
+        keep = [original["faces"][0]["id"]]
+        client.app.state.face_engine = None
+        saved = save_faces(client, original, keep)
+        assert saved["usable_faces_count"] == 1 and saved["face_model_id"] == MODEL
+        client.app.state.face_model_id = None
+        before = dump(engine)
+        response = save_faces(client, saved, keep, status=503)
+        assert response["detail"]["code"] == "FACE_MODEL_UNAVAILABLE" and dump(engine) == before
+
+
+@test
+def test_human_visit_reference_prevents_employee_deletion_without_touching_enrollment():
+    with api() as (client, engine, _model, _store, _root):
+        original = create(client)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO cameras (id,name,nvr_host,rtsp_port,username,password,channel,"
+                "stream_type,enabled,created_at,updated_at) VALUES "
+                "(12,'Test camera','unused',554,'test','test',1,'main',1,?,?)", (STAMP, STAMP))
+        with immediate_session(engine) as db:
+            db.add(HumanVisit(id=str(uuid4()), camera_id=12, tracking_generation=str(uuid4()),
+                              track_id=1, source_revision=1, stream_id=str(uuid4()),
+                              started_at=STAMP, last_seen_at=STAMP, employee_id=original["id"],
+                              identity_state="FACE_CONFIRMED", last_bbox=[0., 0., 1., 1.],
+                              max_person_score=.9, image_expires_at=STAMP))
+        before = dump(engine)
+        client.json("DELETE", f"/api/employees/{original['id']}", status=409)
+        assert dump(engine) == before
+        assert detail(client, original["id"])["usable_faces_count"] == 1
 
 
 if __name__ == "__main__":

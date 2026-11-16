@@ -5,7 +5,7 @@ Recording metadata is installed explicitly by version 3, never via create_all.
 """
 from app.time_utils import utcnow
 
-VERSION = 3
+VERSION = 4
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -132,8 +132,85 @@ V3_INDEXES = {
         ON recording_sessions (camera_id)
         WHERE status IN ('STARTING','RECORDING','RECONNECTING','STOPPING')""",
 }
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES}
-TABLES = frozenset(V3_TABLES)
+V4_TABLES = {
+    **V3_TABLES,
+    "face_model_metadata": """CREATE TABLE face_model_metadata (
+        face_id INTEGER NOT NULL PRIMARY KEY,
+        model_id VARCHAR(64) NOT NULL CHECK (length(model_id) = 64),
+        alignment_id VARCHAR(40) NOT NULL CHECK (length(alignment_id) BETWEEN 1 AND 40),
+        created_at DATETIME NOT NULL,
+        FOREIGN KEY(face_id) REFERENCES employee_faces (id) ON DELETE CASCADE
+    )""",
+    "camera_scenes": """CREATE TABLE camera_scenes (
+        camera_id INTEGER NOT NULL PRIMARY KEY,
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+        reference_width INTEGER NOT NULL CHECK (reference_width > 0),
+        reference_height INTEGER NOT NULL CHECK (reference_height > 0),
+        geometry JSON NOT NULL CHECK (json_valid(geometry)),
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE CASCADE
+    )""",
+    "human_visits": """CREATE TABLE human_visits (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        camera_id INTEGER NOT NULL,
+        tracking_generation VARCHAR(36) NOT NULL,
+        track_id INTEGER NOT NULL,
+        source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+        stream_id VARCHAR(36) NOT NULL,
+        started_at DATETIME NOT NULL,
+        last_seen_at DATETIME NOT NULL CHECK (last_seen_at >= started_at),
+        ended_at DATETIME,
+        end_reason VARCHAR(64),
+        status VARCHAR(20) NOT NULL CHECK (status IN ('PROVISIONAL','ACTIVE','CLOSED')),
+        employee_id INTEGER,
+        identity_state VARCHAR(20) NOT NULL CHECK (identity_state IN ('UNKNOWN','FACE_CONFIRMED','CONFLICT')),
+        global_id INTEGER,
+        last_bbox JSON NOT NULL CHECK (json_valid(last_bbox) AND json_type(last_bbox) = 'array' AND json_array_length(last_bbox) = 4),
+        max_person_score FLOAT NOT NULL CHECK (max_person_score BETWEEN 0 AND 1),
+        snapshot BLOB CHECK (snapshot IS NULL OR length(snapshot) <= 262144),
+        face_thumbnail BLOB CHECK (face_thumbnail IS NULL OR length(face_thumbnail) <= 262144),
+        face_quality JSON,
+        image_expires_at DATETIME NOT NULL,
+        images_purged_at DATETIME,
+        CHECK (ended_at IS NULL OR ended_at >= last_seen_at),
+        CHECK (status != 'CLOSED' OR ended_at IS NOT NULL),
+        UNIQUE (camera_id, tracking_generation, track_id),
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT,
+        FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT,
+        FOREIGN KEY(global_id) REFERENCES global_persons (id) ON DELETE SET NULL
+    )""",
+    "human_visit_events": """CREATE TABLE human_visit_events (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        visit_id VARCHAR(36) NOT NULL,
+        dedupe_key VARCHAR(200) NOT NULL UNIQUE CHECK (length(dedupe_key) BETWEEN 1 AND 200),
+        type VARCHAR(24) NOT NULL CHECK (type IN ('FIRST_SEEN','IDENTIFIED','IDENTITY_CONFLICT','LOST','RECOVERED','CLOSED','LINKED')),
+        occurred_at DATETIME NOT NULL,
+        payload JSON NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object' AND length(CAST(payload AS BLOB)) <= 16384),
+        FOREIGN KEY(visit_id) REFERENCES human_visits (id) ON DELETE CASCADE
+    )""",
+    "human_journal_gaps": """CREATE TABLE human_journal_gaps (
+        id VARCHAR(36) NOT NULL PRIMARY KEY,
+        camera_id INTEGER NOT NULL,
+        tracking_generation VARCHAR(36) NOT NULL,
+        started_at DATETIME NOT NULL,
+        ended_at DATETIME,
+        reason VARCHAR(64) NOT NULL,
+        CHECK (ended_at IS NULL OR ended_at >= started_at),
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+    )""",
+}
+V4_INDEXES = {
+    **V3_INDEXES,
+    "ix_human_visits_last_seen_id": "CREATE INDEX ix_human_visits_last_seen_id ON human_visits (last_seen_at, id)",
+    "ix_human_visits_camera_last_seen": "CREATE INDEX ix_human_visits_camera_last_seen ON human_visits (camera_id, last_seen_at)",
+    "ix_human_visits_employee_last_seen": "CREATE INDEX ix_human_visits_employee_last_seen ON human_visits (employee_id, last_seen_at)",
+    "ix_human_visit_events_visit_occurred": "CREATE INDEX ix_human_visit_events_visit_occurred ON human_visit_events (visit_id, occurred_at, id)",
+    "ix_human_journal_gaps_camera_started": "CREATE INDEX ix_human_journal_gaps_camera_started ON human_journal_gaps (camera_id, started_at)",
+}
+INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES}
+TABLES = frozenset(V4_TABLES)
 
 
 def _refuse(detail):
@@ -158,7 +235,7 @@ def preflight(connection):
             raise _refuse("unknown or uncommitted version")
         installed = versions[0][1]
         expected_tables = SCHEMAS[installed]
-        expected_indexes = V3_INDEXES if installed == 3 else {}
+        expected_indexes = INDEXES[installed]
         if owned != set(expected_tables) | set(expected_indexes):
             raise _refuse("partial or unexpected operator objects")
         for name, expected in expected_tables.items():
@@ -212,3 +289,13 @@ def install(connection, installed=0):
             connection.exec_driver_sql(ddl)
         connection.exec_driver_sql(
             "UPDATE operator_schema SET version=3,updated_at=? WHERE id=1", (utcnow(),))
+        installed = 3
+    if installed == 3:
+        for name, ddl in V4_TABLES.items():
+            if name not in V3_TABLES:
+                connection.exec_driver_sql(ddl)
+        for name, ddl in V4_INDEXES.items():
+            if name not in V3_INDEXES:
+                connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql(
+            "UPDATE operator_schema SET version=4,updated_at=? WHERE id=1", (utcnow(),))

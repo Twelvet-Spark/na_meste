@@ -72,7 +72,7 @@ class TransferRoute(APIRoute):
                 require_local_transfer(request)
                 service = getattr(request.app.state, "setup_transfer", None)
                 if service is None:
-                    raise TransferError("TRANSFER_UNAVAILABLE", 503)
+                    raise TransferError("TRANSFER_MODEL_UNAVAILABLE", 503)
                 lock = service.operation_lock
                 if not lock.acquire(blocking=False):
                     lock = None
@@ -119,7 +119,10 @@ router = APIRouter(prefix="/api/setup-transfer", tags=["setup-transfer"], route_
 
 
 def _service(request):
-    return request.app.state.setup_transfer
+    service = getattr(request.app.state, "setup_transfer", None)
+    if service is None:
+        raise TransferError("TRANSFER_MODEL_UNAVAILABLE", 503)
+    return service
 
 
 @router.get("/status")

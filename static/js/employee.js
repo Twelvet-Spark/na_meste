@@ -44,7 +44,9 @@ function updateSummary() {
   $('employee-remediation').textContent = [
     current.active ? 'Активен.' : 'Неактивен — распознавание отключено.',
     current.needs_name_completion ? 'Старое имя сохранено. Уточните имя и фамилию вместе.' : '',
-    current.needs_photo_remediation ? 'Исправьте набор до 1–15 фотографий. Данные и активность можно менять уже сейчас.' : '',
+    `Сохранено образцов: ${current.faces_count}/15; пригодно для текущей модели: ${current.usable_faces_count}.`,
+    !current.face_model_id ? 'Модель лиц недоступна. Проверьте диагностику.' : '',
+    current.needs_photo_remediation ? 'Замените непригодные образцы новыми фото; исходные фотографии не хранятся. Итоговый набор — 1–15 фото. Данные и активность можно менять уже сейчас.' : '',
   ].filter(Boolean).join(' ');
 }
 async function loadPlaces() {

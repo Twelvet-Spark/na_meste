@@ -11,8 +11,11 @@ from uuid import uuid4
 from app.config import settings
 from app.time_utils import attendance_iso, utcnow
 
-PROVIDER_KEYS = ("yolo", "live_face_detection", "live_face_recognition",
-                 "enroll_face_detection", "enroll_face_recognition", "reid")
+REQUIRED_PROVIDER_KEYS = (
+    "person_detection", "live_face_detection", "live_face_recognition",
+    "enroll_face_detection", "enroll_face_recognition",
+)
+PROVIDER_KEYS = REQUIRED_PROVIDER_KEYS + ("reid", "scene_encoder", "scene_decoder")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +182,7 @@ class AttendanceHealth:
         with self._lock:
             now, utc = self._mono(), self._now()
             roles, reasons = {}, set()
-            models_ready = all(self._providers[key] for key in PROVIDER_KEYS[:5])
+            models_ready = all(self._providers[key] for key in REQUIRED_PROVIDER_KEYS)
             if not models_ready:
                 reasons.add("AI_UNAVAILABLE")
             for role in ("ENTRY", "EXIT"):

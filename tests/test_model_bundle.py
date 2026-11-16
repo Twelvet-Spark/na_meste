@@ -1,4 +1,4 @@
-"""Isolated model-manifest/ONNX validation; no runtime sessions or model execution.
+"""Isolated manifest and tiny-ONNX detector contracts; no production DB or weights.
 
 Run: .venv/Scripts/python.exe tests/test_model_bundle.py
 """
@@ -564,6 +564,90 @@ def loader_does_not_create_runtime_sessions_or_use_network():
                 patch("socket.create_connection", side_effect=AssertionError("network forbidden")), \
                 patch("urllib.request.urlopen", side_effect=AssertionError("download forbidden")):
             assert set(fixture.load().component_status.values()) == {"READY"}
+
+
+def color_detector_fixture(fixture, *, dynamic=True):
+    import numpy as np
+    from onnx import numpy_helper
+    inputs, outputs = fixture.specifications["person"]
+    initializers = [
+        numpy_helper.from_array(np.array([0], dtype=np.int64), "zero"),
+        numpy_helper.from_array(np.array([1], dtype=np.int64), "one_axis"),
+        numpy_helper.from_array(np.array([300], dtype=np.int64), "count"),
+        numpy_helper.from_array(np.array([4], dtype=np.int64), "four"),
+        numpy_helper.from_array(np.array([[0] + [1] * 299], dtype=np.int64), "classes"),
+        numpy_helper.from_array(np.tile(np.array([[[192., 192., 416., 416.]]],
+                                                dtype=np.float32), (1, 300, 1)), "square"),
+    ]
+    if not dynamic:
+        initializers.append(numpy_helper.from_array(np.array([1], dtype=np.int64), "one_batch"))
+    nodes = [
+        helper.make_node("Shape", ["images"], ["image_shape"]),
+        helper.make_node("Gather", ["image_shape", "zero"], ["batch"], axis=0),
+        helper.make_node("Concat", ["batch" if dynamic else "one_batch", "count"], ["rows"], axis=0),
+        helper.make_node("Concat", ["rows", "four"], ["box_shape"], axis=0),
+        helper.make_node("Gather", ["images", "zero"], ["red"], axis=1),
+        helper.make_node("ReduceMean", ["red"], ["red_mean"], axes=[1, 2, 3], keepdims=0),
+        helper.make_node("Unsqueeze", ["red_mean", "one_axis"], ["score_column"]),
+        helper.make_node("Identity", ["score_column"], ["score_batch"]) if dynamic else
+        helper.make_node("Gather", ["score_column", "zero"], ["score_batch"], axis=0),
+        helper.make_node("Expand", ["score_batch", "rows"], ["scores"]),
+        helper.make_node("Expand", ["classes", "rows"], ["labels"]),
+        helper.make_node("Expand", ["square", "box_shape"], ["boxes"]),
+    ]
+    info = lambda value: helper.make_tensor_value_info(
+        value["name"], TensorProto.FLOAT if value["dtype"] == "float32" else TensorProto.INT64,
+        value["shape"])
+    graph = helper.make_graph(nodes, "color-and-coordinate-consumer",
+                              [info(value) for value in inputs], [info(value) for value in outputs],
+                              initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 16)], ir_version=10)
+    data = model.SerializeToString()
+    fixture.asset("person").write_bytes(data)
+    fixture.file("person")["sha256"] = hashlib.sha256(data).hexdigest()
+    sys.path.insert(0, str(SOURCE.parents[2]))
+    from app.ai.detector import PersonDetector
+    return PersonDetector(fixture.load(), ["CPUExecutionProvider"], confidence=.1)
+
+
+@test
+def dfine_batch_preserves_rgb_native_boxes_and_distinct_input_order():
+    import numpy as np
+    with tempfile.TemporaryDirectory() as directory:
+        detector = color_detector_fixture(BundleFixture(Path(directory)))
+        landscape = np.zeros((100, 200, 3), dtype=np.uint8)
+        landscape[:, :, 2] = 255
+        portrait = np.zeros((200, 100, 3), dtype=np.uint8)
+        portrait[:, :, 2] = 255
+        blue = np.zeros((100, 200, 3), dtype=np.uint8)
+        blue[:, :, 0] = 255
+        landscape.setflags(write=False)
+        portrait.setflags(write=False)
+        assert detector.detect_batch([]) == []
+        single = detector.detect(landscape)
+        assert len(single) == 1
+        np.testing.assert_allclose(single[0][0], [60, 10, 130, 80], atol=1e-4)
+        outcomes = detector.detect_batch([landscape, portrait, blue, landscape])
+        assert [len(rows) for rows in outcomes] == [1, 1, 0, 1]
+        np.testing.assert_allclose(outcomes[0][0][0], [60, 10, 130, 80], atol=1e-4)
+        np.testing.assert_allclose(outcomes[1][0][0], [10, 60, 80, 130], atol=1e-4)
+        np.testing.assert_allclose(outcomes[3][0][0], [60, 10, 130, 80], atol=1e-4)
+        assert .49 < outcomes[0][0][1] < .51
+
+
+@test
+def dfine_rejects_actual_batch_shape_mismatch_instead_of_dropping_a_camera():
+    import numpy as np
+    with tempfile.TemporaryDirectory() as directory:
+        detector = color_detector_fixture(BundleFixture(Path(directory)), dynamic=False)
+        from app.ai.model_bundle import ModelBundleError as DetectorError
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        try:
+            detector.detect_batch([frame, frame])
+        except DetectorError as exc:
+            assert exc.code == "MODEL_CONTRACT_INVALID" and exc.component == "person"
+        else:
+            raise AssertionError("A malformed batch silently dropped a camera")
 
 
 if __name__ == "__main__":

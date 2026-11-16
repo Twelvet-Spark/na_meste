@@ -19,6 +19,7 @@ from app.database.database import immediate_session
 from app.database.models import (
     AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, CameraArchive,
     GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSession,
+    HumanVisit, HumanJournalGap,
 )
 from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraDeletion, CameraSource
 from app.rtsp.dahua import build_rtsp_url, normalize_host
@@ -416,6 +417,8 @@ def delete_camera(db: Session, camera: Camera | CameraSource) -> CameraDeletion:
             payload = case((func.json_valid(GlobalEvent.payload), GlobalEvent.payload), else_="{}")
             history = (
                 writer.query(PresenceSession.id).filter_by(camera_id=camera_id).first()
+                or writer.query(HumanVisit.id).filter_by(camera_id=camera_id).first()
+                or writer.query(HumanJournalGap.id).filter_by(camera_id=camera_id).first()
                 or writer.query(RecordingSession.id).filter_by(camera_id=camera_id).first()
                 or writer.query(RecordingSegment.id).filter_by(camera_id=camera_id).first()
                 or writer.query(AttendanceEvent.id).filter_by(camera_id=camera_id).first()

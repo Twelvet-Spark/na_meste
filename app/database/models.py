@@ -465,3 +465,98 @@ class AttendanceRuntime(Base):
     monitoring_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class FaceModelMetadata(Base):
+    __tablename__ = "face_model_metadata"
+    face_id: Mapped[int] = mapped_column(ForeignKey("employee_faces.id", ondelete="CASCADE"), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(64))
+    alignment_id: Mapped[str] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (CheckConstraint("length(model_id) = 64"),
+                      CheckConstraint("length(alignment_id) BETWEEN 1 AND 40"))
+
+
+class CameraScene(Base):
+    __tablename__ = "camera_scenes"
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    source_revision: Mapped[int] = mapped_column(Integer)
+    reference_width: Mapped[int] = mapped_column(Integer)
+    reference_height: Mapped[int] = mapped_column(Integer)
+    geometry: Mapped[dict] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    __table_args__ = (CheckConstraint("revision >= 0"), CheckConstraint("source_revision >= 0"),
+                      CheckConstraint("reference_width > 0"), CheckConstraint("reference_height > 0"),
+                      CheckConstraint("json_valid(geometry)"))
+
+
+class HumanVisit(Base):
+    __tablename__ = "human_visits"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    tracking_generation: Mapped[str] = mapped_column(String(36))
+    track_id: Mapped[int] = mapped_column(Integer)
+    source_revision: Mapped[int] = mapped_column(Integer)
+    stream_id: Mapped[str] = mapped_column(String(36))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    end_reason: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="PROVISIONAL")
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    identity_state: Mapped[str] = mapped_column(String(20), default="UNKNOWN")
+    global_id: Mapped[int | None] = mapped_column(ForeignKey("global_persons.id", ondelete="SET NULL"))
+    last_bbox: Mapped[list] = mapped_column(JSON)
+    max_person_score: Mapped[float] = mapped_column(Float)
+    snapshot: Mapped[bytes | None] = mapped_column(LargeBinary)
+    face_thumbnail: Mapped[bytes | None] = mapped_column(LargeBinary)
+    face_quality: Mapped[dict | None] = mapped_column(JSON)
+    image_expires_at: Mapped[datetime] = mapped_column(DateTime)
+    images_purged_at: Mapped[datetime | None] = mapped_column(DateTime)
+    __table_args__ = (
+        UniqueConstraint("camera_id", "tracking_generation", "track_id"),
+        CheckConstraint("source_revision >= 1"),
+        CheckConstraint("last_seen_at >= started_at"),
+        CheckConstraint("ended_at IS NULL OR ended_at >= last_seen_at"),
+        CheckConstraint("status IN ('PROVISIONAL','ACTIVE','CLOSED')"),
+        CheckConstraint("status != 'CLOSED' OR ended_at IS NOT NULL"),
+        CheckConstraint("identity_state IN ('UNKNOWN','FACE_CONFIRMED','CONFLICT')"),
+        CheckConstraint("json_valid(last_bbox) AND json_type(last_bbox) = 'array' AND json_array_length(last_bbox) = 4"),
+        CheckConstraint("max_person_score BETWEEN 0 AND 1"),
+        CheckConstraint("snapshot IS NULL OR length(snapshot) <= 262144"),
+        CheckConstraint("face_thumbnail IS NULL OR length(face_thumbnail) <= 262144"),
+        Index("ix_human_visits_last_seen_id", "last_seen_at", "id"),
+        Index("ix_human_visits_camera_last_seen", "camera_id", "last_seen_at"),
+        Index("ix_human_visits_employee_last_seen", "employee_id", "last_seen_at"),
+    )
+
+
+class HumanVisitEvent(Base):
+    __tablename__ = "human_visit_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    visit_id: Mapped[str] = mapped_column(ForeignKey("human_visits.id", ondelete="CASCADE"))
+    dedupe_key: Mapped[str] = mapped_column(String(200), unique=True)
+    type: Mapped[str] = mapped_column(String(24))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime)
+    payload: Mapped[dict] = mapped_column(JSON)
+    __table_args__ = (
+        CheckConstraint("length(dedupe_key) BETWEEN 1 AND 200"),
+        CheckConstraint("type IN ('FIRST_SEEN','IDENTIFIED','IDENTITY_CONFLICT','LOST','RECOVERED','CLOSED','LINKED')"),
+        CheckConstraint("json_valid(payload) AND json_type(payload) = 'object' AND length(CAST(payload AS BLOB)) <= 16384"),
+        Index("ix_human_visit_events_visit_occurred", "visit_id", "occurred_at", "id"),
+    )
+
+
+class HumanJournalGap(Base):
+    __tablename__ = "human_journal_gaps"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    tracking_generation: Mapped[str] = mapped_column(String(36))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    reason: Mapped[str] = mapped_column(String(64))
+    __table_args__ = (
+        CheckConstraint("ended_at IS NULL OR ended_at >= started_at"),
+        Index("ix_human_journal_gaps_camera_started", "camera_id", "started_at"),
+    )

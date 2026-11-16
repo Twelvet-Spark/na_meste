@@ -1,6 +1,7 @@
 """Atomic employee identity/face-set transactions; original images are never stored."""
 import io
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
@@ -14,14 +15,15 @@ from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.ai.face_detector import ALIGNMENT_ID
 from app.ai.face_quality import measure_face_quality, quality_reasons
-from app.ai.face_recognition import EmbeddingStore, normalized_embedding
+from app.ai.face_recognition import EmbeddingStore, normalized_embedding, stored_embedding
 from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
     AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
     EmployeeFace, EmployeeWorkplace, GlobalPerson, OperatorRequest, PresenceSession,
-    WorkSession, Workplace,
+    WorkSession, Workplace, HumanVisit, FaceModelMetadata,
 )
 from app.services.attendance_evidence import encode_evidence
 from app.services.workplace_service import WorkplaceOut, replace_assignments, validate_assignments
@@ -112,6 +114,8 @@ class EmployeeOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     faces_count: int = 0
+    usable_faces_count: int = 0
+    face_model_id: str | None = None
     faces: list[FaceOut] = Field(default_factory=list)
     workplaces: list[WorkplaceOut] = Field(default_factory=list)
     needs_name_completion: bool = False
@@ -131,6 +135,21 @@ class PreparedFace:
     filename: str
     embedding: bytes
     thumbnail: bytes
+    model_id: str
+    alignment_id: str
+
+
+@contextmanager
+def enrollment_slot(semaphore):
+    """One shared nonblocking lease around the entire expensive preparation."""
+    if semaphore is None:
+        raise HTTPException(503, {"code": "ENROLLMENT_UNAVAILABLE"})
+    if not semaphore.acquire(blocking=False):
+        raise HTTPException(503, {"code": "ENROLLMENT_BUSY"})
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 def get_employee(db, employee_id):
@@ -141,18 +160,24 @@ def list_employees(db):
     return db.query(Employee).order_by(Employee.name).all()
 
 
-def employee_out(db, employee):
+def employee_out(db, employee, *, model_id: str | None = None):
     data = EmployeeOut.model_validate(employee)
-    samples = db.query(EmployeeFace.id, EmployeeFace.created_at).filter(
-        EmployeeFace.employee_id == employee.id).order_by(EmployeeFace.id).all()
+    samples = db.query(EmployeeFace.id, EmployeeFace.created_at, EmployeeFace.embedding,
+                       FaceModelMetadata.model_id, FaceModelMetadata.alignment_id).outerjoin(
+        FaceModelMetadata, FaceModelMetadata.face_id == EmployeeFace.id,
+    ).filter(EmployeeFace.employee_id == employee.id).order_by(EmployeeFace.id).all()
     data.faces = [FaceOut(id=row.id, created_at=row.created_at,
                           thumbnail_url=f"/api/employees/{employee.id}/faces/{row.id}/thumbnail") for row in samples]
     data.faces_count = len(samples)
+    data.face_model_id = model_id
+    data.usable_faces_count = sum(
+        model_id is not None and row.model_id == model_id and row.alignment_id == ALIGNMENT_ID
+        and stored_embedding(row.embedding) is not None for row in samples)
     data.workplaces = [WorkplaceOut.model_validate(row) for row in db.query(Workplace).join(
         EmployeeWorkplace, Workplace.id == EmployeeWorkplace.workplace_id).filter(
             EmployeeWorkplace.employee_id == employee.id).order_by(Workplace.name, Workplace.id)]
     data.needs_name_completion = not (employee.first_name and employee.last_name)
-    data.needs_photo_remediation = not 1 <= len(samples) <= 15
+    data.needs_photo_remediation = not 1 <= len(samples) <= 15 or data.usable_faces_count != len(samples)
     return data.model_dump(mode="json")
 
 
@@ -188,6 +213,8 @@ def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace
     if len(observations) != 1:
         return failed("На фотографии должно быть ровно одно лицо")
     observation = observations[0]
+    if observation.model_id != face_engine.model_id or face_engine.alignment_id != ALIGNMENT_ID:
+        return failed("Несовместимая модель или схема выравнивания лица")
     reasons = quality_reasons(measure_face_quality(observation), min_size=max(80, settings.face_min_size),
                               det_score=.80, blur_min=20.)
     embedding = normalized_embedding(observation.embedding)
@@ -200,7 +227,7 @@ def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace
     thumbnail = encode_evidence(before=None, after=None, face=observation.aligned).face_jpeg
     if thumbnail is None:
         return failed("Не удалось сохранить выровненное лицо")
-    return PreparedFace(filename, embedding.tobytes(), thumbnail)
+    return PreparedFace(filename, embedding.tobytes(), thumbnail, face_engine.model_id, face_engine.alignment_id)
 
 
 def committed_request(db, request_id, digest):
@@ -212,23 +239,39 @@ def committed_request(db, request_id, digest):
 
 def _advance_gallery(db):
     db.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
-        gallery_revision=AttendanceRuntime.gallery_revision + 1))
+        gallery_revision=AttendanceRuntime.gallery_revision + 1, commission_id=None))
 
 
-def _check_faces(db, employee_id, prepared_faces):
-    gallery = EmbeddingStore()
+def _check_faces(db, employee_id, prepared_faces, model_id):
+    gallery = EmbeddingStore(model_id)
     gallery.refresh(db)
     errors = []
     for index, sample in enumerate(prepared_faces):
+        if (sample.model_id != model_id or sample.alignment_id != ALIGNMENT_ID
+                or stored_embedding(sample.embedding) is None):
+            errors.append({"index": index, "filename": sample.filename,
+                           "error": "Несовместимый или некорректный образец лица"})
+            continue
         match = gallery.match(np.frombuffer(sample.embedding, dtype=np.float32), exclude_employee_id=employee_id)
-        if match.employee_id is not None and match.score >= .55 and match.margin >= .08:
+        if match.employee_id is not None and match.score >= .60 and match.margin >= .10:
             errors.append({"index": index, "filename": sample.filename,
                            "error": "Лицо совпадает с другим активным сотрудником"})
     if errors:
         raise photo_failure(errors)
 
 
-def create_employee_with_faces(db: Session, data: EmployeeCreate, prepared_faces, payload_sha256) -> Employee:
+def _insert_faces(db, employee_id, prepared_faces):
+    samples = [EmployeeFace(employee_id=employee_id, embedding=row.embedding,
+                            thumbnail=row.thumbnail, created_at=utcnow()) for row in prepared_faces]
+    db.add_all(samples)
+    db.flush()
+    db.add_all(FaceModelMetadata(face_id=face.id, model_id=prepared.model_id,
+                                 alignment_id=prepared.alignment_id, created_at=utcnow())
+               for face, prepared in zip(samples, prepared_faces))
+
+
+def create_employee_with_faces(db: Session, data: EmployeeCreate, prepared_faces, payload_sha256,
+                               *, model_id: str) -> Employee:
     bind = db.get_bind().engine
     db.rollback()
     try:
@@ -239,26 +282,27 @@ def create_employee_with_faces(db: Session, data: EmployeeCreate, prepared_faces
             if not 1 <= len(prepared_faces) <= 15:
                 raise HTTPException(422, "Нужно от 1 до 15 фотографий")
             validate_assignments(writer, data.workplace_ids)
-            _check_faces(writer, None, prepared_faces)
+            _check_faces(writer, None, prepared_faces, model_id)
             employee = Employee(first_name=data.first_name, last_name=data.last_name,
                                 name=f"{data.last_name} {data.first_name}", external_id=data.external_id,
                                 active=data.active, revision=1, created_at=utcnow(), updated_at=utcnow())
             writer.add(employee)
             writer.flush()
-            writer.add_all(EmployeeFace(employee_id=employee.id, embedding=row.embedding,
-                                        thumbnail=row.thumbnail, created_at=utcnow()) for row in prepared_faces)
+            _insert_faces(writer, employee.id, prepared_faces)
             replace_assignments(writer, employee.id, data.workplace_ids)
             _advance_gallery(writer)
             writer.flush()
             writer.add(OperatorRequest(id=str(data.request_id), operation="employee.create",
-                                       payload_sha256=payload_sha256, result=employee_out(writer, employee)))
+                                       payload_sha256=payload_sha256,
+                                       result=employee_out(writer, employee, model_id=model_id)))
         db.expire_all()
         return employee
     except SQLAlchemyError as exc:
         raise HTTPException(503, "База данных недоступна") from exc
 
 
-def replace_employee_faces(db: Session, employee_id, expected_revision, keep_face_ids, prepared_faces) -> Employee:
+def replace_employee_faces(db: Session, employee_id, expected_revision, keep_face_ids, prepared_faces,
+                           *, model_id: str) -> Employee:
     bind = db.get_bind().engine
     db.rollback()
     try:
@@ -269,10 +313,9 @@ def replace_employee_faces(db: Session, employee_id, expected_revision, keep_fac
             if (len(keep_face_ids) != len(set(keep_face_ids)) or not set(keep_face_ids) <= owned
                     or not 1 <= len(keep_face_ids) + len(prepared_faces) <= 15):
                 raise HTTPException(422, "Итоговый набор должен содержать 1–15 собственных фотографий без повторов")
-            _check_faces(writer, employee_id, prepared_faces)
+            _check_faces(writer, employee_id, prepared_faces, model_id)
             # Insert before deleting so SQLite cannot recycle an omitted thumbnail ID.
-            writer.add_all(EmployeeFace(employee_id=employee_id, embedding=row.embedding,
-                                        thumbnail=row.thumbnail, created_at=utcnow()) for row in prepared_faces)
+            _insert_faces(writer, employee_id, prepared_faces)
             writer.flush()
             removed = owned - set(keep_face_ids)
             if removed:
@@ -330,6 +373,7 @@ def delete_employee(db: Session, employee: Employee):
                        or writer.query(AttendanceEmployeeReference.event_id).filter_by(employee_id=employee_id).first()
                        or writer.query(WorkSession.entry_event_id).filter_by(employee_id=employee_id).first()
                        or writer.query(AttendanceEvent.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(HumanVisit.id).filter_by(employee_id=employee_id).first()
                        or writer.query(GlobalPerson.id).filter_by(employee_id=employee_id).first())
             if history:
                 raise HTTPException(409, "У сотрудника есть история; отключите активность вместо удаления")

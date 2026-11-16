@@ -52,6 +52,8 @@ SECRETS = (TOKEN, OTHER_TOKEN, PASSWORD, USERNAME, AUTH, COOKIE)
 EDITABLE = {
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
     "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
+    "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",
@@ -243,9 +245,9 @@ def test_public_allowlist_constraints_and_deployment_fields_cannot_be_written():
         assert view["read_only"]["recording_max_duration_seconds"] == 86400
         assert view["read_only"]["attendance_utc_offset_minutes"] == 300
         for key in ("database_url", "app_host", "app_port", "recording_root", "recording_min_free_bytes",
-                    "recording_max_duration_seconds", "attendance_utc_offset_minutes", "yolo_model",
+                    "recording_max_duration_seconds", "attendance_utc_offset_minutes", "ai_model_manifest",
                     "cuda_dll_path", "topology_config", "reid_similarity_threshold",
-                    "min_recognition_confidence", "unknown"):
+                    "person_confidence", "unknown"):
             no_secrets(save(f, {key: TOKEN}, status=422))
             save(f, reset_keys=[key], status=422)
         assert not f.path.exists()
@@ -257,6 +259,9 @@ def test_each_editable_field_accepts_valid_value_and_remains_pending():
         "preview_fps": 30, "rtsp_connect_timeout": 60, "rtsp_reconnect_max_delay": 300,
         "frame_stall_timeout": 120, "ai_enabled": False, "ai_device": "cpu", "ai_fps": 30,
         "ai_cameras": "", "attendance_ai_fps": 12.5, "attendance_frame_max_age": 2.,
+        "min_recognition_confidence": .72, "min_confirmations": 4,
+        "face_recognition_retry_interval": .4, "live_face_min_size": 64,
+        "live_face_margin": .12, "live_face_window": 3., "live_face_recheck_interval": 3.,
         "attendance_max_frame_gap": 1., "attendance_face_threshold": .65,
         "attendance_face_margin": .12, "attendance_face_confirmations": 4,
         "attendance_face_window": 2., "attendance_face_interval": .5,
@@ -285,6 +290,11 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
         "rtsp_reconnect_max_delay": [0, 301], "frame_stall_timeout": [0, 121],
         "ai_fps": [0, -1, 30.1, float("nan"), float("inf"), float("-inf")],
         "ai_device": ["gpu", "", TOKEN], "attendance_ai_fps": [0, float("inf")],
+        "min_recognition_confidence": [-.01, 1.01, float("nan")],
+        "min_confirmations": [0, 1.5, True], "face_recognition_retry_interval": [0, float("inf")],
+        "live_face_min_size": [0, 1.5, 4097], "live_face_margin": [-.01, 1.01, float("inf")],
+        "live_face_window": [0, 60.1, float("nan")],
+        "live_face_recheck_interval": [0, 60.1, float("inf")],
         "attendance_frame_max_age": [0, float("nan")], "attendance_max_frame_gap": [0, float("inf")],
         "attendance_face_threshold": [-.01, 1.01, float("nan")],
         "attendance_face_margin": [-.01, 1.01, float("inf")],
@@ -494,7 +504,9 @@ def diagnostics():
             db.commit()
         state = f.app.state
         state.manager, state.ai_worker, state.face_engine = manager, None, None
-        state.attendance = AttendanceService(f.engine)
+        state.attendance = AttendanceService(f.engine, model_bundle=None)
+        state.model_bundle, state.gallery_migration = None, None
+        state.legacy_model_settings_ignored = ()
         state.recordings = RecordingManager(f.engine, f.root / "recordings", None, None)
         stack.callback(state.recordings.shutdown)
         state.recording_error, state.playbacks, state.playback_error = None, None, None
@@ -520,6 +532,88 @@ def test_diagnostics_reports_actual_ai_off_camera_off_and_no_false_commission():
         assert view["recordings"]["storage"]["oldest_available"] is None
         assert view["updated_at"]
         no_secrets(view)
+
+
+@test
+def test_diagnostics_reports_missing_models_without_constructing_sessions():
+    with diagnostics() as f:
+        view = f.client.json("GET", "/api/debug/status")
+        models = view["models"]
+        assert models["bundle_id"] is None and models["face_model_id"] is None
+        assert models["error_code"] == "MODEL_MISSING"
+        assert models["component_status"] == {
+            key: "MODEL_MISSING" for key in ("person", "face_detection", "face_recognition", "body", "scene")
+        }
+        assert models["gallery_migration"] is None
+        assert models["legacy_model_settings_ignored"] == []
+        no_secrets(view)
+
+
+@test
+def test_model_diagnostics_projects_only_safe_ids_codes_counts_and_ignored_setting_names():
+    from test_attendance_service import model_bundle_fixture
+    with diagnostics() as f:
+        bundle = model_bundle_fixture()
+        bundle.metadata["private_path"] = URL
+        bundle.component_paths["person"] = Path(USERNAME) / PASSWORD
+        bundle.component_status.update(body=URL, scene="MODEL_HASH_MISMATCH", **{AUTH: COOKIE})
+        f.app.state.model_bundle = bundle
+        f.app.state.gallery_migration = {
+            "face_model_id": "b" * 64, "alignment_id": "arcface-5pt-112-v1",
+            "stored_faces_count": 6, "usable_faces_count": 4, "faces_reencoded": 3,
+            "faces_need_reenrollment": 2, "employees_needing_photos": [1, 2, TOKEN],
+            "employee_names": [USERNAME], "source_url": URL, "embedding": PASSWORD,
+            "error_code": "GALLERY_CHANGED",
+        }
+        f.app.state.legacy_model_settings_ignored = (
+            "YOLO_MODEL", "INSIGHTFACE_MODEL", "INSIGHTFACE_ROOT", "REID_MODEL",
+            "TELEGRAM_BOT_TOKEN", TOKEN, URL, "insightface_model",
+        )
+        view = f.client.json("GET", "/api/debug/status")
+        models = view["models"]
+        assert models["bundle_id"] == "a" * 64 and models["face_model_id"] == "b" * 64
+        assert models["alignment_id"] == "arcface-5pt-112-v1"
+        assert models["component_status"]["body"] == "MODEL_CONTRACT_INVALID"
+        assert models["component_status"]["scene"] == "MODEL_HASH_MISMATCH"
+        assert models["error_code"] is None
+        assert models["gallery_migration"] == {
+            "face_model_id": "b" * 64, "alignment_id": "arcface-5pt-112-v1",
+            "stored_faces_count": 6, "usable_faces_count": 4, "faces_reencoded": 3,
+            "faces_need_reenrollment": 2, "employees_needing_photos_count": 3,
+            "error_code": "GALLERY_CHANGED",
+        }
+        assert models["legacy_model_settings_ignored"] == [
+            "YOLO_MODEL", "INSIGHTFACE_MODEL", "INSIGHTFACE_ROOT", "REID_MODEL",
+        ]
+        assert models["legacy_model_settings_code"] == "LEGACY_MODEL_SETTINGS_IGNORED"
+        no_secrets(view)
+        assert "employees_needing_photos" not in models["gallery_migration"]
+        assert "metadata" not in models and "component_paths" not in models
+        bundle.bundle_id, bundle.face_model_id, bundle.alignment_id = URL, TOKEN, PASSWORD
+        f.app.state.gallery_migration = {
+            "face_model_id": AUTH, "alignment_id": COOKIE, "usable_faces_count": float("inf"),
+            "employees_needing_photos": URL, "error_code": URL,
+        }
+        invalid = f.client.json("GET", "/api/debug/export")
+        no_secrets(invalid)
+        assert invalid["status"]["models"]["bundle_id"] is None
+        assert invalid["status"]["models"]["face_model_id"] is None
+        assert invalid["status"]["models"]["alignment_id"] is None
+        assert invalid["status"]["models"]["gallery_migration"]["usable_faces_count"] is None
+        assert invalid["status"]["models"]["gallery_migration"]["employees_needing_photos_count"] is None
+
+
+@test
+def test_model_failure_codes_remain_static_in_support_events():
+    module = feature("app.services.diagnostics_service")
+    ring = module.DiagnosticRing()
+    codes = ("MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID",
+             "FACE_MODEL_UNAVAILABLE", "GALLERY_UNAVAILABLE", "GALLERY_CHANGED",
+             "JOURNAL_DEGRADED", "CAPACITY_DEGRADED", "DECODE_SOFTWARE_FALLBACK",
+             "SCENE_MODEL_UNAVAILABLE", "ENROLLMENT_BUSY")
+    for code in codes:
+        ring.emit(logging.LogRecord("app.ai", logging.WARNING, __file__, 1, code, (), None))
+    assert [item["code"] for item in ring.export()["events"]] == list(codes)
 
 
 @test
@@ -642,8 +736,9 @@ def test_pending_threshold_does_not_change_commission_until_next_startup():
     from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime
     from app.services import attendance_service
     from app.services.attendance_health import PROVIDER_KEYS
+    from test_attendance_service import model_bundle_fixture
     with api() as f:
-        service = attendance_service.AttendanceService(f.engine)
+        service = attendance_service.AttendanceService(f.engine, model_bundle=model_bundle_fixture())
         providers = {key: ["CUDAExecutionProvider"] for key in PROVIDER_KEYS}
         with patch.object(attendance_service, "settings", f.active), Session(f.engine) as db:
             for ident, role in ((1, "ENTRY"), (2, "EXIT")):
@@ -681,10 +776,16 @@ def test_diagnostics_projects_scalar_allowlists_not_runtime_objects_or_raw_error
         reader._set_status(CameraStatus.ERROR)
         reader.command_args = ["ffmpeg", "-i", URL]
         f.app.state.manager._readers[1] = reader
-        f.app.state.attendance.health.set_providers({"yolo": ["CPUExecutionProvider", TOKEN]})
+        f.app.state.attendance.health.set_providers({
+            "person_detection": ["CPUExecutionProvider", TOKEN],
+            "scene_encoder": ["CPUExecutionProvider"], "scene_decoder": ["CPUExecutionProvider"],
+            "reid": ["CPUExecutionProvider"],
+        })
         view = f.client.json("GET", "/api/debug/status")
         no_secrets(view)
-        assert view["ai"]["providers"]["yolo"] == ["CPUExecutionProvider"]
+        assert view["ai"]["providers"]["person_detection"] == ["CPUExecutionProvider"]
+        assert view["ai"]["providers"]["scene_encoder"] == ["CPUExecutionProvider"]
+        assert view["ai"]["providers"]["scene_decoder"] == ["CPUExecutionProvider"]
         camera = next(row for row in view["cameras"] if row["id"] == 1)
         assert camera["error"] == "STREAM_UNAVAILABLE"
         assert camera["current_fps"] is None

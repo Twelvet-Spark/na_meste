@@ -15,6 +15,8 @@ from app import setup_transfer as transfer
 
 TESTS = []
 PASSWORD = " перенос-secret-2026 "
+MODEL_ID = "1" * 64
+ALIGNMENT_ID = "arcface-5pt-112-v1"
 
 
 def test(fn):
@@ -26,9 +28,9 @@ def document():
     image = io.BytesIO()
     Image.new("RGB", (112, 112), "navy").save(image, "JPEG")
     return {
-        "transfer_version": 1, "exported_at": "2026-11-16T10:00:00+00:00",
-        "attendance_schema_version": 1, "operator_schema_version": 3,
-        "embedding_model": "buffalo_l", "embedding_encoding": "float32-le-512",
+        "transfer_version": 2, "exported_at": "2026-11-16T10:00:00+00:00",
+        "attendance_schema_version": 1, "operator_schema_version": 4,
+        "face_model_id": MODEL_ID, "embedding_encoding": "float32-le-512",
         "cameras": [{"id": 7, "name": "Магазин", "nvr_host": "127.0.0.1", "rtsp_port": 554,
                      "username": "viewer", "password": "sentinel-device-password", "channel": 2,
                      "stream_type": "sub", "enabled": True, "created_at": "2026-01-01T00:00:00Z",
@@ -43,13 +45,29 @@ def document():
                        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z"}],
         "faces": [{"id": 12, "employee_id": 4,
                    "embedding": base64.b64encode(struct.pack("<512f", 1., *([0.] * 511))).decode(),
-                   "thumbnail": base64.b64encode(image.getvalue()).decode(), "created_at": "2026-01-01T00:00:00Z"}],
+                   "thumbnail": base64.b64encode(image.getvalue()).decode(), "created_at": "2026-01-01T00:00:00Z",
+                   "face_model_id": MODEL_ID, "alignment_id": ALIGNMENT_ID}],
         "assignments": [{"employee_id": 4, "workplace_id": 9}],
+        "scenes": [{"camera_id": 7, "reference_width": 1920, "reference_height": 1080,
+                    "geometry": {"version": 1, "floor": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                                 "objects": [], "metric": None}}],
     }
 
 
+def legacy_document():
+    data = document()
+    data.update(transfer_version=1, operator_schema_version=3, embedding_model="buffalo_l")
+    del data["face_model_id"]
+    del data["scenes"]
+    for face in data["faces"]:
+        del face["face_model_id"]
+        del face["alignment_id"]
+    return data
+
+
 def parse(data):
-    return transfer.validate_document(json.dumps(data, ensure_ascii=False).encode(), expected_model="buffalo_l")
+    return transfer.validate_document(json.dumps(data, ensure_ascii=False).encode(),
+                                      expected_face_model_id=MODEL_ID)
 
 
 def refused(fn, code=None):
@@ -72,37 +90,37 @@ def roundtrip_preserves_setup_and_hides_credentials():
     assert first != second
     assert b"sentinel-device-password" not in first
     assert "sentinel-device-password" not in repr(source)
-    result = transfer.decode_transfer(first, PASSWORD, expected_model="buffalo_l")
+    result = transfer.decode_transfer(first, PASSWORD, expected_face_model_id=MODEL_ID)
     assert result.model_dump(mode="json") == source.model_dump(mode="json")
     assert result.cameras[0].password == "sentinel-device-password"
     assert result.workplaces[0].active is False
     assert result.employees[0].first_name is None
-    assert result.counts().model_dump() == {"cameras": 1, "workplaces": 1, "employees": 1, "faces": 1, "assignments": 1}
+    assert result.counts().model_dump() == {"cameras": 1, "workplaces": 1, "employees": 1, "faces": 1, "assignments": 1, "scenes": 1}
 
 
 @test
 def password_and_corruption_are_authenticated():
     blob = transfer.encode_transfer(parse(document()), PASSWORD)
-    refused(lambda: transfer.decode_transfer(blob, "wrong-password-2026", expected_model="buffalo_l"))
+    refused(lambda: transfer.decode_transfer(blob, "wrong-password-2026", expected_face_model_id=MODEL_ID))
     for index in (0, 9, 25, 40, len(blob)-1):
         damaged = bytearray(blob)
         damaged[index] ^= 1
-        refused(lambda: transfer.decode_transfer(bytes(damaged), PASSWORD, expected_model="buffalo_l"))
-    refused(lambda: transfer.decode_transfer(blob[:-10], PASSWORD, expected_model="buffalo_l"))
+        refused(lambda: transfer.decode_transfer(bytes(damaged), PASSWORD, expected_face_model_id=MODEL_ID))
+    refused(lambda: transfer.decode_transfer(blob[:-10], PASSWORD, expected_face_model_id=MODEL_ID))
     refused(lambda: transfer.encode_transfer(parse(document()), "short"), "TRANSFER_PASSWORD_INVALID")
-    refused(lambda: transfer.decode_transfer(blob, PASSWORD.strip(), expected_model="buffalo_l"))
+    refused(lambda: transfer.decode_transfer(blob, PASSWORD.strip(), expected_face_model_id=MODEL_ID))
 
 
 @test
 def schema_model_and_unknown_fields_fail_closed():
-    for key, value in (("transfer_version", 2), ("operator_schema_version", 999),
-                       ("attendance_schema_version", 999), ("embedding_model", "other"),
+    for key, value in (("transfer_version", 3), ("operator_schema_version", 999),
+                       ("attendance_schema_version", 999), ("face_model_id", "2" * 64),
                        ("embedding_encoding", "pickle"), ("videos", [])):
         data = document()
         data[key] = value
         refused(lambda: parse(data))
-    refused(lambda: transfer.validate_document(b'{"a":1,"a":2}', expected_model="buffalo_l"))
-    refused(lambda: transfer.validate_document(b'[' * 17 + b'0' + b']' * 17, expected_model="buffalo_l"))
+    refused(lambda: transfer.validate_document(b'{"a":1,"a":2}', expected_face_model_id=MODEL_ID))
+    refused(lambda: transfer.validate_document(b'[' * 17 + b'0' + b']' * 17, expected_face_model_id=MODEL_ID))
 
 
 @test
@@ -129,15 +147,14 @@ def malformed_links_geometry_and_fields_are_rejected():
 
 
 @test
-def invalid_biometrics_cannot_enter_gallery():
-    for raw in (b"bad", struct.pack("<512f", *([0.] * 512)), struct.pack("<512f", float("nan"), *([0.] * 511)), struct.pack("<512f", 1e20, *([0.] * 511))):
+def invalid_binary_encoding_is_rejected_before_preparation():
+    for raw in (b"bad", b"x" * 2049):
         data = document()
         data["faces"][0]["embedding"] = base64.b64encode(raw).decode()
         refused(lambda: parse(data))
-    for value in ("not base64!", base64.b64encode(b"not an image").decode()):
-        data = document()
-        data["faces"][0]["thumbnail"] = value
-        refused(lambda: parse(data))
+    data = document()
+    data["faces"][0]["thumbnail"] = "not base64!"
+    refused(lambda: parse(data))
 
 
 @test
@@ -149,7 +166,7 @@ def legacy_missing_samples_and_limits_are_not_silent_truncation():
     assert parse(data).counts().faces == 0
     with patch.object(transfer, "MAX_FILE_BYTES", 100):
         refused(lambda: parse(document()), "TRANSFER_TOO_LARGE")
-        refused(lambda: transfer.decode_transfer(b"x" * 101, PASSWORD, expected_model="buffalo_l"), "TRANSFER_TOO_LARGE")
+        refused(lambda: transfer.decode_transfer(b"x" * 101, PASSWORD, expected_face_model_id=MODEL_ID), "TRANSFER_TOO_LARGE")
     data = document()
     data["cameras"] *= 10001
     refused(lambda: parse(data))
@@ -177,11 +194,88 @@ def excessive_json_records_are_rejected_without_materialization_spike():
     payload = b'{"faces":[' + b'{},' * 200000 + b'{}]}'
     tracemalloc.start()
     try:
-        refused(lambda: transfer.validate_document(payload, expected_model="buffalo_l"))
+        refused(lambda: transfer.validate_document(payload, expected_face_model_id=MODEL_ID))
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
     assert peak < 8 * 1024 * 1024, f"unbounded decoder allocation: {peak}"
+
+
+@test
+def legacy_decoder_accepts_package_name_without_comparing_target_space():
+    data = legacy_document()
+    data["embedding_model"] = "another_legacy-package.v1"
+    restored = transfer.decode_transfer(transfer.encode_transfer(parse(data), PASSWORD), PASSWORD,
+                                        expected_face_model_id=MODEL_ID)
+    assert restored.transfer_version == 1 and restored.faces[0].id == 12
+    for value in ("../buffalo_l", "https://example.test/model", "", "bad name", "a" * 101):
+        data["embedding_model"] = value
+        refused(lambda: parse(data), "TRANSFER_INVALID")
+
+
+@test
+def provenance_is_paired_and_every_populated_sample_must_match():
+    for values in ({"face_model_id": None}, {"alignment_id": None}):
+        data = document()
+        data["faces"][0].update(values)
+        refused(lambda: parse(data), "TRANSFER_INVALID")
+    for values in ({"face_model_id": "2" * 64}, {"alignment_id": "other-alignment"}):
+        data = document()
+        data["faces"].append({**data["faces"][0], "id": 13, **values})
+        # Mixed actual provenance can be exported, but cannot be imported into this space.
+        source = transfer.validate_document(json.dumps(data).encode())
+        blob = transfer.encode_transfer(source, PASSWORD)
+        refused(lambda: transfer.decode_transfer(blob, PASSWORD, expected_face_model_id=MODEL_ID),
+                "TRANSFER_MODEL_MISMATCH")
+    data = document()
+    data["faces"][0].update(face_model_id=None, alignment_id=None,
+                             thumbnail=base64.b64encode(b"malformed aligned JPEG").decode())
+    assert parse(data).faces[0].face_model_id is None
+    for value in ("not-a-hash", "A" * 64):
+        data["face_model_id"] = value
+        refused(lambda: parse(data), "TRANSFER_INVALID")
+
+
+@test
+def scenes_accept_only_bounded_normalized_geometry_without_runtime_state():
+    mutations = [
+        lambda g: g.update(version=2),
+        lambda g: g.update(version=True),
+        lambda g: g.update(snapshot_id="secret"),
+        lambda g: g.update(floor=[[0., 0.], [1., 0.]]),
+        lambda g: g.update(floor=[[0., 0.], [1.1, 0.], [0., 1.]]),
+        lambda g: g.update(floor=[[0., 0.], [float("inf"), 0.], [0., 1.]]),
+        lambda g: g.update(floor=[[0., 0.], [1., 0.], [0., 1.]] * 43),
+        lambda g: g.update(objects=[{"id": "bad", "label": "Стол", "polygon": [[0., 0.], [1., 0.], [0., 1.]]}]),
+        lambda g: g.update(objects=[{"id": "00000000-0000-4000-8000-000000000001", "label": "x" * 81,
+                                    "polygon": [[0., 0.], [1., 0.], [0., 1.]]}]),
+        lambda g: g.update(objects=[{"id": f"00000000-0000-4000-8000-{i:012d}", "label": "Стол",
+                                    "polygon": [[0., 0.], [1., 0.], [0., 1.]]} for i in range(33)]),
+        lambda g: g.update(metric={"corners": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                                   "width_m": 0, "depth_m": 3.}),
+        lambda g: g.update(metric={"corners": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                                   "width_m": 1000.01, "depth_m": 3.}),
+        lambda g: g.update(floor=None, metric={"corners": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                                               "width_m": 4., "depth_m": 3.}),
+    ]
+    for mutation in mutations:
+        data = document()
+        mutation(data["scenes"][0]["geometry"])
+        refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = document()
+    obj = {"id": "00000000-0000-4000-8000-000000000001", "label": "Стол",
+           "polygon": [[0., 0.], [1., 0.], [0., 1.]]}
+    data["scenes"][0]["geometry"]["objects"] = [obj, obj]
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = document()
+    data["scenes"][0]["source_revision"] = 42
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = document()
+    data["scenes"][0]["camera_id"] = 999
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = document()
+    data["scenes"].append(copy.deepcopy(data["scenes"][0]))
+    refused(lambda: parse(data), "TRANSFER_INVALID")
 
 
 if __name__ == "__main__":

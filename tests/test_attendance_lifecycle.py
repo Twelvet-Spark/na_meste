@@ -637,7 +637,7 @@ class Readers:
 
 def worker_for(engine, attendance, clock):
     health = health_for(attendance, clock)
-    store = EmbeddingStore()
+    store = EmbeddingStore("a" * 64)
     with Session(engine) as db:
         store.refresh(db)
     observations = PersonObservations()
@@ -823,6 +823,8 @@ def test_lifespan_restores_enabled_frozen_sources_and_keeps_manual_access_when_a
         with patch.object(main, "init_db"), patch.object(main, "SessionLocal", factory), \
                 patch.object(main, "engine", engine), \
                 patch.object(settings, "recording_root", Path(engine.url.database).parent / "recordings"), \
+                patch.dict("os.environ", {"OPERATOR_SETTINGS_PATH": str(Path(engine.url.database).with_name("operator-settings.json"))}), \
+                patch.object(settings, "ai_model_manifest", str(Path(engine.url.database).with_name("missing-manifest.json"))), \
                 patch("app.media.process_guard.MediaProcessGuard.initialize", return_value=True), \
                 patch.object(main, "build_enroll_engine", return_value=None), \
                 patch.object(settings, "ai_enabled", False), \
@@ -845,7 +847,9 @@ def test_loaded_sessions_not_requested_cuda_determine_commission_validity():
 
     cpu = SimpleNamespace(session=SessionProviders(["CPUExecutionProvider"]))
     cuda = SimpleNamespace(session=SessionProviders(["CUDAExecutionProvider", "CPUExecutionProvider"]))
-    faces = SimpleNamespace(app=SimpleNamespace(models={"detection": cuda, "recognition": cpu}))
+    faces = SimpleNamespace(providers=lambda: {
+        "detection": cuda.session.get_providers(),
+        "recognition": cpu.session.get_providers()})
     with database(commissioned=True) as (engine, service):
         with patch.object(settings, "ai_device", "cuda"):
             service.health.set_providers(loaded_providers(detector=cuda, live=faces, enroll=faces))
@@ -856,25 +860,6 @@ def test_loaded_sessions_not_requested_cuda_determine_commission_validity():
         assert service.health.snapshot()["providers"]["live_face_recognition"] == ["CPUExecutionProvider"]
 
 
-@test
-def test_model_file_replacement_revokes_commission_without_loading_any_model():
-    import tempfile
-    with tempfile.TemporaryDirectory() as directory:
-        model = Path(directory) / "model.onnx"
-        model.write_bytes(b"isolated fingerprint fixture")
-        with patch.object(settings, "yolo_model", str(model)):
-            with database(commissioned=True) as (engine, service):
-                clock = Clock()
-                health = health_for(service, clock)
-                warm(health, clock)
-                monitor = AttendanceMonitor(service, now=clock.utcnow, monotonic=clock.monotonic)
-                monitor.tick()
-                with Session(engine) as db:
-                    assert db.get(AttendanceRuntime, 1).commission_id is not None
-                model.write_bytes(b"replacement model with a different size")
-                monitor.tick()
-                with Session(engine) as db:
-                    assert db.get(AttendanceRuntime, 1).commission_id is None
 
 
 @test

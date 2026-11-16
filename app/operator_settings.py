@@ -14,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 EDITABLE = (
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
     "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
+    "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",

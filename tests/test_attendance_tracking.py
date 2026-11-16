@@ -168,7 +168,7 @@ class NoFaces:
 @test
 def test_recognition_reset_always_changes_generation_and_clears_employee_cache():
     detector = Detector()
-    service = RecognitionService(detector, NoFaces(), EmbeddingStore(), min_hits=1)
+    service = RecognitionService(detector, NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
     first = service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
     identified(service._trackers[1].tracks[0])
     generation = service.reset_camera(1)
@@ -183,7 +183,7 @@ def test_recognition_reset_always_changes_generation_and_clears_employee_cache()
 @test
 def test_recognition_never_displays_cached_employee_after_ambiguous_overlap():
     detector = Detector()
-    service = RecognitionService(detector, NoFaces(), EmbeddingStore(), min_hits=1)
+    service = RecognitionService(detector, NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
     service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
     identified(service._trackers[1].tracks[0])
     detector.persons = [(box(-2., 98.), .99), (box(2., 102.), .99)]

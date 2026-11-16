@@ -56,21 +56,22 @@ class Settings(BaseSettings):
     ai_fps: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False)
     ai_cameras: str = ""                    # canonical sorted IDs; empty = all cameras
     ai_device: Literal["auto", "cpu", "cuda"] = "auto"
-    person_confidence: float = 0.35         # порог YOLO для человека
+    person_confidence: float = Field(default=0.1, ge=0.1, le=1, allow_inf_nan=False)
     tracker_new_track_threshold: float = 0.5  # score детекции, создающей НОВЫЙ трек
                                               # (ниже — детекция только продлевает существующий)
     track_lost_timeout: float = 3.0         # сек grace period трека (re-identification)
     min_recognition_confidence: float = Field(
-        default=0.45,
+        default=0.60, ge=0, le=1, allow_inf_nan=False,
         validation_alias=AliasChoices("MIN_RECOGNITION_CONFIDENCE", "FACE_RECOGNITION_THRESHOLD"),
     )
-    min_confirmations: int = 2              # подряд совпавших распознаваний до подтверждения
-    face_recognition_retry_interval: float = 2.0  # сек между попытками распознать неизвестного
+    min_confirmations: int = Field(default=3, ge=1)
+    face_recognition_retry_interval: float = Field(default=0.5, gt=0, allow_inf_nan=False)
+    live_face_min_size: int = Field(default=48, ge=1, le=4096)
+    live_face_margin: float = Field(default=0.10, ge=0, le=1, allow_inf_nan=False)
+    live_face_window: float = Field(default=2.0, gt=0, le=60, allow_inf_nan=False)
+    live_face_recheck_interval: float = Field(default=2.0, gt=0, le=60, allow_inf_nan=False)
     face_min_size: int = 80                 # мин. размер лица на фото, px
     ai_model_manifest: str = "models/store-v1/manifest.json"
-    yolo_model: str = "models/yolov8n.onnx"
-    insightface_model: str = "buffalo_l"
-    insightface_root: str = "."             # модели лежат в ./models/<имя_пакета>
     cuda_dll_path: str = ""                 # путь к CUDA/cuDNN DLL (пусто — авто-поиск)
 
     # --- Учёт рабочего времени: консервативные начальные пороги ---
@@ -78,8 +79,8 @@ class Settings(BaseSettings):
     attendance_ai_fps: float = Field(default=10, gt=0, allow_inf_nan=False)
     attendance_frame_max_age: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     attendance_max_frame_gap: float = Field(default=0.75, gt=0, allow_inf_nan=False)
-    attendance_face_threshold: float = Field(default=0.55, ge=0, le=1, allow_inf_nan=False)
-    attendance_face_margin: float = Field(default=0.08, ge=0, le=1, allow_inf_nan=False)
+    attendance_face_threshold: float = Field(default=0.60, ge=0, le=1, allow_inf_nan=False)
+    attendance_face_margin: float = Field(default=0.10, ge=0, le=1, allow_inf_nan=False)
     attendance_face_confirmations: int = Field(default=3, ge=1)
     attendance_face_window: float = Field(default=1.5, gt=0, allow_inf_nan=False)
     attendance_face_interval: float = Field(default=0.25, gt=0, allow_inf_nan=False)
@@ -98,7 +99,6 @@ class Settings(BaseSettings):
 
     # --- Межкамерный трекинг (Multi-Camera Person Tracking) ---
     multi_camera_tracking_enabled: bool = True
-    reid_model: str = "models/osnet_x0_25_msmt17.onnx"
     reid_embedding_interval: float = 2.5    # сек между обновлениями эмбеддинга трека
     reid_similarity_threshold: float = 0.80 # мин. косинус OSNet для кандидата
     global_match_threshold: float = 0.65    # мин. composite score для связывания

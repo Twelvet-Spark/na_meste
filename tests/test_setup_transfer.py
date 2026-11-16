@@ -1,5 +1,6 @@
 """Real SQLite/ASGI transfer tests. Never opens the deployment database."""
 import asyncio
+import base64
 import hashlib
 import json
 import sys
@@ -16,16 +17,17 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fastapi import FastAPI
+import numpy as np
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import Base
 from app.database.models import *
 from app.ai.face_recognition import EmbeddingStore
-from app.setup_transfer import TransferError, decode_binary
+from app.setup_transfer import TransferError, decode_binary, decode_transfer, encode_transfer, validate_document
 from app.services.setup_transfer_service import SetupTransferService
 from app.api.setup_transfer import router
-from test_setup_transfer_format import document, parse, PASSWORD
+from test_setup_transfer_format import document, legacy_document, parse, PASSWORD, MODEL_ID, ALIGNMENT_ID
 from operator_test_support import Client
 
 TESTS = []
@@ -51,8 +53,31 @@ def database():
             engine.dispose()
 
 
-def service(engine):
-    return SetupTransferService(engine, embedding_model="buffalo_l")
+def service(engine, **kwargs):
+    return SetupTransferService(engine, face_model_id=MODEL_ID, **kwargs)
+
+
+class AlignedEngine:
+    model_id = MODEL_ID
+    alignment_id = ALIGNMENT_ID
+
+    def __init__(self, callback=None):
+        self.callback = callback
+        self.batches = []
+
+    def embed_aligned(self, crops):
+        assert 1 <= len(crops) <= 4
+        assert all(crop.shape == (112, 112, 3) for crop in crops)
+        self.batches.append(len(crops))
+        if self.callback is not None:
+            self.callback()
+        result = np.zeros((len(crops), 512), dtype=np.float32)
+        result[:, 1] = 1.
+        return result
+
+
+def transfer_blob(data):
+    return encode_transfer(validate_document(json.dumps(data).encode()), PASSWORD)
 
 
 def seed(engine):
@@ -65,8 +90,15 @@ def seed(engine):
         db.add(CameraArchive(**data.archives[0].model_dump(), revision=8))
         db.add(AttendanceCamera(**data.calibrations[0].model_dump(), enabled=True, revision=9, source_revision=8))
         db.add(EmployeeFace(id=12, employee_id=4, embedding=decode_binary(data.faces[0].embedding), thumbnail=decode_binary(data.faces[0].thumbnail), created_at=STAMP))
+        db.flush()
+        db.add(FaceModelMetadata(face_id=12, model_id=MODEL_ID, alignment_id=ALIGNMENT_ID))
+        db.add(CameraScene(**data.scenes[0].model_dump(), revision=8, source_revision=8))
         db.add(EmployeeWorkplace(employee_id=4, workplace_id=9))
         db.add(GlobalPerson(id=22, employee_id=4))
+        db.add(HumanVisit(id=str(uuid4()), camera_id=7, tracking_generation=str(uuid4()), track_id=1,
+                          source_revision=8, stream_id=str(uuid4()), started_at=STAMP, last_seen_at=STAMP,
+                          last_bbox=[0.1, 0.2, 0.3, 0.8], max_person_score=.9, image_expires_at=STAMP,
+                          snapshot=b"private-visit-image-not-for-export"))
         db.add(OperatorRequest(id=str(uuid4()), operation="unrelated", payload_sha256="0"*64, result={}))
 
 
@@ -82,7 +114,7 @@ def refused(fn, code):
 def app_for(engine):
     app = FastAPI()
     app.state.setup_transfer = service(engine)
-    app.state.embedding_store = EmbeddingStore()
+    app.state.embedding_store = EmbeddingStore(MODEL_ID)
     app.include_router(router)
     return app
 
@@ -105,8 +137,10 @@ def roundtrip_preserves_setup_not_history_and_gallery_works():
         seed(source)
         blob = service(source).export(PASSWORD)
         target = service(dest)
-        assert target.preview(blob, PASSWORD)["counts"]["faces"] == 1
         request_id = uuid4()
+        preview = target.preview(blob, PASSWORD)
+        assert preview["faces_reencoded"] == 0 and preview["faces_need_reenrollment"] == 0
+        assert preview["scenes_need_review"] == 1
         result, replay = target.import_setup(blob, PASSWORD, request_id=request_id, expected_sha256=hashlib.sha256(blob).hexdigest())
         assert result["committed"] and result["restart_required"] and not replay
         with Session(dest) as db:
@@ -122,7 +156,14 @@ def roundtrip_preserves_setup_not_history_and_gallery_works():
             assert db.query(RecordingSession).count() == 0
             assert db.query(AttendanceEvent).count() == 0
             assert db.get(EmployeeFace, 12).embedding == decode_binary(document()["faces"][0]["embedding"])
-            gallery = EmbeddingStore()
+            metadata = db.get(FaceModelMetadata, 12)
+            assert metadata.model_id == MODEL_ID and metadata.alignment_id == ALIGNMENT_ID
+            scene = db.get(CameraScene, 7)
+            assert scene.source_revision == 0 and scene.revision == 1
+            assert scene.reference_width == 1920 and scene.reference_height == 1080
+            assert scene.geometry == document()["scenes"][0]["geometry"]
+            assert db.query(HumanVisit).count() == 0 and db.query(HumanJournalGap).count() == 0
+            gallery = EmbeddingStore(MODEL_ID)
             gallery.refresh(db)
             import numpy as np
             assert gallery.match(np.frombuffer(db.get(EmployeeFace, 12).embedding, dtype=np.float32)).employee_id == 4
@@ -344,24 +385,293 @@ def application_entrypoint_registers_transfer_service_and_routes():
         env = {**os.environ, "DATABASE_URL": "sqlite:///" + str(Path(directory)/"app.db"),
                "OPERATOR_SETTINGS_PATH": str(Path(directory)/"settings.json"),
                "RECORDING_ROOT": str(Path(directory)/"recordings"), "AI_ENABLED": "false",
-               "TELEGRAM_ENABLED": "false", "PYTHONPATH": str(root) + os.pathsep + str(root/"tests")}
+               "TELEGRAM_ENABLED": "false", "AI_MODEL_MANIFEST": str(Path(directory)/"missing-model-manifest.json"),
+               "PYTHONPATH": str(root) + os.pathsep + str(root/"tests")}
         code = """
 import asyncio
 import main
 from operator_test_support import Client
-main.build_enroll_engine = lambda: None
+main.build_enroll_engine = lambda *args, **kwargs: None
 async def check():
     async with main.lifespan(main.app):
         status, _, data = await Client(main.app).arequest('GET', '/api/setup-transfer/status',
                                                          headers={'host':'localhost'})
-        assert status == 200, (status, data)
-        assert data['destination_empty'] and not data['restart_required']
+        assert status == 503, (status, data)
+        assert data == {'detail': 'TRANSFER_MODEL_UNAVAILABLE'}
 asyncio.run(check())
 """
         result = subprocess.run([sys.executable, "-c", code],
             cwd=os.environ.get("TRANSFER_TEST_ENTRYPOINT_CWD", str(root)), env=env,
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+@test
+def legacy_and_null_faces_share_target_space_preparation_and_keep_bad_thumbnails():
+    for data in (legacy_document(), document()):
+        if data["transfer_version"] == 2:
+            data["faces"][0].update(face_model_id=None, alignment_id=None)
+        data["faces"].extend([
+            {**data["faces"][0], "id": 13, "thumbnail": None},
+            {**data["faces"][0], "id": 14, "thumbnail": base64.b64encode(b"broken JPEG").decode()},
+        ])
+        blob = transfer_blob(data)
+        with database() as dest:
+            engine = AlignedEngine()
+            target = service(dest, face_engine=engine, enrollment_semaphore=threading.BoundedSemaphore(1))
+            preview = target.preview(blob, PASSWORD)
+            assert preview["faces_reencoded"] == 1 and preview["faces_need_reenrollment"] == 2
+            assert preview["scenes_need_review"] == (1 if data["transfer_version"] == 2 else 0)
+            assert target.status()["destination_empty"]
+            result, replay = target.import_setup(blob, PASSWORD, request_id=uuid4(),
+                                                 expected_sha256=hashlib.sha256(blob).hexdigest())
+            assert not replay and result["faces_reencoded"] == 1 and result["faces_need_reenrollment"] == 2
+            with Session(dest) as db:
+                face = db.get(EmployeeFace, 12)
+                vector = np.frombuffer(face.embedding, dtype="<f4")
+                assert vector[1] == 1. and vector[0] == 0.
+                assert db.get(FaceModelMetadata, 12).model_id == MODEL_ID
+                assert db.get(FaceModelMetadata, 13) is None and db.get(FaceModelMetadata, 14) is None
+                assert db.get(EmployeeFace, 13).embedding == decode_binary(data["faces"][0]["embedding"])
+                assert db.get(EmployeeFace, 14).thumbnail == b"broken JPEG"
+                assert db.get(AttendanceRuntime, 1).gallery_revision == 1
+
+
+@test
+def incompatible_samples_require_model_before_writes_and_share_enrollment_slot():
+    data = document()
+    data["faces"][0].update(face_model_id=None, alignment_id=None)
+    blob = transfer_blob(data)
+    digest = hashlib.sha256(blob).hexdigest()
+    with database() as dest:
+        target = service(dest)
+        refused(lambda: target.preview(blob, PASSWORD), "TRANSFER_MODEL_UNAVAILABLE")
+        refused(lambda: target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=digest),
+                "TRANSFER_MODEL_UNAVAILABLE")
+        assert target.status()["destination_empty"]
+        semaphore = threading.BoundedSemaphore(1)
+        target = service(dest, face_engine=AlignedEngine(), enrollment_semaphore=semaphore)
+        semaphore.acquire()
+        try:
+            refused(lambda: target.preview(blob, PASSWORD), "ENROLLMENT_BUSY")
+            refused(lambda: target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=digest),
+                    "ENROLLMENT_BUSY")
+        finally:
+            semaphore.release()
+        assert target.preview(blob, PASSWORD)["faces_reencoded"] == 1
+        assert target.status()["destination_empty"]
+
+
+@test
+def compatible_vectors_need_no_recognizer_even_without_thumbnails():
+    data = document()
+    data["faces"][0]["thumbnail"] = None
+    blob = transfer_blob(data)
+    with database() as dest:
+        target = service(dest)
+        assert target.preview(blob, PASSWORD)["faces_reencoded"] == 0
+        target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=hashlib.sha256(blob).hexdigest())
+        with Session(dest) as db:
+            assert db.get(EmployeeFace, 12).embedding == decode_binary(data["faces"][0]["embedding"])
+            assert db.get(FaceModelMetadata, 12).model_id == MODEL_ID
+
+
+@test
+def receipt_replay_returns_frozen_preparation_result_without_model_or_enrollment_slot():
+    data = legacy_document()
+    blob = transfer_blob(data)
+    request_id, digest = uuid4(), hashlib.sha256(blob).hexdigest()
+    with database() as dest:
+        target = service(dest, face_engine=AlignedEngine())
+        committed, replay = target.import_setup(blob, PASSWORD, request_id=request_id, expected_sha256=digest)
+        assert not replay and committed["faces_reencoded"] == 1
+        unavailable = service(dest)
+        restored, replay = unavailable.import_setup(blob, PASSWORD, request_id=request_id, expected_sha256=digest)
+        assert replay and restored == committed
+        data["employees"][0]["name"] = "Changed payload"
+        altered = transfer_blob(data)
+        refused(lambda: unavailable.import_setup(altered, PASSWORD, request_id=request_id,
+                                                 expected_sha256=hashlib.sha256(altered).hexdigest()),
+                "TRANSFER_REQUEST_CONFLICT")
+
+
+@test
+def preparation_outside_writer_rechecks_empty_destination_and_inference_failure_rolls_back():
+    data = legacy_document()
+    blob = transfer_blob(data)
+    digest = hashlib.sha256(blob).hexdigest()
+    with database() as dest:
+        def operator_edit():
+            with Session(dest) as db, db.begin():
+                db.add(Workplace(name="Operator edit", name_key="operator edit"))
+        target = service(dest, face_engine=AlignedEngine(operator_edit))
+        refused(lambda: target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=digest),
+                "TRANSFER_DESTINATION_NOT_EMPTY")
+        with Session(dest) as db:
+            assert db.query(Employee).count() == 0 and db.query(OperatorRequest).count() == 0
+            assert db.query(Workplace).one().name == "Operator edit"
+    with database() as dest:
+        def broken_model():
+            raise RuntimeError("private inference error")
+        semaphore = threading.BoundedSemaphore(1)
+        target = service(dest, face_engine=AlignedEngine(broken_model), enrollment_semaphore=semaphore)
+        refused(lambda: target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=digest),
+                "TRANSFER_MODEL_UNAVAILABLE")
+        assert target.status()["destination_empty"]
+        assert semaphore.acquire(blocking=False)
+        semaphore.release()
+
+
+@test
+def preparation_handles_all_samples_in_enrollment_sized_chunks():
+    data = legacy_document()
+    data["faces"] = [{**data["faces"][0], "id": i} for i in range(1, 18)]
+    blob = transfer_blob(data)
+    with database() as dest:
+        target = service(dest, face_engine=AlignedEngine())
+        assert target.preview(blob, PASSWORD)["faces_reencoded"] == 17
+        target.import_setup(blob, PASSWORD, request_id=uuid4(), expected_sha256=hashlib.sha256(blob).hexdigest())
+        with Session(dest) as db:
+            assert db.query(EmployeeFace).count() == 17 and db.query(FaceModelMetadata).count() == 17
+
+
+@test
+def export_projects_actual_mixed_provenance_instead_of_runtime_stamping():
+    with database() as source:
+        seed(source)
+        with Session(source) as db, db.begin():
+            original = db.get(EmployeeFace, 12)
+            db.add_all([
+                EmployeeFace(id=13, employee_id=4, embedding=original.embedding, thumbnail=None),
+                EmployeeFace(id=14, employee_id=4, embedding=original.embedding, thumbnail=None),
+            ])
+            db.flush()
+            db.add(FaceModelMetadata(face_id=14, model_id="2" * 64, alignment_id=ALIGNMENT_ID))
+        blob = service(source).export(PASSWORD)
+        data = decode_transfer(blob, PASSWORD)
+        assert data.face_model_id == MODEL_ID
+        faces = {face.id: face for face in data.faces}
+        assert faces[12].face_model_id == MODEL_ID
+        assert faces[13].face_model_id is None and faces[13].alignment_id is None
+        assert faces[14].face_model_id == "2" * 64
+        with database() as dest:
+            refused(lambda: service(dest).preview(blob, PASSWORD), "TRANSFER_MODEL_MISMATCH")
+            refused(lambda: service(dest).import_setup(blob, PASSWORD, request_id=uuid4(),
+                                                       expected_sha256=hashlib.sha256(blob).hexdigest()),
+                    "TRANSFER_MODEL_MISMATCH")
+            assert service(dest).status()["destination_empty"]
+
+
+@test
+def unavailable_declared_model_returns_static_error_after_local_security_guard():
+    with database() as dest:
+        app = app_for(dest)
+        app.state.setup_transfer = None
+        client = Client(app)
+        for method, path in (("GET", "/status"), ("POST", "/export"), ("POST", "/preview"), ("POST", "/import")):
+            status, headers, body = client.request(method, "/api/setup-transfer" + path,
+                                                   body=b"not parsed", headers={"host": "localhost"})
+            assert status == 503 and body == {"detail": "TRANSFER_MODEL_UNAVAILABLE"}
+            assert headers[b"cache-control"] == b"no-store"
+        assert client.request("POST", "/api/setup-transfer/import", body=b"invalid",
+                              headers={"host": "evil.example"})[0] == 403
+
+
+@test
+def invalid_or_unnormalized_vectors_are_reencoded_or_retained_without_provenance():
+    for first in (0., 2., float("nan"), float("inf"), 1e20):
+        vector = np.zeros(512, dtype="<f4")
+        vector[0] = first
+        raw = vector.tobytes()
+        for thumbnail in (document()["faces"][0]["thumbnail"], None):
+            data = document()
+            data["faces"][0].update(embedding=base64.b64encode(raw).decode(), thumbnail=thumbnail)
+            blob = transfer_blob(data)
+            with database() as dest:
+                target = service(dest, face_engine=AlignedEngine())
+                preview = target.preview(blob, PASSWORD)
+                assert preview["faces_reencoded"] == (1 if thumbnail else 0)
+                assert preview["faces_need_reenrollment"] == (0 if thumbnail else 1)
+                target.import_setup(blob, PASSWORD, request_id=uuid4(),
+                                    expected_sha256=hashlib.sha256(blob).hexdigest())
+                with Session(dest) as db:
+                    face = db.get(EmployeeFace, 12)
+                    if thumbnail:
+                        assert np.frombuffer(face.embedding, dtype="<f4")[1] == 1.
+                        assert db.get(FaceModelMetadata, 12).model_id == MODEL_ID
+                    else:
+                        assert face.embedding == raw and db.get(FaceModelMetadata, 12) is None
+
+
+@test
+def import_prepares_again_after_preview_and_does_not_reuse_stale_vectors():
+    data = legacy_document()
+    blob = transfer_blob(data)
+    with database() as dest:
+        target = service(dest, face_engine=AlignedEngine())
+        assert target.preview(blob, PASSWORD)["faces_reencoded"] == 1
+        target.face_engine = None
+        refused(lambda: target.import_setup(blob, PASSWORD, request_id=uuid4(),
+                                            expected_sha256=hashlib.sha256(blob).hexdigest()),
+                "TRANSFER_MODEL_UNAVAILABLE")
+        assert target.status()["destination_empty"]
+
+
+@test
+def imported_scene_review_marker_survives_schema_restart():
+    blob = transfer_blob(document())
+    with database() as dest:
+        service(dest).import_setup(blob, PASSWORD, request_id=uuid4(),
+                                   expected_sha256=hashlib.sha256(blob).hexdigest())
+        initialize_attendance_schema(dest)
+        with Session(dest) as db:
+            scene = db.get(CameraScene, 7)
+            assert scene.source_revision == 0 and scene.revision == 1
+            assert scene.geometry == document()["scenes"][0]["geometry"]
+            assert db.get(AttendanceCamera, 7).enabled is False
+            assert db.get(AttendanceRuntime, 1).commission_id is None
+
+
+@test
+def unusable_legacy_thumbnails_need_no_recognizer_or_gpu_lease():
+    for data in (legacy_document(), document()):
+        if data["transfer_version"] == 2:
+            data["faces"][0].update(face_model_id=None, alignment_id=None)
+        data["faces"][0]["thumbnail"] = None
+        data["faces"].append({**data["faces"][0], "id": 13,
+                              "thumbnail": base64.b64encode(b"broken JPEG").decode()})
+        blob = transfer_blob(data)
+        with database() as dest:
+            target = service(dest)
+            preview = target.preview(blob, PASSWORD)
+            assert preview["faces_reencoded"] == 0 and preview["faces_need_reenrollment"] == 2
+            assert target.status()["destination_empty"]
+            result, replay = target.import_setup(
+                blob, PASSWORD, request_id=uuid4(), expected_sha256=hashlib.sha256(blob).hexdigest())
+            assert not replay and result["faces_need_reenrollment"] == 2
+            with Session(dest) as db:
+                assert db.query(FaceModelMetadata).count() == 0
+                assert db.get(EmployeeFace, 12).embedding == decode_binary(data["faces"][0]["embedding"])
+                assert db.get(EmployeeFace, 13).thumbnail == b"broken JPEG"
+
+
+@test
+def compatible_gallery_norm_tolerance_does_not_erase_provenance_without_a_thumbnail():
+    data = document()
+    vector = np.zeros(512, dtype="<f4")
+    vector[0] = .9995  # Valid under the shared persisted-gallery unit-norm tolerance.
+    original = vector.tobytes()
+    data["faces"][0].update(embedding=base64.b64encode(original).decode(), thumbnail=None)
+    blob = transfer_blob(data)
+    with database() as dest:
+        target = service(dest)
+        preview = target.preview(blob, PASSWORD)
+        assert preview["faces_reencoded"] == preview["faces_need_reenrollment"] == 0
+        target.import_setup(blob, PASSWORD, request_id=uuid4(),
+                            expected_sha256=hashlib.sha256(blob).hexdigest())
+        with Session(dest) as db:
+            assert db.get(EmployeeFace, 12).embedding == original
+            assert db.get(FaceModelMetadata, 12).model_id == MODEL_ID
 
 
 if __name__ == "__main__":

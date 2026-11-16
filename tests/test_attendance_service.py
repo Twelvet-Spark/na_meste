@@ -6,6 +6,7 @@ transactions, reducers, requests, constraints and query snapshots are real.
 """
 import copy
 import sys
+import os
 import tempfile
 import threading
 import traceback
@@ -15,6 +16,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,6 +29,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.attendance_types import EventDecisionInput, GapDecisionInput, ManualEventInput, VisitorBatchInput
+from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import immediate_session
 from app.database.models import (
@@ -47,11 +51,34 @@ BASE = datetime(2026, 11, 11, 4)  # 09:00 UTC+05:00
 AS_OF = datetime(2026, 11, 12, 15)
 CUDA_PROVIDERS = {
     key: ["CUDAExecutionProvider", "CPUExecutionProvider"] for key in (
-        "yolo", "live_face_detection", "live_face_recognition",
+        "person_detection", "live_face_detection", "live_face_recognition",
         "enroll_face_detection", "enroll_face_recognition",
     )
 }
-CUDA_PROVIDERS["reid"] = []
+CUDA_PROVIDERS.update(reid=[], scene_encoder=[], scene_decoder=[])
+
+
+def model_bundle_fixture():
+    """Verified startup metadata double, not evidence of real model execution."""
+    preprocessing = {
+        "person": "dfine-rgb-letterbox640-black-div255-v1",
+        "face_detection": "yunet-bgr-f32-strides8-16-32-v1",
+        "face_recognition": "auraface-rgb112-minus127.5-div127.5-v1",
+        "body": "osnet-rgb256x128-imagenet-v1",
+        "scene": "mobilesam-rgb-longest1024-meanstd-pad-v1",
+    }
+    components = {
+        name: {"preprocessing_id": policy,
+               "files": [{"role": role, "sha256": str(index) * 64,
+                          "path": f"{name}-{role}.onnx"} for role in
+                         (("encoder", "decoder") if name == "scene" else ("model",))]}
+        for index, (name, policy) in enumerate(preprocessing.items(), 1)
+    }
+    return SimpleNamespace(
+        bundle_id="a" * 64, face_model_id="b" * 64, alignment_id="arcface-5pt-112-v1",
+        metadata={"version": 1, "alignment_id": "arcface-5pt-112-v1", "components": components},
+        component_status={name: "READY" for name in components}, component_paths={},
+    )
 
 
 def test(fn):
@@ -104,7 +131,7 @@ def database(*, commissioned=False):
                 runtime.gallery_revision = 7
                 runtime.monitoring_started_at = BASE - timedelta(days=1)
                 runtime.heartbeat_at = BASE - timedelta(seconds=1)
-            service = AttendanceService(engine, now=lambda: AS_OF)
+            service = AttendanceService(engine, now=lambda: AS_OF, model_bundle=model_bundle_fixture())
             service.health.set_providers(CUDA_PROVIDERS)
             if commissioned:
                 # This fixture installs an already-approved record; it is NOT an
@@ -176,6 +203,124 @@ def projection(engine):
              db.query(WorkSession).order_by(WorkSession.entry_event_id)],
         )
     return read_snapshot(engine, read)
+
+
+@test
+def test_commission_fingerprint_uses_critical_declared_hashes_not_file_metadata_or_optional_models():
+    with database(commissioned=True) as (engine, service), Session(engine) as db:
+        baseline = service.configuration_fingerprint(db)
+        assert baseline["version"] == 2
+        assert service._commission_valid(db, invalidate=False)
+        assert baseline["math_policy"] == {"cuda_use_tf32": 0}
+        assert set(baseline["models"]) == {"person", "face_detection", "face_recognition"}
+        assert baseline["models"]["person"]["files"] == {"model": "1" * 64}
+        assert baseline["face_model_id"] == "b" * 64
+        assert baseline["alignment_id"] == "arcface-5pt-112-v1"
+        for component in ("person", "face_detection", "face_recognition"):
+            changed = model_bundle_fixture()
+            changed.metadata["components"][component]["files"][0]["sha256"] = "c" * 64
+            replacement = AttendanceService(engine, model_bundle=changed)
+            assert not replacement._commission_valid(db, invalidate=False, providers=CUDA_PROVIDERS)
+        changed = model_bundle_fixture()
+        changed.face_model_id = "f" * 64
+        replacement = AttendanceService(engine, model_bundle=changed)
+        assert not replacement._commission_valid(db, invalidate=False, providers=CUDA_PROVIDERS)
+        changed = model_bundle_fixture()
+        changed.metadata["components"]["person"]["preprocessing_id"] = "new-verified-preprocessing-v2"
+        replacement = AttendanceService(engine, model_bundle=changed)
+        assert not replacement._commission_valid(db, invalidate=False, providers=CUDA_PROVIDERS)
+        for component in ("body", "scene"):
+            optional = model_bundle_fixture()
+            optional.bundle_id = "d" * 64
+            optional.metadata["components"][component]["files"][0]["sha256"] = "e" * 64
+            optional.component_status[component] = "MODEL_MISSING"
+            replacement = AttendanceService(engine, model_bundle=optional)
+            providers = dict(CUDA_PROVIDERS, reid=["CPUExecutionProvider"],
+                             scene_encoder=["CPUExecutionProvider"], scene_decoder=["CPUExecutionProvider"])
+            assert replacement.configuration_fingerprint(db, providers=providers) == baseline
+            assert replacement._commission_valid(db, invalidate=False, providers=providers)
+        with tempfile.TemporaryDirectory() as directory:
+            asset = Path(directory) / "same-name.onnx"
+            asset.write_bytes(b"unchanged declared bytes")
+            bundle = model_bundle_fixture()
+            bundle.component_paths["person"] = asset
+            replacement = AttendanceService(engine, model_bundle=bundle)
+            os.utime(asset, ns=(1_000_000_000, 2_000_000_000))
+            with patch.object(Path, "stat", side_effect=AssertionError("Commission checks must not stat assets")), \
+                    patch.object(Path, "open", side_effect=AssertionError("Commission checks must not read assets")):
+                assert replacement.configuration_fingerprint(db, providers=CUDA_PROVIDERS) == baseline
+                assert replacement._commission_valid(db, invalidate=False, providers=CUDA_PROVIDERS)
+
+
+@test
+def test_commission_model_identity_is_an_immutable_startup_snapshot():
+    with database() as (engine, _service), Session(engine) as db:
+        bundle = model_bundle_fixture()
+        service = AttendanceService(engine, model_bundle=bundle)
+        baseline = service.configuration_fingerprint(db, providers=CUDA_PROVIDERS)
+        bundle.metadata["components"]["person"]["files"][0]["sha256"] = "c" * 64
+        bundle.face_model_id = "d" * 64
+        assert service.configuration_fingerprint(db, providers=CUDA_PROVIDERS) == baseline
+        restarted = AttendanceService(engine, model_bundle=bundle)
+        assert restarted.configuration_fingerprint(db, providers=CUDA_PROVIDERS) != baseline
+
+
+@test
+def test_missing_critical_bundle_cannot_validate_even_matching_cuda_commission():
+    with database(commissioned=True) as (engine, _service):
+        missing_bundles = [None]
+        for component in ("person", "face_detection", "face_recognition"):
+            for status in ("MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID"):
+                bundle = model_bundle_fixture()
+                bundle.component_status[component] = status
+                missing_bundles.append(bundle)
+        for bundle in missing_bundles:
+            service = AttendanceService(engine, model_bundle=bundle)
+            service.health.set_providers(CUDA_PROVIDERS)
+            with immediate_session(engine) as db:
+                commission = db.query(AttendanceCommission).one()
+                # A matching JSON record and claimed CUDA do not prove verified models.
+                commission.configuration_fingerprint = service.configuration_fingerprint(db)
+                db.get(AttendanceRuntime, 1).commission_id = commission.id
+            with immediate_session(engine) as db:
+                assert not service._commission_valid(db)
+                assert db.get(AttendanceRuntime, 1).commission_id is None
+                assert db.query(AttendanceCommission).count() == 1
+
+
+@test
+def test_every_ordinary_quality_continuity_setting_invalidates_commission():
+    changed_values = {
+        "min_recognition_confidence": .71, "min_confirmations": 5,
+        "face_recognition_retry_interval": .75, "live_face_min_size": 64,
+        "live_face_margin": .15, "live_face_window": 3., "live_face_recheck_interval": 4.,
+    }
+    with database(commissioned=True) as (engine, service), Session(engine) as db:
+        assert service._commission_valid(db, invalidate=False)
+        baseline = service.configuration_fingerprint(db)
+        assert baseline["live_policy"]["face_det_score"] == .8
+        assert baseline["live_policy"]["face_blur_min"] == 20.
+        with patch.object(settings, "face_min_size", 96):
+            assert service._commission_valid(db, invalidate=False)
+        with patch.object(settings, "attendance_face_det_score", .9), \
+                patch.object(settings, "attendance_face_blur_min", 30.):
+            assert service.configuration_fingerprint(db)["live_policy"] == baseline["live_policy"]
+        for name, value in changed_values.items():
+            with patch.object(settings, name, value):
+                assert not service._commission_valid(db, invalidate=False), name
+
+
+@test
+def test_legacy_commission_record_is_retained_but_cannot_approve_new_runtime():
+    with database(commissioned=True) as (engine, service):
+        with immediate_session(engine) as db:
+            row = db.query(AttendanceCommission).one()
+            original_id = row.id
+            row.configuration_fingerprint = {"version": 1, "models": [], "providers": CUDA_PROVIDERS}
+        with immediate_session(engine) as db:
+            assert not service._commission_valid(db)
+            assert db.get(AttendanceRuntime, 1).commission_id is None
+            assert db.get(AttendanceCommission, original_id).configuration_fingerprint["version"] == 1
 
 
 @test

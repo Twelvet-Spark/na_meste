@@ -10,12 +10,14 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 from uuid import uuid4
+from pathlib import Path
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.doorway import DoorwayCalibration, DoorwayDetector
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
+from app.ai.model_bundle import ModelBundle
 from app.ai.providers import provider_label, resolve_providers, setup_cuda_dlls
 from app.ai.recognition_service import RecognitionService
 from app.config import BASE_DIR, settings
@@ -86,15 +88,17 @@ class _CameraConfiguration:
     calibration: DoorwayCalibration | None
 
 
-def loaded_providers(*, detector=None, live=None, enroll=None, reid=None):
-    """Evidence from loaded sessions, never available/requested providers."""
-    result = {}
-    for key, model in (("yolo", detector), ("reid", reid)):
-        result[key] = list(model.session.get_providers()) if model is not None else []
+def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=None):
+    """Actual resident sessions only; optional CPU scene work is separate."""
+    result = {key: list(model.session.get_providers()) if model is not None else []
+              for key, model in (("person_detection", detector), ("reid", reid))}
     for prefix, face in (("live_face", live), ("enroll_face", enroll)):
+        providers = face.providers() if face is not None else {}
         for kind in ("detection", "recognition"):
-            model = face.app.models.get(kind) if face is not None else None
-            result[f"{prefix}_{kind}"] = list(model.session.get_providers()) if model is not None else []
+            result[f"{prefix}_{kind}"] = list(providers.get(kind, ()))
+    providers = scene.providers() if scene is not None else {}
+    for kind in ("encoder", "decoder"):
+        result[f"scene_{kind}"] = list(providers.get(kind, ()))
     return result
 
 
@@ -111,7 +115,7 @@ class AIWorker(threading.Thread):
         self._last_seq, self._last_ts, self._last_received = {}, {}, {}
         self._last_received_at = {}
         self._streams, self._configurations = {}, {}
-        self._gallery_revision = service.store.revision
+        self._gallery_revision = service.store.revision if service.store is not None else None
         self._rotation = 0
 
     def stop(self, timeout=None):
@@ -147,10 +151,11 @@ class AIWorker(threading.Thread):
         if not self.health.observe_clock(utcnow(), now):
             for camera_id in list(self._configurations):
                 self._reset_camera(camera_id, "CLOCK_DISCONTINUITY")
-        if self.service.store.revision != self._gallery_revision:
+        revision = self.service.store.revision if self.service.store is not None else None
+        if revision != self._gallery_revision:
             for camera_id in list(self._configurations):
                 self._reset_camera(camera_id, "GALLERY_CHANGED")
-            self._gallery_revision = self.service.store.revision
+            self._gallery_revision = revision
         try:
             packets = self._collect_frames()
             self.health.transition("configuration", [])
@@ -322,90 +327,67 @@ class AIWorker(threading.Thread):
 
 # ------------------------------------------------------------- инициализация
 
-def build_enroll_engine() -> Optional[FaceEngine]:
-    """Движок для загрузки фото сотрудников (det_size 640). None — AI недоступен."""
+def build_enroll_engine(bundle: ModelBundle | None) -> Optional[FaceEngine]:
+    """One shared enrollment owner; missing face components never load a fallback."""
+    if bundle is None:
+        return None
     setup_cuda_dlls()
     try:
-        return FaceEngine(
-            model_name=settings.insightface_model,
-            root=settings.insightface_root,
-            providers=resolve_providers(settings.ai_device),
-            det_size=640,
-        )
+        return FaceEngine(bundle, resolve_providers(settings.ai_device), det_size=640)
     except Exception as exc:
-        logger.error("FaceEngine недоступна (загрузка фото отключена): %s", exc)
+        logger.error("Enrollment face model unavailable: %s", getattr(exc, "code", type(exc).__name__))
         return None
 
 
 def build_ai_worker(
-    manager: ReaderManager, attendance, store: EmbeddingStore,
-    *, session_factory, notifier=None, enroll_engine=None,
+    manager: ReaderManager, attendance, store: EmbeddingStore | None,
+    *, bundle: ModelBundle | None, session_factory, notifier=None, enroll_engine=None,
 ) -> Optional[AIWorker]:
-    """Собирает полный AI-стек. None — модели недоступны (приложение работает
-    только как RTSP-превью, не падая)."""
-    if store is None:
-        logger.error("Employee gallery unavailable; live attendance inference disabled")
+    """Require people and journal storage, not face/gallery/appearance availability."""
+    if bundle is None or session_factory is None:
+        logger.error("Person model or journal database unavailable")
         return None
     setup_cuda_dlls()
     providers = resolve_providers(settings.ai_device)
-
-    yolo_path = BASE_DIR / settings.yolo_model
-    if not yolo_path.is_file():
-        logger.error("YOLO-модель не найдена: %s — AI отключён (см. README)", yolo_path)
-        return None
-
-    # межкамерный трекинг (опциональный слой, не ломает остальное)
-    global_manager = None
-    if settings.multi_camera_tracking_enabled and session_factory is not None:
-        reid_path = BASE_DIR / settings.reid_model
-        if reid_path.is_file():
-            try:
-                from app.ai.global_tracker import CameraTopology, GlobalIdentityManager
-                from app.ai.reid import PersonReID
-
-                reid = PersonReID(str(reid_path), providers)
-                topology = CameraTopology.load(settings.topology_config)
-                global_manager = GlobalIdentityManager(
-                    session_factory, reid, topology, notifier=notifier,
-                )
-                logger.info("Межкамерный трекинг включён (Re-ID: %s)",
-                            reid_path.name)
-            except Exception:
-                logger.exception(
-                    "Межкамерный трекинг не запустился — система работает без него")
-                global_manager = None
-        else:
-            logger.warning("Re-ID модель не найдена: %s — межкамерный трекинг "
-                           "отключён (см. README)", reid_path)
-
     try:
+        from app.database.operator_schema import preflight, VERSION
+        with session_factory() as db:
+            if preflight(db.connection()) != VERSION:
+                raise RuntimeError("Journal schema unavailable")
         from app.ai.detector import PersonDetector
-        detector = PersonDetector(
-            str(yolo_path), providers, settings.person_confidence,
-        )
-        face_engine = FaceEngine(
-            model_name=settings.insightface_model,
-            root=settings.insightface_root,
-            providers=providers,
-            det_size=320,
-        )
-        attendance.health.set_providers(loaded_providers(
-            detector=detector, live=face_engine, enroll=enroll_engine,
-            reid=global_manager.reid if global_manager is not None else None))
+        detector = PersonDetector(bundle, providers, settings.person_confidence)
     except Exception as exc:
-        logger.error("AI-модели не загрузились (%s) — AI отключён", exc)
+        logger.error("Person inference unavailable: %s", getattr(exc, "code", type(exc).__name__))
         return None
 
+    face_engine = None
+    try:
+        face_engine = FaceEngine(bundle, providers, det_size=640)
+    except Exception as exc:
+        logger.error("Live face model unavailable: %s", getattr(exc, "code", type(exc).__name__))
+    global_manager = None
+    if settings.multi_camera_tracking_enabled:
+        try:
+            from app.ai.global_tracker import CameraTopology, GlobalIdentityManager
+            from app.ai.reid import PersonReID
+            topology_path = Path(settings.topology_config)
+            if not topology_path.is_absolute():
+                topology_path = BASE_DIR / topology_path
+            global_manager = GlobalIdentityManager(
+                session_factory, PersonReID(bundle, providers),
+                CameraTopology.load(str(topology_path)), notifier=notifier)
+        except Exception as exc:
+            logger.error("Optional appearance unavailable: %s", getattr(exc, "code", type(exc).__name__))
+    attendance.health.set_providers(loaded_providers(
+        detector=detector, live=face_engine, enroll=enroll_engine,
+        reid=global_manager.reid if global_manager is not None else None))
     service = RecognitionService(
-        detector,
-        face_engine,
-        store,
+        detector, face_engine, store,
         min_confidence=settings.min_recognition_confidence,
         min_confirmations=settings.min_confirmations,
         retry_interval=settings.face_recognition_retry_interval,
         track_lost_timeout=settings.track_lost_timeout,
-        tracker_high_threshold=settings.tracker_new_track_threshold,
-    )
+        tracker_high_threshold=settings.tracker_new_track_threshold)
     state = DetectionState()
     logger.info("AI Provider: %s", provider_label(detector.session.get_providers()))
     return AIWorker(manager, service, attendance, state, global_manager=global_manager)

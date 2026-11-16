@@ -3,6 +3,9 @@
   'use strict';
   function errorText(detail) {
     if (typeof detail === 'string') return detail;
+    if (detail?.code === 'ENROLLMENT_BUSY') return 'Обработка фотографий уже выполняется. Черновик сохранён — подождите и повторите сохранение.';
+    if (detail?.code === 'ENROLLMENT_UNAVAILABLE') return 'Обработка фотографий недоступна. Черновик сохранён. Проверьте диагностику и повторите сохранение.';
+    if (detail?.code === 'FACE_MODEL_UNAVAILABLE') return 'Модель лиц недоступна. Черновик сохранён. Проверьте диагностику и повторите сохранение.';
     if (detail?.code === 'PHOTO_VALIDATION_FAILED') {
       return 'Ничего не сохранено. ' + (detail.files || []).map((file) => `${file.filename}: ${file.error}`).join('; ');
     }

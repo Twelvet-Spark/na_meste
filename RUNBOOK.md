@@ -22,7 +22,7 @@ Python 3.11+; both FFmpeg and ffprobe are required for video. Tool search: `FFMP
 
 **Video support is Windows 10/11, one application process.** Windows Job containment is required before FFmpeg/ffprobe children, including live decoding and connection probes as well as recording/playback. There is no non-Windows containment fallback: installing FFmpeg on Linux/macOS alone does not enable these media operations. Containment/storage failure disables the affected media operation, not employee records or manual accounting.
 
-Requirements select GPU ONNX Runtime; InsightFace dependencies may also install the CPU distribution. Do not keep both distributions sharing the `onnxruntime` module:
+Requirements select GPU ONNX Runtime. Do not keep both CPU and GPU distributions sharing the `onnxruntime` module; export-only PyTorch belongs in `.model-build`, not the server environment:
 
 - **CPU:** uninstall `onnxruntime` and `onnxruntime-gpu`, then install only `onnxruntime`; select `AI_DEVICE=cpu`.
 - **NVIDIA:** uninstall the CPU `onnxruntime`, then reinstall the selected GPU distribution with `--no-deps --force-reinstall` if needed. Match CUDA, cuDNN and the driver to the **actual wheel/build source**, not just the ORT version number. CUDA 12/13 and cuDNN major versions are not interchangeable. See [README CUDA setup](README.md#3-cuda-windows-опционально) and the [official compatibility table](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements).
@@ -33,11 +33,12 @@ Models are separate deployment assets, not included in Git or setup transfer:
 
 | Asset | Behavior |
 |---|---|
-| `models/yolov8n.onnx` | Required person detector for live AI; no automatic download. |
-| `models/buffalo_l/` | InsightFace detection/ArcFace package. InsightFace may download an absent package; an incomplete directory can still fail. Prepare a complete compatible package for offline use. |
-| `models/osnet_x0_25_msmt17.onnx` | Optional body Re-ID; missing/invalid model disables only the optional global layer. No automatic download. |
+| `models/store-v1/manifest.json` | Authoritative source hashes, provenance, preprocessing and component readiness; selected by `AI_MODEL_MANIFEST`. |
+| `person` | Full D-FINE-S COCO detector. Missing/invalid component is a visible analysis outage. |
+| `face_detection` / `face_recognition` | YuNet / AuraFace. Unavailable models or gallery do not suppress anonymous person tracking. |
+| `body` / `scene` | Independent optional appearance linking / CPU-only outline assistance. |
 
-Launch from the project root, using the selected venv's `python main.py` or the Windows launcher. Run **one server process**, no reload/multiple uvicorn workers: readers, tracks and queues are process-local. `AI_ENABLED=false` disables live inference, **not** initialization of the photo-enrollment engine or a possible InsightFace download.
+Launch from the project root, using the selected venv's `python main.py` or the Windows launcher. Run **one server process**, no reload/multiple uvicorn workers: readers, tracks and queues are process-local. `AI_ENABLED=false` disables live inference, not the separate enrollment engine. No runtime path downloads models; old model-selector environment variables no longer select weights.
 
 Startup automatically restores readers for all saved enabled cameras. Connecting is asynchronous; wait for `ONLINE`. Do **not** edit/save every camera after restart. Manual recording is not resumed.
 
@@ -87,6 +88,8 @@ Changing host, RTSP port, credentials, channel or stream invalidates attendance 
 - Accepted files are still JPEG/PNG, ≤15 MiB and ≤20 million pixels each. Exactly one face is required; smaller face-box dimension ≥`max(80, FACE_MIN_SIZE)` px, detector confidence ≥0.80, valid aligned 112×112 face and Laplacian variance ≥20. Bad alignment, blur, low confidence and a confident match to another active employee **reject**, not merely warn.
 - The detail page has data/photos/work time/history, explicit photo save/cancel and conflict recovery. Edit metadata/photo sets using the revision from the latest response. On 409, reload the current version, inspect the retained draft, then explicitly reapply it.
 - Only embeddings/aligned thumbnails are retained, not original uploads. Old incomplete records can be repaired without changing their ID/history. Employee deletion is blocked when history exists; deactivate instead.
+- Gallery startup retains valid matching model/alignment vectors unchanged, including samples without thumbnails. Other samples are re-embedded only from valid stored 112×112 aligned JPEGs. Unconvertible samples remain stored but cannot match. Check usable versus stored counts and remediation; a compatible restart makes no gallery write or commissioning change.
+- Photo preparation shares one nonblocking enrollment lease; overlapping requests return `503 ENROLLMENT_BUSY`, not concurrent unbounded CUDA work. Replaying a committed create request retains its original receipt.
 
 Workplaces are optional labels, not schedules, time zones, geofences or attendance admission. Create one beside the selector or manage them at `/settings`; multiple assignments are supported. Archiving preserves assignments/history. An archived label may be retained or removed from an existing employee, not newly assigned; there is no hard-delete workplace action.
 
@@ -177,7 +180,7 @@ SQLite contains camera credentials, face embeddings/thumbnails, attendance evide
 
 Use `/settings` → **Перенос на другой компьютер** directly on the app machine through `localhost` (remote desktop is fine). LAN/public/proxy transfer requests are rejected; forwarded headers are not accepted. Export/import still requires the operator header and matching Origin when present.
 
-Use the same application/dependency version (`cryptography>=46` is retained) and unchanged compatible InsightFace model on both machines; models themselves are not exported.
+Use the same application/dependency version (`cryptography>=46` is retained) and compatible declared `face_model_id` on both machines; model files themselves are not exported. V1 is a data migration decoder, not a legacy model backend. V2 checks each sample's actual provenance; compatible vectors remain unchanged, valid legacy thumbnails are re-embedded, and unusable samples remain stored without matching provenance. Preview reports reencoded/reenrollment/scene-review counts.
 
 1. Export a `.nmsetup` with a unique **12–1024 UTF-8-byte** passphrase, repeated in the form. Maximum file size: **64 MiB**. The passphrase cannot be recovered.
 2. Move the encrypted file and communicate its password separately.
@@ -185,7 +188,7 @@ Use the same application/dependency version (`cryptography>=46` is retained) and
 4. If the response is lost, retry confirmation using the unchanged form/file/password; do not clear it and invent a different request.
 5. Restart normally. Enabled camera readers restore, recording does not. Recheck calibration and recommission attendance: automatic admission is not transferred.
 
-Included: camera credentials/live/archive setup, disabled attendance calibration geometry, workplaces/assignments, employee records and saved face thumbnails/embeddings. Legacy incomplete records remain repairable.
+Included: camera credentials/live/archive setup, disabled attendance calibration geometry, workplaces/assignments, employee records, saved face thumbnails/embeddings and paired model/alignment provenance, plus descriptive scene geometry/reference dimensions. Imported scenes have source revision zero and require explicit review/resave; visits, history, video and frozen/assistance images remain excluded.
 
 Excluded: video, recording metadata/cache, attendance/observation history and evidence, app/operator settings, `.env`/Telegram, topology, models, Cloudflare/WARP/VPN and routing. Reconfigure network access separately. **This is setup migration, not a full backup.**
 

@@ -271,7 +271,7 @@ class FrameReader:
 
 def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
     clock = [100.0]
-    service = RecognitionService(PersonDetector(), NoFaces(), EmbeddingStore(), min_hits=1)
+    service = RecognitionService(PersonDetector(), NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
     outcomes = []
     process = service.process_frame
 

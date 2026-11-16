@@ -1,7 +1,6 @@
 """Atomic multipart employee onboarding and final-photo-set replacement."""
 import hashlib
 import json
-import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
@@ -82,12 +81,11 @@ def _refresh(request, db):
 
 
 def _enrollment_lock(request):
-    # Called on the ASGI loop before offloading; one lock per application/model.
-    lock = getattr(request.app.state, "enrollment_lock", None)
-    if lock is None:
-        lock = threading.Lock()
-        request.app.state.enrollment_lock = lock
-    return lock
+    return getattr(request.app.state, "enrollment_lock", None)
+
+
+def _model_id(request):
+    return getattr(request.app.state, "face_model_id", None)
 
 
 async def _read_form(request, model, *, creating):
@@ -119,22 +117,24 @@ async def _read_form(request, model, *, creating):
 
 
 def _prepare(contents, request, lock):
-    if not contents:
-        return []
-    engine = getattr(request.app.state, "face_engine", None)
-    if engine is None:
-        raise HTTPException(503, "AI-модели недоступны — загрузка фотографий невозможна")
-    prepared, errors = [], []
-    for index, (filename, image) in enumerate(contents):
-        with lock:
+    with service.enrollment_slot(lock):
+        if _model_id(request) is None:
+            raise HTTPException(503, {"code": "FACE_MODEL_UNAVAILABLE"})
+        if not contents:
+            return []
+        engine = getattr(request.app.state, "face_engine", None)
+        if engine is None or engine.model_id != _model_id(request):
+            raise HTTPException(503, {"code": "FACE_MODEL_UNAVAILABLE"})
+        prepared, errors = [], []
+        for index, (filename, image) in enumerate(contents):
             result = service.prepare_face(image, engine, filename)
-        if isinstance(result, service.FaceEnrollResult):
-            errors.append({"index": index, "filename": filename, "error": result.error})
-        else:
-            prepared.append(result)
-    if errors:
-        raise service.photo_failure(errors)
-    return prepared
+            if isinstance(result, service.FaceEnrollResult):
+                errors.append({"index": index, "filename": filename, "error": result.error})
+            else:
+                prepared.append(result)
+        if errors:
+            raise service.photo_failure(errors)
+        return prepared
 
 
 def _create(request, db, metadata, contents, lock):
@@ -147,7 +147,7 @@ def _create(request, db, metadata, contents, lock):
     if replay is not None:
         return replay
     prepared = _prepare(contents, request, lock)
-    service.create_employee_with_faces(db, metadata, prepared, digest)
+    service.create_employee_with_faces(db, metadata, prepared, digest, model_id=_model_id(request))
     # Always return the transaction's frozen result, including a racing replay.
     result = service.committed_request(db, metadata.request_id, digest)
     _refresh(request, db)
@@ -155,8 +155,9 @@ def _create(request, db, metadata, contents, lock):
 
 
 @router.get("")
-def api_list_employees(db: Session = Depends(get_db)):
-    return [service.employee_out(db, employee) for employee in service.list_employees(db)]
+def api_list_employees(request: Request, db: Session = Depends(get_db)):
+    return [service.employee_out(db, employee, model_id=_model_id(request))
+            for employee in service.list_employees(db)]
 
 
 @router.post("", status_code=201)
@@ -166,15 +167,15 @@ async def api_create_employee(request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/{employee_id}")
-def api_get_employee(employee_id: int, faces: bool = False, db: Session = Depends(get_db)):
-    return service.employee_out(db, _employee_or_404(db, employee_id))
+def api_get_employee(employee_id: int, request: Request, faces: bool = False, db: Session = Depends(get_db)):
+    return service.employee_out(db, _employee_or_404(db, employee_id), model_id=_model_id(request))
 
 
 @router.put("/{employee_id}", dependencies=[Depends(require_operator_request)])
 def api_update_employee(employee_id: int, payload: service.EmployeeUpdate, request: Request,
                         db: Session = Depends(get_db)):
     employee = service.update_employee(db, _employee_or_404(db, employee_id), payload)
-    result = service.employee_out(db, employee)
+    result = service.employee_out(db, employee, model_id=_model_id(request))
     _refresh(request, db)
     return result
 
@@ -189,8 +190,8 @@ def api_delete_employee(employee_id: int, request: Request, db: Session = Depend
 def _replace(request, db, employee_id, metadata, contents, lock):
     prepared = _prepare(contents, request, lock)
     employee = service.replace_employee_faces(db, employee_id, metadata.expected_revision,
-                                              metadata.keep_face_ids, prepared)
-    result = service.employee_out(db, employee)
+                                              metadata.keep_face_ids, prepared, model_id=_model_id(request))
+    result = service.employee_out(db, employee, model_id=_model_id(request))
     _refresh(request, db)
     return result
 
