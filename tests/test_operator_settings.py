@@ -51,7 +51,9 @@ URL = f"rtsp://{USERNAME}:{PASSWORD}@127.0.0.1/private?token={TOKEN}"
 SECRETS = (TOKEN, OTHER_TOKEN, PASSWORD, USERNAME, AUTH, COOKIE)
 EDITABLE = {
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
+    "stream_output_fps", "stream_hwaccel",
     "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
@@ -258,6 +260,7 @@ def test_each_editable_field_accepts_valid_value_and_remains_pending():
     values = {
         "preview_fps": 30, "rtsp_connect_timeout": 60, "rtsp_reconnect_max_delay": 300,
         "frame_stall_timeout": 120, "ai_enabled": False, "ai_device": "cpu", "ai_fps": 30,
+        "stream_output_fps": 30, "stream_hwaccel": "none", "ai_batch_size": 8, "ai_batch_wait_ms": 50,
         "ai_cameras": "", "attendance_ai_fps": 12.5, "attendance_frame_max_age": 2.,
         "min_recognition_confidence": .72, "min_confirmations": 4,
         "face_recognition_retry_interval": .4, "live_face_min_size": 64,
@@ -290,6 +293,8 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
         "rtsp_reconnect_max_delay": [0, 301], "frame_stall_timeout": [0, 121],
         "ai_fps": [0, -1, 30.1, float("nan"), float("inf"), float("-inf")],
         "ai_device": ["gpu", "", TOKEN], "attendance_ai_fps": [0, float("inf")],
+        "stream_output_fps": [4, 31, True], "stream_hwaccel": ["gpu", "", "software"],
+        "ai_batch_size": [0, 9, 1.5, True], "ai_batch_wait_ms": [-1, 51, 1.5, True],
         "min_recognition_confidence": [-.01, 1.01, float("nan")],
         "min_confirmations": [0, 1.5, True], "face_recognition_retry_interval": [0, float("inf")],
         "live_face_min_size": [0, 1.5, 4097], "live_face_margin": [-.01, 1.01, float("inf")],

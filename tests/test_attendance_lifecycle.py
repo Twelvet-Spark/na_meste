@@ -598,6 +598,7 @@ def test_backward_clock_gap_is_nonnegative_and_blocks_admission_until_review():
 class PersonObservations:
     """Only model inference is supplied; tracking/ownership/crossing stay real."""
     def __init__(self):
+        self.session = SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"])
         self.y = .25
 
     def detect(self, frame):
@@ -605,10 +606,19 @@ class PersonObservations:
             return []
         return [(np.array([220., self.y * 480 - 200., 420., self.y * 480]), .99)]
 
+    def detect_batch(self, frames):
+        return [self.detect(frame) for frame in frames]
+
 
 class NoFaces:
-    def detect(self, image, max_num=0):
+    model_id = "a" * 64
+    alignment_id = "arcface-5pt-112-v1"
+
+    def detect_faces(self, image):
         return []
+
+    def providers(self):
+        return {"detection": [], "recognition": []}
 
 
 class BufferedReader:
@@ -677,17 +687,20 @@ def test_real_worker_persists_doorway_crossing_without_any_recognition_or_legacy
 
 
 @test
-def test_worker_disable_flushes_partial_before_reset_and_removes_stale_detections():
+def test_attendance_disable_flushes_partial_before_reset_and_keeps_general_analysis():
     with database() as (engine, service):
         clock = Clock()
         worker, manager, observations, _queue = worker_for(engine, service, clock)
         for y in (.25, .3, .49):
             step(worker, manager, observations, clock, y)
         assert worker.state.camera(1) is not None
+        previous_generation = worker.service._generations[1]
         with immediate_session(engine) as db:
             db.get(AttendanceCamera, 1).enabled = False
         step(worker, manager, observations, clock, publish=False)
-        assert worker.state.camera(1) is None
+        assert worker.state.camera(1)["people_count"] == 0  # No new person observation was supplied.
+        assert worker._configurations[1].attendance is False
+        assert worker.service._generations[1] != previous_generation
         with Session(engine) as db:
             row = db.query(AttendanceEvent).one()
             assert row.direction is None and row.status == "REVIEW"
@@ -938,40 +951,6 @@ def test_monitor_retries_only_one_fifo_head_per_second_and_shutdown_keeps_failed
             assert any("EVIDENCE_LOST" in row.reason_codes for row in db.query(AttendanceCoverageGap))
             assert db.get(AttendanceRuntime, 1).stopped_at is not None
 
-
-@test
-def test_worker_rotates_two_attendance_roles_ahead_of_optional_nonattendance_camera():
-    with database() as (engine, service):
-        clock = Clock()
-        worker, manager, observations, _queue = worker_for(engine, service, clock)
-        with immediate_session(engine) as db:
-            db.add(Camera(id=3, name="Preview", nvr_host="unused", username="u", password="p", channel=3))
-            db.flush()
-            db.add(AttendanceCamera(camera_id=3))
-        manager.readers[3] = BufferedReader()
-        manager.readers[3].source_revision = 1
-        order = []
-        original = worker.service.process_frame
-
-        def observed(frame, camera_id, *args, **kwargs):
-            result = original(frame, camera_id, *args, **kwargs)
-            order.append(camera_id)
-            return result
-
-        observations.y = .3
-        with patch.object(worker.service, "process_frame", side_effect=observed), \
-                patch.object(settings, "ai_cameras", ""), \
-                patch("app.ai.worker.time.monotonic", side_effect=clock.monotonic), \
-                patch("app.ai.worker.utcnow", side_effect=clock.utcnow):
-            for _ in range(2):
-                for camera_id, reader in manager.readers.items():
-                    reader.buffer.put(FRAME, stream_id=f"stream-{camera_id}",
-                                      source_revision=reader.source_revision,
-                                      received_at=clock.utc, received_mono=clock.mono)
-                worker.step()
-                clock.advance(.5)
-        assert order == [1, 2, 3, 2, 1, 3]
-        assert worker.state.camera(3)["people_count"] == 1
 
 
 @test

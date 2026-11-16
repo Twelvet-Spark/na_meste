@@ -28,6 +28,7 @@ from app.api import cameras as api
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import AttendanceCamera, Camera
+from app.rtsp.jpeg_cache import JPEGCache
 from app.rtsp.reader import CameraStatus, ConnectionLost, FrameBuffer, RTSPReader
 from app.services.attendance_service import AttendanceService
 
@@ -76,6 +77,7 @@ def database():
 class StaticManager:
     def __init__(self, value):
         self.value = value
+        self.jpeg_cache = JPEGCache()
 
     def get(self, camera_id):
         assert camera_id == 1
@@ -90,7 +92,8 @@ def test_packet_keeps_receipt_metadata_and_frame_without_copying():
     assert packet.seq == 1 and packet.stream_id == "stream-a"
     assert packet.source_revision == 1 and packet.received_at == STAMP
     assert packet.received_at.tzinfo is None and packet.received_mono == 100.0
-    assert packet.frame is FRAME and not hasattr(packet, "__dict__")
+    assert packet.frame is FRAME and not packet.frame.flags.writeable
+    assert not hasattr(packet, "__dict__")
     try:
         packet.seq = 9
     except FrozenInstanceError:
@@ -171,7 +174,7 @@ def test_snapshot_rejects_stale_or_non_online_packets():
     with database() as db:
         value = reader()
         value._set_status(CameraStatus.ONLINE)
-        put(value.buffer, mono=100.0)
+        put(value.buffer, revision=value.source_revision, mono=100.0)
         with patch("app.api.cameras.time.monotonic", return_value=100.0 + settings.frame_stall_timeout + .001):
             try:
                 api.api_camera_snapshot(1, db=db, manager=StaticManager(value))
@@ -195,7 +198,7 @@ def test_snapshot_encodes_the_fresh_packet_not_a_tuple():
     with database() as db:
         value = reader()
         value._set_status(CameraStatus.ONLINE)
-        put(value.buffer)
+        put(value.buffer, revision=value.source_revision)
         with patch("app.api.cameras.time.monotonic", return_value=100.1):
             response = api.api_camera_snapshot(1, db=db, manager=StaticManager(value))
         assert response.media_type == "image/jpeg"
@@ -206,11 +209,11 @@ def test_snapshot_encodes_the_fresh_packet_not_a_tuple():
 @test
 def test_mjpeg_encodes_packet_and_keeps_preview_limiter_independent():
     value = reader()
-    put(value.buffer)
+    put(value.buffer, revision=value.source_revision)
     value._set_status(CameraStatus.ONLINE)
     with patch.object(value, "is_alive", return_value=True), \
             patch("app.api.cameras.time.monotonic", return_value=100.1):
-        stream = api._mjpeg_generator(value, "Door")
+        stream = api._mjpeg_generator(StaticManager(value), 1, "Door")
         part = next(stream)
         stream.close()
     assert part.startswith(b"--frame\r\nContent-Type: image/jpeg\r\n")
@@ -222,12 +225,15 @@ class EndLoop(Exception):
 
 
 class PersonDetector:
-    def detect(self, frame):
-        return [(np.array([30., 20., 160., 230.]), .99)]
+    def detect_batch(self, frames):
+        return [[(np.array([30., 20., 160., 230.]), .99)] for frame in frames]
 
 
 class NoFaces:
-    def detect(self, image, max_num=0):
+    model_id = "a" * 64
+    alignment_id = "arcface-5pt-112-v1"
+
+    def detect_faces(self, image):
         return []
 
 
@@ -273,12 +279,12 @@ def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
     clock = [100.0]
     service = RecognitionService(PersonDetector(), NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
     outcomes = []
-    process = service.process_frame
+    process = service.process_batch
 
     def collect(*args, **kwargs):
-        outcome = process(*args, **kwargs)
-        outcomes.append(outcome)
-        return outcome
+        batch = process(*args, **kwargs)
+        outcomes.extend(batch)
+        return batch
 
     state = DetectionState()
     with database() as db:
@@ -302,9 +308,11 @@ def run_worker(stages, *, attendance=False, on_stage=None, global_reid=None):
             LoopManager(stages, clock, advance), service, AttendanceService(db.get_bind()), state,
             global_manager=global_manager,
         )
-        with patch.object(service, "process_frame", side_effect=collect), \
+        # Match the fixture's 100 ms receipt cadence with a valid production
+        # rate, leaving real scheduler slack for optional appearance work.
+        with patch.object(service, "process_batch", side_effect=collect), \
                 patch("app.ai.worker.time.monotonic", side_effect=lambda: clock[0]), \
-                patch.object(settings, "ai_cameras", ""), patch.object(settings, "ai_fps", 100.0):
+                patch.object(settings, "ai_cameras", ""), patch.object(settings, "ai_fps", 10.0):
             try:
                 while True:
                     worker.step()
@@ -413,7 +421,8 @@ def test_disabling_attendance_calibration_immediately_clears_identity():
         (FrameReader("a", 1, 100.0), 100.0),
         (FrameReader("a", 2, 100.1), 100.1),
     ], attendance=True, on_stage=change)
-    assert len(outcomes) == 1 and state.camera(1) is None
+    assert len(outcomes) == 2 and state.camera(1) is not None
+    assert outcomes[0].tracking_generation != outcomes[1].tracking_generation
 
 
 @test
@@ -443,7 +452,9 @@ def test_worker_reconnect_cannot_reuse_previous_global_local_id_binding():
         (FrameReader("new", 1, 100.1, frame=np.full_like(FRAME, 255)), 100.1),
     ], global_reid=DifferentPeopleReID())
     assert len(outcomes) == 2
+    assert outcomes[0].tracking_generation != outcomes[1].tracking_generation
     first, second = (item.detections[0] for item in outcomes)
+    assert first.track_id == second.track_id == 1
     assert first.global_id is not None and second.global_id is not None
     assert first.global_id != second.global_id, "Local ID 1 must not inherit its previous binding"
 

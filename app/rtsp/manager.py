@@ -5,6 +5,7 @@ from typing import Optional
 
 from app.config import resolve_ffmpeg, settings
 from app.rtsp.dahua import build_rtsp_url
+from app.rtsp.jpeg_cache import JPEGCache
 from app.rtsp.reader import RTSPReader
 from app.rtsp.source import CONNECTION_FIELDS, CameraDeletion, CameraSource
 
@@ -21,6 +22,7 @@ class ReaderManager:
         self._readers: dict[int, RTSPReader] = {}
         self._published_sources: dict[int, CameraSource | CameraDeletion] = {}
         self._lock = threading.RLock()
+        self.jpeg_cache = JPEGCache()
         self._ffmpeg, self._ffprobe = resolve_ffmpeg()
         if not self._ffmpeg or not self._ffprobe:
             logger.error(
@@ -76,7 +78,8 @@ class ReaderManager:
             source_revision=camera.source_revision,
             ffmpeg_path=self._ffmpeg,
             ffprobe_path=self._ffprobe,
-            frame_buffer_size=settings.frame_buffer_size,
+            target_fps=settings.stream_output_fps,
+            hwaccel=settings.stream_hwaccel,
             connect_timeout=settings.rtsp_connect_timeout,
             max_reconnect_delay=settings.rtsp_reconnect_max_delay,
             frame_stall_timeout=settings.frame_stall_timeout,
@@ -135,6 +138,9 @@ class ReaderManager:
             "codec": None,
             "stream_fps": None,
             "reconnect_count": 0,
+            "decoder_requested": settings.stream_hwaccel,
+            "decoder_mode": None,
+            "decoder_warning": None,
             "error": None,
         }
 
@@ -142,11 +148,13 @@ class ReaderManager:
         with self._lock:
             readers = list(self._readers.values())
             self._readers.clear()
+            self.jpeg_cache.clear()
         for reader in readers:
             reader.stop()
         logger.info("Все ридеры остановлены (%d)", len(readers))
 
     def _stop_locked(self, camera_id: int) -> None:
+        self.jpeg_cache.invalidate(camera_id)
         reader = self._readers.pop(camera_id, None)
         if reader:
             reader.stop()

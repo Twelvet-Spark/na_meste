@@ -33,6 +33,7 @@ SAFE_CODES = frozenset({
     "MODEL_MISSING", "MODEL_HASH_MISMATCH", "MODEL_CONTRACT_INVALID",
     "FACE_MODEL_UNAVAILABLE", "GALLERY_UNAVAILABLE", "GALLERY_CHANGED",
     "JOURNAL_DEGRADED", "CAPACITY_DEGRADED", "DECODE_SOFTWARE_FALLBACK",
+    "DECODE_HARDWARE_INIT_FAILED",
     "SCENE_MODEL_UNAVAILABLE", "ENROLLMENT_BUSY", "LEGACY_MODEL_SETTINGS_IGNORED",
 })
 PROVIDERS = frozenset({"CPUExecutionProvider", "CUDAExecutionProvider", "TensorrtExecutionProvider",
@@ -301,6 +302,8 @@ class DiagnosticsService:
         with Session(self.engine) as db:
             cameras = db.query(Camera.id, Camera.enabled).order_by(Camera.id).all()
         manager = getattr(self.state, "manager", None)
+        worker = getattr(self.state, "ai_worker", None)
+        inference = self._isolated(worker.inference_snapshot, {}) if worker is not None else {}
         result = []
         for camera_id, enabled in cameras:
             try:
@@ -314,6 +317,23 @@ class DiagnosticsService:
                 resolution = raw.get("resolution")
                 row["resolution"] = resolution if type(resolution) is str and re.fullmatch(r"[0-9]{1,5}x[0-9]{1,5}", resolution) else None
                 row["codec"] = raw.get("codec") if raw.get("codec") in {"h264", "hevc", "mjpeg", "mpeg4", "vp8", "vp9", "av1"} else None
+                row["decoder_mode"] = raw.get("decoder_mode") if raw.get("decoder_mode") in {"cuda", "software"} else None
+                row["decoder_requested"] = raw.get("decoder_requested") if raw.get("decoder_requested") in {"auto", "cuda", "none"} else None
+                row["decoder_warning"] = safe_code(raw["decoder_warning"]) if raw.get("decoder_warning") else None
+                measurement = inference.get(camera_id)
+                if measurement is not None:
+                    row["inference"] = {
+                        key: number(measurement.get(key)) for key in (
+                            "processed_fps_10s", "target_fps", "completion_age_p95_seconds", "pending_age_seconds",
+                            "queue_age_seconds", "processing_seconds", "completion_age_seconds",
+                            "skipped_slots", "face_deferred", "reid_deferred")}
+                    row["inference"].update(
+                        reason_codes=[safe_code(code) for code in measurement.get("reason_codes", [])],
+                        stage_times_ms={key: number(measurement.get("stage_times_ms", {}).get(key))
+                                        for key in ("person", "face_detection", "face_recognition", "tracking")},
+                        model_ids={key: model_identifier(measurement.get("model_ids", {}).get(key))
+                                   for key in ("bundle", "person", "face", "body")},
+                        providers=provider_summary(measurement.get("providers")))
             except Exception:
                 row = {"id": camera_id, "enabled": bool(enabled), "status": "ERROR", "error": "DIAGNOSTICS_UNAVAILABLE"}
             result.append(row)

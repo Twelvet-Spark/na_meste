@@ -16,7 +16,7 @@
 import logging
 import time
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 import cv2
 import numpy as np
@@ -29,7 +29,8 @@ from fastapi.routing import APIRoute
 from app.config import settings
 from app.database.database import get_db
 from app.rtsp.manager import ReaderManager
-from app.rtsp.reader import CameraStatus, RTSPReader
+from app.rtsp.jpeg_cache import JPEG_QUALITY
+from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
 from app.services import camera_service as service
 from app.services.camera_service import ConnectionTestRequest
 from app.api.operator_security import require_operator_request
@@ -66,7 +67,6 @@ def _setup(request: Request) -> DahuaSetup:
             request.app.state.dahua_setup = setup
         return setup
 
-JPEG_QUALITY = 70
 
 
 def get_manager(request: Request) -> ReaderManager:
@@ -364,41 +364,70 @@ def _multipart_part(jpeg: bytes) -> bytes:
     )
 
 
-def _mjpeg_generator(reader: Optional[RTSPReader], name: str):
-    """MJPEG-поток из буфера ридера.
+def _packet_current(
+    manager: ReaderManager, camera_id: int, reader: RTSPReader, packet: FramePacket,
+) -> bool:
+    """Check the current reader and connection again after waiting/encoding."""
+    current = reader.buffer.latest()
+    return (manager.get(camera_id) is reader and reader.status() is CameraStatus.ONLINE
+            and packet.source_revision == reader.source_revision and current is not None
+            and current.stream_id == packet.stream_id
+            and current.source_revision == packet.source_revision
+            and time.monotonic() - packet.received_mono <= settings.frame_stall_timeout)
 
-    Синхронный генератор — Starlette выполняет его в threadpool, event loop
-    не блокируется. Кадры отдаются с ограничением PREVIEW_FPS; при потере
-    потока — заглушка NO SIGNAL; при остановленном ридере — OFFLINE.
-    """
+
+FrameSize = Literal["native", "thumbnail", "preview"]
+
+
+def _packet_jpeg(manager: ReaderManager, camera_id: int, packet: FramePacket, size: FrameSize) -> bytes:
+    if size == "native":
+        return _encode_jpeg(packet.frame)
+    return manager.jpeg_cache.get(camera_id, packet, size)
+
+
+def _mjpeg_generator(manager: ReaderManager, camera_id: int, name: str, size: FrameSize = "preview"):
+    """Reacquire the live reader every iteration, including after sequence reset."""
+    previous_reader = None
+    previous_stream = None
     seq = 0
     min_interval = 1.0 / max(1, settings.preview_fps)
-    last_sent = 0.0
+    last_sent = float("-inf")
 
     while True:
+        reader = manager.get(camera_id)
         if reader is None:
-            return  # ридер не существует — поток завершается
-
-        if not reader.is_alive():
-            status = reader.status().value
-            if status in ("OFFLINE", "ERROR"):
-                yield _multipart_part(_placeholder_jpeg(f"{status}: {name}"))
-                time.sleep(1.0)
-                continue
-            return  # ридер в процессе остановки — завершаем поток
-
-        result = reader.buffer.wait_for_new(seq, timeout=2.0)
-        if result is None:
-            yield _multipart_part(_placeholder_jpeg("NO SIGNAL"))
+            yield _multipart_part(_placeholder_jpeg(f"OFFLINE: {name}"))
             time.sleep(1.0)
             continue
-
-        seq = result.seq
+        if reader is not previous_reader:
+            previous_reader, previous_stream, seq = reader, None, 0
+        latest = reader.buffer.latest()
+        if latest is not None and latest.stream_id != previous_stream:
+            previous_stream, seq = latest.stream_id, 0
+        if reader.status() is not CameraStatus.ONLINE:
+            yield _multipart_part(_placeholder_jpeg(f"{reader.status().value}: {name}"))
+            time.sleep(1.0)
+            continue
+        packet = reader.buffer.wait_for_new(seq, timeout=1.0)
+        if manager.get(camera_id) is not reader:
+            continue
+        if packet is None:
+            yield _multipart_part(_placeholder_jpeg("NO SIGNAL"))
+            time.sleep(.1)
+            continue
+        previous_stream, seq = packet.stream_id, packet.seq
         now = time.monotonic()
+        if not _packet_current(manager, camera_id, reader, packet):
+            continue
         if now - last_sent < min_interval:
-            continue  # кадр пришёл слишком рано — пропускаем, ждём следующий
-        last_sent = now
-        yield _multipart_part(_encode_jpeg(result.frame))
+            time.sleep(min_interval - (now - last_sent))
+            continue
+        jpeg = _packet_jpeg(manager, camera_id, packet, size)
+        if not _packet_current(manager, camera_id, reader, packet):
+            manager.jpeg_cache.invalidate(camera_id)
+            continue
+        last_sent = time.monotonic()
+        yield _multipart_part(jpeg)
 
 
 @router.get("/{camera_id}/stream")
@@ -406,11 +435,11 @@ def api_camera_stream(
     camera_id: int,
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
+    size: FrameSize = "preview",
 ):
     camera = _camera_or_404(db, camera_id)
-    reader = manager.get(camera.id)
     return StreamingResponse(
-        _mjpeg_generator(reader, camera.name),
+        _mjpeg_generator(manager, camera.id, camera.name, size),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={
             "Cache-Control": "no-cache, no-store",
@@ -424,13 +453,18 @@ def api_camera_snapshot(
     camera_id: int,
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
+    size: FrameSize = "native",
 ):
-    """Один статичный JPEG-кадр из буфера ридера."""
+    """Native by default for calibration; only two bounded preview derivatives."""
     camera = _camera_or_404(db, camera_id)
     reader = manager.get(camera.id)
     packet = reader.buffer.latest() if reader is not None else None
-    if (reader is None or reader.status() is not CameraStatus.ONLINE or packet is None
-            or time.monotonic() - packet.received_mono > settings.frame_stall_timeout):
+    if (reader is None or packet is None or not camera.enabled
+            or not _packet_current(manager, camera.id, reader, packet)):
         raise HTTPException(503, "Кадр недоступен: камера не подключена")
-    return Response(content=_encode_jpeg(packet.frame), media_type="image/jpeg",
+    jpeg = _packet_jpeg(manager, camera.id, packet, size)
+    if not _packet_current(manager, camera.id, reader, packet):
+        manager.jpeg_cache.invalidate(camera.id)
+        raise HTTPException(503, "Кадр недоступен: камера не подключена")
+    return Response(content=jpeg, media_type="image/jpeg",
                     headers={"Cache-Control": "no-cache, no-store"})

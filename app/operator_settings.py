@@ -13,7 +13,9 @@ from pydantic_settings import EnvSettingsSource, DotEnvSettingsSource
 BASE_DIR = Path(__file__).resolve().parent.parent
 EDITABLE = (
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
+    "stream_output_fps", "stream_hwaccel",
     "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",

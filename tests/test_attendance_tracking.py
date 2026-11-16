@@ -16,10 +16,11 @@ from sqlalchemy.orm import sessionmaker
 
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.global_tracker import GlobalIdentityManager
-from app.ai.recognition_service import DetectionResult, FrameOutcome, RecognitionService
+from app.ai.recognition_service import DetectionResult, FrameOutcome, RecognitionInput, RecognitionService
 from app.ai.tracker import ByteTracker
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import Camera, GlobalEvent, GlobalObservation, GlobalPerson
+from app.rtsp.reader import FramePacket
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4)
@@ -156,24 +157,35 @@ class Detector:
     def __init__(self):
         self.persons = [(box(), .99)]
 
-    def detect(self, frame):
-        return self.persons
+    def detect_batch(self, frames):
+        return [self.persons for _frame in frames]
 
 
 class NoFaces:
-    def detect(self, image, max_num=0):
+    model_id = "a" * 64
+    alignment_id = "arcface-5pt-112-v1"
+
+    def detect_faces(self, image):
         return []
+
+    def embed_aligned(self, crops):
+        raise AssertionError("No detected faces may be embedded")
+
+
+def process(service, seq, mono):
+    packet = FramePacket("tracking-test", 1, seq,
+                         STAMP + timedelta(seconds=mono - 10.), mono, FRAME)
+    return service.process_batch([RecognitionInput(1, packet)])[0]
 
 
 @test
 def test_recognition_reset_always_changes_generation_and_clears_employee_cache():
     detector = Detector()
     service = RecognitionService(detector, NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
-    first = service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
+    first = process(service, 1, 10.)
     identified(service._trackers[1].tracks[0])
     generation = service.reset_camera(1)
-    second = service.process_frame(FRAME, 1, 10.1, frame_seq=2,
-                                   received_at=STAMP + timedelta(seconds=.1))
+    second = process(service, 2, 10.1)
     assert first.tracking_generation != generation == second.tracking_generation
     assert second.detections[0].track_id == 1 and second.detections[0].employee_id is None
     third = service.reset_camera(1)
@@ -184,11 +196,10 @@ def test_recognition_reset_always_changes_generation_and_clears_employee_cache()
 def test_recognition_never_displays_cached_employee_after_ambiguous_overlap():
     detector = Detector()
     service = RecognitionService(detector, NoFaces(), EmbeddingStore("a" * 64), min_hits=1)
-    service.process_frame(FRAME, 1, 10., frame_seq=1, received_at=STAMP)
+    process(service, 1, 10.)
     identified(service._trackers[1].tracks[0])
     detector.persons = [(box(-2., 98.), .99), (box(2., 102.), .99)]
-    outcome = service.process_frame(FRAME, 1, 10.1, frame_seq=2,
-                                    received_at=STAMP + timedelta(seconds=.1))
+    outcome = process(service, 2, 10.1)
     assert all(det.employee_id is None for det in outcome.detections)
     assert any(item.track_id == 1 and item.state == "AMBIGUOUS"
                for item in outcome.track_lifecycle)

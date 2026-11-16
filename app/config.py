@@ -37,7 +37,8 @@ class Settings(BaseSettings):
 
     ffmpeg_path: str = ""                   # пусто — автоопределение
     preview_fps: int = Field(default=10, ge=1, le=30)
-    frame_buffer_size: int = 2              # буфер кадров (drop old, keep latest)
+    stream_output_fps: int = Field(default=15, ge=5, le=30)
+    stream_hwaccel: Literal["auto", "cuda", "none"] = "auto"
     frame_stall_timeout: int = Field(default=10, ge=1, le=120)
 
     # Manual video only. Deployment paths/reserve are not operator-editable.
@@ -56,6 +57,8 @@ class Settings(BaseSettings):
     ai_fps: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False)
     ai_cameras: str = ""                    # canonical sorted IDs; empty = all cameras
     ai_device: Literal["auto", "cpu", "cuda"] = "auto"
+    ai_batch_size: int = Field(default=4, ge=1, le=8)
+    ai_batch_wait_ms: int = Field(default=10, ge=0, le=50)
     person_confidence: float = Field(default=0.1, ge=0.1, le=1, allow_inf_nan=False)
     tracker_new_track_threshold: float = 0.5  # score детекции, создающей НОВЫЙ трек
                                               # (ниже — детекция только продлевает существующий)

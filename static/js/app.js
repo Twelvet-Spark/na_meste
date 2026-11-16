@@ -56,7 +56,7 @@
       : recordingStates[camera.recording?.status] || 'Запись не ведётся';
     card.image.alt = `Предпросмотр: ${camera.name}`;
     if (camera.enabled && camera.status === 'ONLINE' && Date.now() - card.previewAt >= 10000) {
-      card.previewAt = Date.now(); card.image.src = `/api/cameras/${camera.id}/snapshot?t=${card.previewAt}`;
+      card.previewAt = Date.now(); card.image.src = `/api/cameras/${camera.id}/snapshot?size=thumbnail&t=${card.previewAt}`;
     } else if (!camera.enabled || camera.status !== 'ONLINE') {
       card.image.hidden = true; card.unavailable.hidden = false;
       card.unavailable.textContent = camera.enabled ? 'Нет свежего видео' : 'Камера отключена';

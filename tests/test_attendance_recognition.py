@@ -27,11 +27,12 @@ from sqlalchemy.orm import Session
 
 from app.ai.face_detector import FaceInfo
 from app.ai.face_recognition import EmbeddingStore
-from app.ai.recognition_service import RecognitionService
+from app.ai.recognition_service import RecognitionInput, RecognitionService
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata
 from app.services import employee_service
+from app.rtsp.reader import FramePacket
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4)
@@ -56,10 +57,13 @@ def vector(first=1., second=0.):
 
 
 def face(embedding=None, **changes):
+    bbox = np.asarray(changes.get("bbox", [30., 30., 130., 130.]), dtype=np.float32)
+    points = np.array([[.3, .35], [.7, .35], [.5, .55], [.35, .8], [.65, .8]],
+                      dtype=np.float32)
+    points = bbox[:2] + points * (bbox[2:] - bbox[:2])
     observation = FaceInfo(
-        bbox=np.array([30., 30., 130., 130.], dtype=np.float32),
-        det_score=.99, embedding=vector() if embedding is None else embedding,
-        aligned=CHECKER, model_id=MODEL_ID,
+        bbox=bbox, det_score=.99, embedding=vector() if embedding is None else embedding,
+        aligned=CHECKER, native_bbox=bbox.copy(), landmarks=points, model_id=MODEL_ID,
     )
     return replace(observation, **changes)
 
@@ -104,17 +108,26 @@ class Persons:
     def __init__(self):
         self.observations = [(PERSON, .99)]
 
-    def detect(self, frame):
-        return self.observations
+    def detect_batch(self, frames):
+        return [self.observations for _frame in frames]
 
 
 class Faces:
-    """Synthetic model output; honor max_num so truncation cannot hide ambiguity."""
+    """Synthetic external models, with separate detection and embedding APIs."""
     model_id = MODEL_ID
     alignment_id = ALIGNMENT_ID
 
     def __init__(self):
         self.observations = [face()]
+        self._vectors = {}
+
+    def detect_faces(self, image):
+        for observation in self.observations:
+            self._vectors[id(observation.aligned)] = observation.embedding
+        return [replace(observation, embedding=None) for observation in self.observations]
+
+    def embed_aligned(self, crops):
+        return np.stack([self._vectors[id(crop)] for crop in crops])
 
     def detect(self, image, max_num=0):
         return self.observations[:max_num] if max_num else self.observations
@@ -126,10 +139,10 @@ def recognition(engine, **kwargs):
 
 
 def process(service, seq, mono, *, attendance=True):
-    return service.process_frame(
-        FRAME, 1, mono, frame_seq=seq,
-        received_at=STAMP + timedelta(seconds=mono - 10.), attendance=attendance,
+    packet = FramePacket(
+        "recognition-test", 1, seq, STAMP + timedelta(seconds=mono - 10.), mono, FRAME,
     )
+    return service.process_batch([RecognitionInput(1, packet, attendance)])[0]
 
 
 def detection(service, seq, mono, **kwargs):
@@ -226,7 +239,7 @@ def test_three_distinct_fresh_frames_confirm_and_publish_immutable_evidence():
         assert evidence.supporting_frame_sequences == (1, 2, 3)
         assert evidence.quality.aligned and evidence.quality.blur >= 20.
         assert evidence.aligned_jpeg and len(evidence.aligned_jpeg) <= 32 * 1024
-        assert evidence.face_bbox == (120., 30., 220., 130.)
+        assert evidence.face_bbox == (110., 30., 210., 130.)
         try:
             evidence.confirmed_employee_id = 2
         except (FrozenInstanceError, AttributeError):
@@ -346,9 +359,9 @@ def test_gallery_refresh_during_third_face_observation_requires_three_new_revisi
         service, _people, faces, store = recognition(engine)
         assert detection(service, 1, 10.).employee_id is None
         assert detection(service, 2, 10.25).employee_id is None
-        original_detect = faces.detect
+        original_detect = faces.detect_faces
 
-        def refresh_then_detect(image, max_num=0):
+        def refresh_then_detect(image):
             with Session(engine) as db:
                 employee_service.update_employee(
                     db, db.get(Employee, 1),
@@ -356,23 +369,24 @@ def test_gallery_refresh_during_third_face_observation_requires_three_new_revisi
                                                     last_name="First", first_name="revised"),
                 )
                 store.refresh(db)
-            return original_detect(image, max_num=max_num)
+            return original_detect(image)
 
-        with patch.object(faces, "detect", side_effect=refresh_then_detect):
+        with patch.object(faces, "detect_faces", side_effect=refresh_then_detect):
             result = detection(service, 3, 10.5)
-        assert result.employee_id is None, "Two old-revision votes cannot confirm a new gallery"
-        assert result.fresh_face_evidence.store_revision == 8
-        assert result.fresh_face_evidence.confirmed_employee_id is None
-        assert result.fresh_face_evidence.supporting_frame_sequences == (3,)
+        assert result.employee_id is None, "An admitted old-revision batch cannot cast new votes"
+        assert result.fresh_face_evidence.store_revision == 7
+        assert "GALLERY_CHANGED" in result.fresh_face_evidence.reason_codes
+        assert result.fresh_face_evidence.supporting_frame_sequences == ()
         assert detection(service, 4, 10.75).employee_id is None
-        result = detection(service, 5, 11.)
+        assert detection(service, 5, 11.).employee_id is None
+        result = detection(service, 6, 11.25)
         assert result.employee_id == 1 and result.employee_name == "First revised"
         assert result.fresh_face_evidence.store_revision == 8
-        assert result.fresh_face_evidence.supporting_frame_sequences == (3, 4, 5)
+        assert result.fresh_face_evidence.supporting_frame_sequences == (4, 5, 6)
 
 
 @test
-def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
+def test_in_batch_refresh_invalidates_every_track_before_embedding_publication():
     with database() as engine:
         service, people, faces, store = recognition(engine)
         people.observations = [
@@ -381,10 +395,10 @@ def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
         for seq, mono in ((1, 10.), (2, 10.25), (3, 10.5)):
             prior = process(service, seq, mono)
         assert [item.employee_id for item in prior.detections] == [1, 1]
-        original_detect = faces.detect
+        original_detect = faces.detect_faces
         calls = 0
 
-        def refresh_on_second_head(image, max_num=0):
+        def refresh_on_second_head(image):
             nonlocal calls
             calls += 1
             if calls == 2:
@@ -395,24 +409,18 @@ def test_in_frame_refresh_invalidates_other_track_result_already_materialized():
                                                         last_name="First", first_name="revised"),
                     )
                     store.refresh(db)
-            return original_detect(image, max_num=max_num)
+            return original_detect(image)
 
-        with patch.object(faces, "detect", side_effect=refresh_on_second_head):
+        with patch.object(faces, "detect_faces", side_effect=refresh_on_second_head):
             outcome = process(service, 4, 10.75)
         assert store.match(vector()).store_revision == 8
         assert len(outcome.detections) == 2
         assert all(item.employee_id is None for item in outcome.detections)
-        old_evidence = outcome.detections[0].fresh_face_evidence
-        assert old_evidence.store_revision == 7
-        assert old_evidence.confirmed_employee_id == 1
-        assert old_evidence.candidate_employee_name == "First"
-        assert old_evidence.supporting_frame_sequences == (2, 3, 4)
-        assert old_evidence.confirmed_at_mono == 10.5
-        assert "GALLERY_CHANGED" in old_evidence.reason_codes
-        new_evidence = outcome.detections[1].fresh_face_evidence
-        assert new_evidence.store_revision == 8
-        assert new_evidence.confirmed_employee_id is None
-        assert new_evidence.supporting_frame_sequences == (4,)
+        for result in outcome.detections:
+            evidence = result.fresh_face_evidence
+            assert evidence.store_revision == 7 and evidence.confirmed_employee_id is None
+            assert evidence.supporting_frame_sequences == ()
+            assert "GALLERY_CHANGED" in evidence.reason_codes
 
 
 @test
@@ -426,10 +434,10 @@ def test_in_frame_refresh_clears_other_tracks_cached_confirmation_without_resamp
         for seq, mono in ((2, 10.1), (3, 10.25), (4, 10.36), (5, 10.5), (6, 10.62)):
             prior = process(service, seq, mono)
         assert [item.employee_id for item in prior.detections] == [1, 1]
-        original_detect = faces.detect
+        original_detect = faces.detect_faces
         refreshed = False
 
-        def refresh_then_detect(image, max_num=0):
+        def refresh_then_detect(image):
             nonlocal refreshed
             if not refreshed:
                 refreshed = True
@@ -440,9 +448,9 @@ def test_in_frame_refresh_clears_other_tracks_cached_confirmation_without_resamp
                                                         last_name="First", first_name="revised"),
                     )
                     store.refresh(db)
-            return original_detect(image, max_num=max_num)
+            return original_detect(image)
 
-        with patch.object(faces, "detect", side_effect=refresh_then_detect):
+        with patch.object(faces, "detect_faces", side_effect=refresh_then_detect):
             outcome = process(service, 7, 10.75)
         assert store.match(vector()).store_revision == 8
         assert len(outcome.detections) == 2
@@ -492,7 +500,7 @@ def test_shared_face_center_is_rejected_even_when_other_person_is_not_display_el
     with database() as engine:
         service, people, faces, _store = recognition(engine)
         service.min_hits = 3
-        # Face center x=270 after crop offset x=90; both head regions own it.
+        # Face center x=260 after crop offset x=80; both raw heads own it.
         faces.observations = [face(bbox=np.array([135., 30., 225., 130.]))]
         process(service, 1, 10.)
         process(service, 2, 10.25)

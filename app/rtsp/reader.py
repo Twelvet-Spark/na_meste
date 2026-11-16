@@ -4,9 +4,8 @@
 
     RTSP (TCP) → ffmpeg -f rawvideo -pix_fmt bgr24 (pipe) → кадры numpy
 
-Модуль не зависит ни от FastAPI, ни от AI-компонентов. В будущем кадры из
-FrameBuffer дополнительно заберёт детектор присутствия, не меняя этот код:
-буфер хранит только самые свежие кадры (drop old, keep latest).
+Модуль не зависит ни от FastAPI, ни от AI-компонентов. Потребители разделяют
+один неизменяемый исходный кадр; единственный latest-слот не хранит историю.
 """
 import json
 import logging
@@ -45,6 +44,10 @@ class RTSPError(Exception):
 class ConnectionLost(RTSPError):
     """Соединение потеряно (EOF, таймаут, ошибка ffmpeg)."""
 
+
+
+class HardwareInitializationFailed(ConnectionLost):
+    """FFmpeg could not initialize the requested CUDA decoder."""
 
 class StopRequested(RTSPError):
     """Запрошена остановка ридера."""
@@ -95,15 +98,10 @@ class FramePacket:
 
 
 class FrameBuffer:
-    """Буфер последних кадров: при переполнении автоматически отбрасывается
-    самый старый кадр (drop old, keep latest).
+    """One shared latest packet; slow consumers never retain an image FIFO."""
 
-    Ориентирован на потребителей, которым нужен актуальный кадр
-    (MJPEG-превью, будущий детектор), а не каждый кадр потока.
-    """
-
-    def __init__(self, maxlen: int = 2):
-        self._frames: deque[FramePacket] = deque(maxlen=maxlen)
+    def __init__(self):
+        self._packet: FramePacket | None = None
         self._seq = 0
         self._cond = threading.Condition()
 
@@ -112,17 +110,18 @@ class FrameBuffer:
         received_at: datetime, received_mono: float,
     ) -> int:
         with self._cond:
+            frame.setflags(write=False)
             self._seq += 1
-            self._frames.append(FramePacket(
+            self._packet = FramePacket(
                 stream_id, source_revision, self._seq, received_at, received_mono, frame,
-            ))
+            )
             self._cond.notify_all()
             return self._seq
 
     def latest(self) -> FramePacket | None:
         """Последний опубликованный пакет без копирования изображения."""
         with self._cond:
-            return self._frames[-1] if self._frames else None
+            return self._packet
 
     def wait_for_new(
         self, after_seq: int, timeout: float
@@ -131,8 +130,8 @@ class FrameBuffer:
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
-                if self._frames and self._frames[-1].seq > after_seq:
-                    return self._frames[-1]
+                if self._packet is not None and self._packet.seq > after_seq:
+                    return self._packet
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -141,7 +140,7 @@ class FrameBuffer:
     def clear(self) -> None:
         """Discard disconnected frames without reusing sequence numbers."""
         with self._cond:
-            self._frames.clear()
+            self._packet = None
             self._cond.notify_all()
 
 
@@ -165,8 +164,8 @@ class RTSPReader:
         source_revision: int,
         ffmpeg_path: Optional[str],
         ffprobe_path: Optional[str],
-        frame_buffer_size: int = 2,
-        target_fps: Optional[float] = None,
+        target_fps: float = 15,
+        hwaccel: str = "auto",
         connect_timeout: int = 10,
         max_reconnect_delay: int = 30,
         frame_stall_timeout: int = 10,
@@ -178,12 +177,21 @@ class RTSPReader:
 
         self._ffmpeg = ffmpeg_path
         self._ffprobe = ffprobe_path
+        if hwaccel not in {"auto", "cuda", "none"}:
+            raise ValueError("hwaccel must be auto, cuda or none")
+        if not np.isfinite(target_fps) or target_fps <= 0:
+            raise ValueError("target_fps must be finite and positive")
+        self._hwaccel = hwaccel
+        self._software_fallback = False
+        self._received_any_frame = False
+        self._attempt_got_frame = False
+        self.decoder_mode: str | None = None
         self._target_fps = target_fps
         self._connect_timeout = connect_timeout
         self._max_reconnect_delay = max_reconnect_delay
         self._stall_timeout = frame_stall_timeout
 
-        self.buffer = FrameBuffer(frame_buffer_size)
+        self.buffer = FrameBuffer()
 
         self._thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
@@ -281,6 +289,9 @@ class RTSPReader:
             "codec": self.codec if self.codec in {"h264", "hevc", "mjpeg", "mpeg4", "vp8", "vp9", "av1"} else None,
             "stream_fps": number(self.stream_fps),
             "reconnect_count": number(self.reconnect_count, integer=True),
+            "decoder_requested": self._hwaccel,
+            "decoder_mode": self.decoder_mode,
+            "decoder_warning": "DECODE_SOFTWARE_FALLBACK" if self._software_fallback else None,
             "error": safe_code(self.last_error, "STREAM_UNAVAILABLE") if self.last_error else None,
         }
 
@@ -298,20 +309,22 @@ class RTSPReader:
             self._set_status(
                 CameraStatus.CONNECTING if first_attempt else CameraStatus.RECONNECTING
             )
-            was_online = False
             try:
-                was_online = self._connect_and_read()
+                self._connect_and_read()
             except StopRequested:
                 break
             except Exception as exc:
-                self.last_error = "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE" if (
-                    getattr(exc, "detail", None) == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE"
-                ) else "STREAM_UNAVAILABLE"
+                if getattr(exc, "detail", None) == "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE":
+                    self.last_error = "MEDIA_PROCESS_CONTAINMENT_UNAVAILABLE"
+                elif isinstance(exc, HardwareInitializationFailed):
+                    self.last_error = "DECODE_HARDWARE_INIT_FAILED"
+                else:
+                    self.last_error = "STREAM_UNAVAILABLE"
                 logger.warning(self.last_error, extra={"camera_id": self.camera_id})
             if self._stop_event.is_set():
                 break
 
-            if was_online:
+            if self._attempt_got_frame:
                 backoff.reset()
             first_attempt = False
             self.reconnect_count += 1
@@ -328,16 +341,26 @@ class RTSPReader:
         self._set_status(CameraStatus.OFFLINE)
         logger.info("Camera #%d reader stopped", self.camera_id)
 
-    def _connect_and_read(self) -> bool:
-        """Подключается к потоку и читает кадры до разрыва.
-
-        Возвращает True, если был получен хотя бы один кадр (подключение
-        состоялось). Бросает ConnectionLost/StopRequested.
-        """
+    def _connect_and_read(self) -> None:
+        """Read one connection until EOF/stop, with one eligible auto fallback."""
         self.buffer.clear()
-        width, height, codec, stream_fps = self._probe()
-        self._attempt_started_mono = time.monotonic()
+        self._attempt_got_frame = False
+        self.decoder_mode = None
+        width, height, _codec, _stream_fps = self._probe()
+        mode = "software" if self._hwaccel == "none" or self._software_fallback else "cuda"
+        try:
+            return self._read_connection(width, height, mode)
+        except HardwareInitializationFailed:
+            if (self._hwaccel != "auto" or self._software_fallback
+                    or self._received_any_frame or self._stop_event.is_set()):
+                raise
+            self._software_fallback = True
+            logger.warning("DECODE_SOFTWARE_FALLBACK", extra={"camera_id": self.camera_id})
+            return self._read_connection(width, height, "software")
 
+    def _read_connection(self, width: int, height: int, mode: str) -> None:
+        """Run one contained decoder; modes are verified only by a real frame."""
+        self._attempt_started_mono = time.monotonic()
         frame_bytes = width * height * 3
         cmd = [
             self._ffmpeg,
@@ -346,6 +369,10 @@ class RTSPReader:
             "-timeout", str(self._connect_timeout * 1_000_000),  # мкс
             "-fflags", "nobuffer",
             "-flags", "low_delay",
+        ]
+        if mode == "cuda":
+            cmd += ["-hwaccel", "cuda"]
+        cmd += [
             "-i", self.rtsp_url,
             "-map", "0:v:0",
             # кадры отдаются как есть, без дублирования до tbr источника
@@ -354,9 +381,12 @@ class RTSPReader:
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
         ]
-        if self._target_fps:
-            cmd += ["-vf", f"fps={self._target_fps}"]
-        cmd += ["pipe:1"]
+        expression = (
+            "if(isnan(t),1,if(isnan(prev_selected_t),1,"
+            "if(lt(t,prev_selected_t),1,"
+            f"gte(t-prev_selected_t,1/{self._target_fps:g}-0.000001))))"
+        )
+        cmd += ["-vf", "select=" + expression.replace(",", r"\,"), "pipe:1"]
 
         with self._proc_lock:
             if self._stop_event.is_set():
@@ -374,9 +404,10 @@ class RTSPReader:
 
         # ffmpeg не должен блокироваться на переполненном stderr — сливаем его
         stderr_tail: deque[str] = deque(maxlen=3)
-        threading.Thread(
+        stderr_thread = threading.Thread(
             target=self._drain_stderr, args=(proc.stderr, stderr_tail), daemon=True
-        ).start()
+        )
+        stderr_thread.start()
 
         got_frame = False
         try:
@@ -384,8 +415,7 @@ class RTSPReader:
             while not self._stop_event.is_set():
                 chunk = self._read_exact(stdout, frame_bytes)
                 if chunk is None:
-                    detail = stderr_tail[-1] if stderr_tail else "поток закрыт"
-                    raise ConnectionLost(detail)
+                    break
                 received_mono = time.monotonic()
                 received_at = utcnow()
                 if self._stop_event.is_set():
@@ -393,6 +423,9 @@ class RTSPReader:
                 frame = np.frombuffer(chunk, dtype=np.uint8).reshape((height, width, 3))
                 if not got_frame:
                     got_frame = True
+                    self._attempt_got_frame = True
+                    self._received_any_frame = True
+                    self.decoder_mode = mode
                     self.last_error = None
                     self._attempt_started_mono = None
                     self._set_status(CameraStatus.ONLINE)
@@ -403,8 +436,11 @@ class RTSPReader:
                     frame, stream_id=stream_id, source_revision=self.source_revision,
                     received_at=received_at, received_mono=received_mono,
                 )
+            if self._stop_event.is_set():
+                raise StopRequested()
         finally:
             self.buffer.clear()
+            self.decoder_mode = None
             self._set_status(
                 CameraStatus.OFFLINE if self._stop_event.is_set() else CameraStatus.RECONNECTING
             )
@@ -414,7 +450,12 @@ class RTSPReader:
                 proc.stdout.close()
             except Exception:
                 pass
-        return got_frame
+            stderr_thread.join(timeout=1.0)
+        if not got_frame and mode == "cuda" and "DECODE_HARDWARE_INIT_FAILED" in stderr_tail:
+            self.last_error = "DECODE_HARDWARE_INIT_FAILED"
+            raise HardwareInitializationFailed(self.last_error)
+        self.last_error = "STREAM_UNAVAILABLE"
+        raise ConnectionLost(self.last_error)
 
     def _probe(self) -> tuple[int, int, str, Optional[float]]:
         """Метаданные потока через ffprobe: (width, height, codec, fps)."""
@@ -522,9 +563,18 @@ class RTSPReader:
     def _drain_stderr(pipe, sink: deque) -> None:
         """Drain external stderr; only a safe code may enter the bounded buffer."""
         try:
-            for raw in iter(pipe.readline, b""):
-                line = raw.decode("utf-8", "replace").strip()
-                if line:
+            for raw in iter(lambda: pipe.readline(4096), b""):
+                line = raw.decode("utf-8", "replace").strip().lower()
+                if any(marker in line for marker in (
+                    "cannot load nvcuda", "cannot load libcuda", "cannot dynamically load cuda",
+                    "cuda_error_no_device", "cuda_error_system_driver_mismatch",
+                    "no device available for decoder: device type cuda",
+                    "device creation failed", "device setup failed for decoder",
+                    "hwaccel initialisation returned error", "hwaccel initialization returned error",
+                    "unrecognized hwaccel: cuda", "unsupported hwaccel: cuda",
+                )) or ("cuinit" in line and "failed" in line):
+                    sink.append("DECODE_HARDWARE_INIT_FAILED")
+                elif line and "DECODE_HARDWARE_INIT_FAILED" not in sink:
                     sink.append("STREAM_UNAVAILABLE")
         except Exception:
             pass

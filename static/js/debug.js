@@ -12,6 +12,12 @@
     FRAME_GAP: 'Недостаточно свежих кадров. Проверьте поток камеры.',
     PERFORMANCE_WARMUP: 'Измеряется производительность. Дождитесь устойчивой обработки кадров.',
     PERFORMANCE_DEGRADED: 'Производительность ниже требований. Проверьте загрузку и провайдеры AI.',
+    CAPACITY_DEGRADED: 'Обработка камер ниже 90% цели или задержка p95 выше 1 с в течение 10 с.',
+    DECODE_HARDWARE_INIT_FAILED: 'Аппаратный декодер не запустился. Проверьте поддержку кодека и драйвер или выберите программный режим.',
+    DECODE_SOFTWARE_FALLBACK: 'Аппаратный запуск не удался; этот поток декодируется программно.',
+    FACE_MODEL_UNAVAILABLE: 'Модель лиц недоступна; анонимные наблюдения продолжаются.',
+    GALLERY_UNAVAILABLE: 'Галерея лиц недоступна; анонимные наблюдения продолжаются.',
+    JOURNAL_DEGRADED: 'Есть разрыв сохранения наблюдений. Проверьте доступ к базе и свободное место.',
     PERSISTENCE_ERROR: 'Есть ошибка сохранения учёта. Проверьте доступ к базе и свободное место.',
     DIAGNOSTICS_UNAVAILABLE: 'Состояние модуля временно недоступно. Остальные данные показаны независимо.',
     FFMPEG_UNAVAILABLE: 'FFmpeg / ffprobe недоступны. Администратору нужно проверить установку и путь.',
@@ -49,6 +55,7 @@
   let loading = false, sequence = 0, lastUpdate = null, generation = 0;
   const events = [];
   const text = (value) => value === null || value === undefined ? 'Нет данных' : String(value);
+  const measure = (value, digits = 3) => value === null || value === undefined ? 'Нет данных' : value.toLocaleString('ru-RU', { maximumFractionDigits: digits });
   const time = (value) => value ? new Date(value).toLocaleString('ru-RU') : 'Нет данных';
   const gb = (value) => value === null || value === undefined ? 'Нет данных' : `${(value / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} ГБ`;
   const why = (code) => reasons[code] || `Код ${code}. Проверьте состояние модуля и передайте отчёт администратору.`;
@@ -93,6 +100,11 @@
       row(cameras, `Камера №${camera.id} — ${stateNames[camera.status] || camera.status}${camera.enabled ? '' : ' (выключена)'}`,
         `Кадров/с: ${text(camera.current_fps)}. Возраст кадра: ${text(camera.seconds_since_last_frame)} с. Переподключений: ${text(camera.reconnect_count)}. ${camera.resolution || ''} ${camera.codec || ''}. ${camera.error ? why(camera.error) : ''}`,
         [['Подключение и тест', `/cameras/${camera.id}`], ['Калибровка', `/cameras/${camera.id}#calibration-heading`]]);
+      row(cameras, `Декодирование №${camera.id}`,
+        `Режим: ${{ cuda: 'CUDA', software: 'программный' }[camera.decoder_mode] || 'нет данных'}. Запрошено: ${camera.decoder_requested || 'нет данных'}.${camera.decoder_warning ? ' ' + why(camera.decoder_warning) : ''}`);
+      const inference = camera.inference;
+      if (inference) row(cameras, `AI №${camera.id}`,
+        `За 10 с: ${measure(inference.processed_fps_10s)} / ${measure(inference.target_fps)} кадров/с. Задержка p95 за 60 с: ${measure(inference.completion_age_p95_seconds)} с. Ожидает: ${measure(inference.pending_age_seconds)} с. Пропущено слотов: ${text(inference.skipped_slots)}; отложено лиц: ${text(inference.face_deferred)}, Re-ID: ${text(inference.reid_deferred)}. ${inference.reason_codes.map(why).join(' ')} Этапы, мс: ${Object.entries(inference.stage_times_ms).map(([key, value]) => `${({ person: 'люди', tracking: 'треки', face_detection: 'детектор лиц', face_recognition: 'эмбеддинг лиц' })[key] || key}: ${measure(value, 2)}`).join('; ')}.`);
     }
     const media = view.recordings, storage = media.storage;
     $('debug-media-message').textContent = media.error_code ? why(media.error_code) : 'Хранилище доступно. Запись запускается только вручную.';
