@@ -97,7 +97,7 @@ def camera_responses_carry_profile_and_attendance_state():
         assert cameras[0]["profile"] == dict(
             workplace_id=None, workplace_name=None, workplace_active=None, zone="INTERIOR",
             ai_enabled=True, ai_fps=None, time_tracking=False, revision=0)
-        assert cameras[0]["attendance"] == dict(enabled=False, role=None)
+        assert cameras[0]["attendance"] == dict(enabled=False, role=None, source_revision=1)
         saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
             expected_revision=0, workplace_id=1, zone="ENTRANCE", ai_fps=2.5))
         assert saved["profile"] == dict(workplace_id=1, workplace_name="Касса", workplace_active=True,
@@ -152,7 +152,7 @@ def a_door_gate_never_locks_the_zone_or_ai_of_its_camera():
         saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
             expected_revision=1, zone="INTERIOR", ai_enabled=False))["profile"]
         assert (saved["zone"], saved["ai_enabled"], saved["revision"]) == ("INTERIOR", False, 2)
-        assert f.client.json("GET", "/api/cameras/1")["attendance"] == dict(enabled=True, role="BOTH")
+        assert f.client.json("GET", "/api/cameras/1")["attendance"] == dict(enabled=True, role="BOTH", source_revision=1)
 
 
 @test

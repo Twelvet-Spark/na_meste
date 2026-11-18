@@ -17,6 +17,7 @@
         <p id="summary" class="muted" role="status" aria-live="polite">Загрузка камер…</p>
         <button id="camera-retry" class="btn" type="button" hidden>Повторить загрузку</button>
       </div>
+      <p class="muted small">Рамки показывают людей и известные системе имена. «Человек, %» — оценка детектора; сходство лица — не вероятность личности. «По внешности» — перенос после узнавания по лицу сегодня.</p>
       <nav id="camera-tabs" class="tabs" role="tablist" aria-label="Рабочие места камер"></nav>
       <div id="camera-directory-panel" role="tabpanel">
         <section id="camera-entrances" class="camera-zone" aria-labelledby="camera-entrances-heading" hidden>
@@ -61,5 +62,6 @@
 
 {% block scripts %}
   <script src="/static/js/camera_setup.js"></script>
+  <script src="/static/js/camera_overlay.js"></script>
   <script src="/static/js/app.js"></script>
 {% endblock %}

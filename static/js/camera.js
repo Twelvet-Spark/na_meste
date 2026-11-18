@@ -142,52 +142,22 @@ $('camera-profile-form').addEventListener('submit', async event => {
   if (result) { profileDirty = false; renderControls(); }
 });
 
-function labelFor(track) {
-  let base;
-  if (track.state === 'recognized' && track.employee_name) {
-    const conf = track.confidence != null ? track.confidence.toFixed(2) : '';
-    base = `${track.employee_name}${conf ? ' ' + conf : ''}`;
-  } else if (track.state === 'unknown') {
-    const conf = track.confidence != null ? track.confidence.toFixed(2) : '';
-    base = `Неизвестный${conf ? ' ' + conf : ''}`;
-  } else base = '…';
-  const tag = `T${track.track_id}` + (track.global_id ? `·G${track.global_id}` : '');
-  return `${base}${track.identity_source === 'REID' ? ' · по внешности' : ''} [${tag}]`;
-}
+let boxesLoading = false;
 async function refreshBoxes() {
-  // Detection metadata still drives source-staleness guards while the stream is hidden.
+  // Metadata still drives source-staleness guards while the mapping tab hides the stream.
+  if (document.hidden) { boxesEl.replaceChildren(); return; }
+  if (boxesLoading) return;
+  boxesLoading = true;
   let data;
   try {
     const res = await fetch(`/api/cameras/${cameraId}/detections`);
     if (!res.ok) throw new Error();
     data = await res.json();
-  } catch (_) { return; }
+  } catch (_) { boxesEl.replaceChildren(); return; }
+  finally { boxesLoading = false; }
   boxesEl.replaceChildren();
-  if (cameraTabs.current() === 'overview') for (const track of data.tracks || []) {
-    const [x1, y1, x2, y2] = track.bbox;
-    const box = document.createElement('div');
-    box.className = 'bbox ' + track.state;
-    box.style.left = (x1 * 100) + '%'; box.style.top = (y1 * 100) + '%';
-    box.style.width = ((x2 - x1) * 100) + '%'; box.style.height = ((y2 - y1) * 100) + '%';
-    const acknowledgedVisit = typeof track.visit_id === 'string'
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(track.visit_id);
-    const label = document.createElement(acknowledgedVisit ? 'a' : 'span');
-    if (acknowledgedVisit) {
-      label.href = `/global/visits/${encodeURIComponent(track.visit_id)}`; label.style.pointerEvents = 'auto';
-      label.title = 'Открыть сохранённый визит — не запись рабочего времени';
-    }
-    label.className = 'bbox-label'; label.textContent = labelFor(track);
-    const reasons = Array.isArray(track.identity_reason_codes) ? track.identity_reason_codes.join(', ') : '';
-    if (reasons) {
-      label.title = `${label.title ? label.title + '. ' : ''}Причина состояния личности: ${reasons}`;
-      label.setAttribute('aria-label', `${label.textContent}. Причина состояния личности: ${reasons}`);
-    }
-    box.appendChild(label);
-    const footpoint = document.createElement('span'); footpoint.className = 'bbox-footpoint';
-    footpoint.title = 'Точка пересечения: низ рамки по центру'; box.appendChild(footpoint);
-    const metric = document.createElement('span'); metric.className = 'bbox-metric';
-    metric.dataset.trackId = String(track.track_id); box.appendChild(metric);
-    boxesEl.appendChild(box);
+  if (!document.hidden && cameraTabs.current() === 'overview' && window.CameraOverlay.isFresh(data)) {
+    window.CameraOverlay.render(boxesEl, data.tracks, { image: $('stream'), links: true, metrics: true });
   }
   window.dispatchEvent(new CustomEvent('camera-detections', {detail: data}));
 }
@@ -202,9 +172,10 @@ refresh(); loadWorkplaces(); refreshBoxes();
 setInterval(refresh, 2000); setInterval(refreshBoxes, 500);
 function alignBoxes() {
   const stream = $('stream');
-  boxesEl.style.inset = 'auto'; boxesEl.style.left = `${stream.offsetLeft}px`; boxesEl.style.top = `${stream.offsetTop}px`;
-  boxesEl.style.width = `${stream.clientWidth}px`; boxesEl.style.height = `${stream.clientHeight}px`;
+  const rect = window.CameraOverlay.fitRect(stream.clientWidth, stream.clientHeight, stream.naturalWidth, stream.naturalHeight, getComputedStyle(stream).objectFit);
+  if (rect) Object.assign(boxesEl.style, { inset: 'auto', left: `${stream.offsetLeft + rect.left}px`, top: `${stream.offsetTop + rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
 }
 new ResizeObserver(alignBoxes).observe($('stream'));
 $('stream').addEventListener('load', alignBoxes);
+document.addEventListener('visibilitychange', () => { if (document.hidden) boxesEl.replaceChildren(); else refreshBoxes(); });
 alignBoxes();

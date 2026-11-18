@@ -259,7 +259,7 @@ def list_cameras(db: Session) -> list[Camera]:
 def profiles_by_camera(db: Session, ids) -> dict[int, dict]:
     """Profile and attendance state for many cameras in one query."""
     rows = db.query(CameraProfile, Workplace.name, Workplace.active, AttendanceCamera.enabled,
-                    AttendanceCamera.role).outerjoin(
+                    AttendanceCamera.role, AttendanceCamera.source_revision).outerjoin(
         Workplace, Workplace.id == CameraProfile.workplace_id).outerjoin(
         AttendanceCamera, AttendanceCamera.camera_id == CameraProfile.camera_id).filter(
         CameraProfile.camera_id.in_(list(ids))).all()
@@ -268,8 +268,8 @@ def profiles_by_camera(db: Session, ids) -> dict[int, dict]:
                     "workplace_active": workplace_active, "zone": profile.zone,
                     "ai_enabled": profile.ai_enabled, "ai_fps": profile.ai_fps,
                     "time_tracking": profile.time_tracking, "revision": profile.revision},
-        "attendance": {"enabled": bool(enabled), "role": role}}
-        for profile, workplace_name, workplace_active, enabled, role in rows}
+        "attendance": {"enabled": bool(enabled), "role": role, "source_revision": source_revision}}
+        for profile, workplace_name, workplace_active, enabled, role, source_revision in rows}
 
 
 def camera_out(db: Session, camera: Camera | CameraSource, profiles: dict | None = None) -> dict:

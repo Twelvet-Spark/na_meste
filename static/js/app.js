@@ -13,6 +13,7 @@
   const selected = new Set();
   const tabNodes = new Map();
   let cameras = [], workplaces = [], tabs = null, sequence = 0, bulkBusy = false;
+  let previewRequests = 0;
   const states = { ONLINE: 'Онлайн', OFFLINE: 'Офлайн', CONNECTING: 'Подключение', RECONNECTING: 'Переподключение', ERROR: 'Ошибка' };
   function node(tag, className, text) {
     const value = document.createElement(tag); value.className = className;
@@ -121,11 +122,12 @@
     const link = node('a', 'camera-preview'); link.href = `/cameras/${camera.id}`;
     const image = node('img', ''); image.alt = `Предпросмотр: ${camera.name}`; image.hidden = true;
     const unavailable = node('span', 'muted', 'Предпросмотр недоступен');
-    link.append(image, unavailable);
+    const boxes = node('div', 'boxes-overlay'); boxes.setAttribute('aria-hidden', 'true');
+    link.append(image, unavailable, boxes);
     image.addEventListener('load', () => {
       if (card.camera.enabled && card.camera.status === 'ONLINE') { image.hidden = false; unavailable.hidden = true; }
     });
-    image.addEventListener('error', () => { image.hidden = true; unavailable.hidden = false; });
+    image.addEventListener('error', () => { image.hidden = true; unavailable.hidden = false; card.boxes.replaceChildren(); });
     const head = node('div', 'cam-card-head');
     const title = node('a', 'cam-name'); title.href = link.href;
     const status = node('span', 'status offline'); head.append(title, status);
@@ -142,8 +144,9 @@
     edit.addEventListener('click', () => window.CameraSetup.openEdit(camera.id, edit));
     const remove = node('button', 'btn danger', 'Удалить'); remove.type = 'button';
     const reconnect = node('button', 'btn ghost', 'Переподключить'); reconnect.type = 'button';
-    const card = { element, title, status, meta, people, recording, image, unavailable, selection,
-      zone, ai, timeTracking, attendance, workplace, reconnect, result, camera, previewAt: 0, busy: false };
+    const card = { element, title, status, meta, people, recording, image, unavailable, selection, boxes,
+      zone, ai, timeTracking, attendance, workplace, reconnect, result, camera, previewAt: 0, busy: false,
+      previewAbort: null, imageUrl: null };
     reconnect.addEventListener('click', async () => {
       if (card.busy) return;
       card.busy = true; ui.setBusy(actions, true); result.hidden = false;
@@ -186,11 +189,69 @@
     card.recording.textContent = camera.recording_available === false ? 'Запись: состояние недоступно'
       : recordingStates[camera.recording?.status] || 'Запись не ведётся';
     card.image.alt = `Предпросмотр: ${camera.name}`;
-    if (camera.enabled && camera.status === 'ONLINE' && Date.now() - card.previewAt >= 10000) {
-      card.previewAt = Date.now(); card.image.src = `/api/cameras/${camera.id}/snapshot?size=thumbnail&t=${card.previewAt}`;
-    } else if (!camera.enabled || camera.status !== 'ONLINE') {
+    if (!camera.enabled || camera.status !== 'ONLINE') {
+      card.previewAbort?.abort();
+      card.boxes.replaceChildren();
       card.image.hidden = true; card.unavailable.hidden = false;
       card.unavailable.textContent = camera.enabled ? 'Нет свежего видео' : 'Камера отключена';
+    }
+  }
+  function previewVisible(card) {
+    if (document.hidden || !card.element.isConnected || !card.element.getClientRects().length) return false;
+    const rect = card.element.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+  }
+  function disposePreview(card) {
+    card.previewAbort?.abort();
+    card.boxes.replaceChildren();
+    if (card.imageUrl) URL.revokeObjectURL(card.imageUrl);
+    card.imageUrl = null;
+    card.image.removeAttribute('src');
+  }
+  async function refreshPreview(card) {
+    if (card.previewAbort || previewRequests >= 4) return;
+    const controller = new AbortController();
+    card.previewAbort = controller; card.previewAt = Date.now(); previewRequests++;
+    let nextUrl = null;
+    try {
+      const [response, detections] = await Promise.all([
+        fetch(`/api/cameras/${card.camera.id}/snapshot?size=thumbnail&t=${card.previewAt}`, { signal: controller.signal }),
+        ui.api(`/api/cameras/${card.camera.id}/detections`, { signal: controller.signal }),
+      ]);
+      if (!response.ok) throw new Error('Нет свежего видео');
+      const blob = await response.blob();
+      if (controller.signal.aborted || !previewVisible(card)) return;
+      nextUrl = URL.createObjectURL(blob);
+      card.image.src = nextUrl;
+      await card.image.decode();
+      if (controller.signal.aborted || !previewVisible(card) || !card.camera.enabled || card.camera.status !== 'ONLINE') return;
+      if (card.imageUrl) URL.revokeObjectURL(card.imageUrl);
+      card.imageUrl = nextUrl; nextUrl = null;
+      if (window.CameraOverlay.isFresh(detections)
+          && detections.source_revision === card.camera.attendance.source_revision) {
+        window.CameraOverlay.render(card.boxes, detections.tracks, { image: card.image });
+      } else card.boxes.replaceChildren();
+    } catch (error) {
+      card.boxes.replaceChildren();
+      if (!controller.signal.aborted) {
+        card.image.hidden = true; card.unavailable.hidden = false;
+        card.unavailable.textContent = 'Нет свежего видео';
+      }
+    } finally {
+      if (nextUrl) URL.revokeObjectURL(nextUrl);
+      card.previewAbort = null; previewRequests--;
+    }
+  }
+  function refreshPreviews() {
+    for (const card of cards.values()) if (!previewVisible(card)) {
+      card.previewAbort?.abort(); card.boxes.replaceChildren();
+    }
+    const visible = [...cards.values()].filter((card) => previewVisible(card) && card.camera.enabled
+      && card.camera.status === 'ONLINE' && Date.now() - card.previewAt >= 1000)
+      .sort((a, b) => a.previewAt - b.previewAt);
+    for (const card of visible) {
+      if (previewRequests >= 4) break;
+      refreshPreview(card);
     }
   }
   async function loadCameras() {
@@ -204,7 +265,7 @@
       cameras = results[0].value;
       const wanted = new Set(cameras.map((camera) => camera.id));
       for (const [id, card] of cards) {
-        if (!wanted.has(id)) { card.element.remove(); cards.delete(id); selected.delete(id); }
+        if (!wanted.has(id)) { disposePreview(card); card.element.remove(); cards.delete(id); selected.delete(id); }
       }
       for (const camera of cameras) {
         if (!cards.has(camera.id)) cards.set(camera.id, newCard(camera));
@@ -216,6 +277,7 @@
     const online = cameras.filter((camera) => camera.status === 'ONLINE').length;
     summary.textContent = [cameras.length ? `Камер: ${cameras.length} · онлайн: ${online}` : 'Камеры ещё не добавлены.', ...errors].join(' ');
     retry.hidden = errors.length === 0;
+    refreshPreviews();
   }
   async function bulkAction(action) {
     if (bulkBusy || !selected.size) return;
@@ -254,7 +316,12 @@
   }
   retry.addEventListener('click', loadCameras);
   window.addEventListener('cameras-changed', loadCameras);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadCameras(); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) loadCameras();
+    else for (const card of cards.values()) { card.previewAbort?.abort(); card.boxes.replaceChildren(); }
+  });
   loadCameras();
   setInterval(() => { if (!document.hidden) loadCameras(); }, 5000);
+  setInterval(refreshPreviews, 750);
+  window.addEventListener('pagehide', () => { for (const card of cards.values()) disposePreview(card); });
 })();

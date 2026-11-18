@@ -58,6 +58,9 @@ class DetectionState:
                 "employee_name": name,
                 "identity_source": source or None,
                 "confidence": d.confidence,
+                "person_score": float(d.person_score) if np.isfinite(d.person_score) and 0 <= d.person_score <= 1 else None,
+                "face_similarity": (float(d.confidence) if d.employee_id is not None and d.employee_id == employee_id
+                                    and np.isfinite(d.confidence) and 0 <= d.confidence <= 1 else None),
                 "bbox": list(d.bbox),
                 "state": d.state,
                 "global_id": d.global_id,

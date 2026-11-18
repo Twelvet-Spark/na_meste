@@ -40,6 +40,7 @@
         <div><dt>Кодек</dt><dd id="st-codec">—</dd></div>
         <div><dt>Реконнекты</dt><dd id="st-reconnects">—</dd></div>
         <div><dt>Последний кадр</dt><dd id="st-lastframe">—</dd></div>
+        <div><dt>Оценки рамок</dt><dd>«Человек» — детекция; сходство лица — не вероятность личности. «По внешности» — перенос после узнавания по лицу сегодня.</dd></div>
         <div><dt>Ошибка</dt><dd id="st-error">—</dd></div>
       </dl>
       <p class="muted small">RTSP → FFmpeg → MJPEG + AI (YOLO → трекинг → лица). Статус обновляется каждые 2 сек.</p>
@@ -262,6 +263,7 @@
 {% block scripts %}
   <script>window.CAMERA_ID = {{ camera_id }};</script>
   <script src="/static/js/camera_setup.js"></script>
+  <script src="/static/js/camera_overlay.js"></script>
   <script src="/static/js/camera.js"></script>
   <script src="/static/js/door3d.js"></script>
   <script src="/static/js/scene_editor.js"></script>
