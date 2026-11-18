@@ -11,8 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.attendance_types import HumanInput
 from app.database.database import immediate_session
-from app.database.models import Employee, HumanVisit, HumanVisitIdentityRevision, OperatorRequest
+from app.database.models import (
+    Employee, HumanVisit, HumanVisitIdentityRevision, OperatorRequest, RecognitionFeedback,
+)
 from app.services.employee_service import committed_request
+from app.services.recognition_feedback_repository import revoke_feedback_rows
 from app.time_utils import attendance_iso, utcnow
 
 
@@ -50,6 +53,35 @@ def effective_identity(db, visit):
                 ai_identity_state=visit.identity_state)
 
 
+def append_identity_revision(db, visit, *, expected_revision, mode, employee_id, actor, reason,
+                             request_id, created_at) -> dict:
+    """Append one operator identity inside the caller's transaction; the caller owns the receipt.
+
+    Active visit-photo ACCEPT feedback that contradicts the new label is revoked first
+    (same transaction); reference uploads opened from this visit are never touched.
+    """
+    if (mode == "EMPLOYEE") != (employee_id is not None) or mode not in ("EMPLOYEE", "UNKNOWN", "AI"):
+        raise ValueError("Некорректный режим личности")
+    current = db.query(func.max(HumanVisitIdentityRevision.revision)).filter_by(visit_id=visit.id).scalar() or 0
+    if current != expected_revision:
+        raise HTTPException(409, {"code": "IDENTITY_REVISION_CONFLICT", "identity_revision": current})
+    if employee_id is not None and db.get(Employee, employee_id) is None:
+        raise HTTPException(404, {"code": "EMPLOYEE_NOT_FOUND"})
+    dependent = db.query(RecognitionFeedback).filter(
+        RecognitionFeedback.visit_id == visit.id, RecognitionFeedback.source == "PHOTO_CROP",
+        RecognitionFeedback.action == "ACCEPT", RecognitionFeedback.revoked_at.is_(None))
+    if mode == "EMPLOYEE":
+        dependent = dependent.filter(RecognitionFeedback.employee_id != employee_id)
+    removal = revoke_feedback_rows(
+        db, [row.id for row in dependent.all()], actor=actor, at=created_at,
+        reason=f"Идентичность визита изменена: {reason}"[:1000])
+    db.add(HumanVisitIdentityRevision(
+        visit_id=visit.id, revision=current + 1, mode=mode, employee_id=employee_id,
+        actor=actor, reason=reason, created_at=created_at, request_id=str(request_id)))
+    db.flush()
+    return {"visit_id": visit.id, **effective_identity(db, visit), **removal}
+
+
 class VisitIdentityService:
     def __init__(self, engine, *, now=utcnow):
         self.engine, self.now = engine, now
@@ -65,17 +97,18 @@ class VisitIdentityService:
             {"visit_id": visit_id, **payload.model_dump(mode="json")},
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         try:
-            with immediate_session(self.engine) as db:
+            with immediate_session(self.engine, publish=True) as db:
                 replay = committed_request(db, payload.request_id, digest, operation=operation)
                 if replay is not None:
                     return replay
                 visit = db.get(HumanVisit, visit_id)
                 if visit is None:
                     raise HTTPException(404, {"code": "VISIT_NOT_FOUND"})
-                current = db.query(func.max(HumanVisitIdentityRevision.revision)).filter_by(visit_id=visit_id).scalar() or 0
-                if current != payload.expected_revision:
-                    raise HTTPException(409, {"code": "IDENTITY_REVISION_CONFLICT", "identity_revision": current})
                 if isinstance(payload, RestoreIdentityInput):
+                    current = db.query(func.max(HumanVisitIdentityRevision.revision)).filter_by(
+                        visit_id=visit_id).scalar() or 0
+                    if current != payload.expected_revision:
+                        raise HTTPException(409, {"code": "IDENTITY_REVISION_CONFLICT", "identity_revision": current})
                     previous = (db.query(HumanVisitIdentityRevision).filter_by(
                         visit_id=visit_id, revision=payload.restore_revision).first()
                         if payload.restore_revision else None)
@@ -84,13 +117,10 @@ class VisitIdentityService:
                     mode, employee_id = (previous.mode, previous.employee_id) if previous else ("AI", None)
                 else:
                     mode, employee_id = payload.mode, payload.employee_id
-                if employee_id is not None and db.get(Employee, employee_id) is None:
-                    raise HTTPException(404, {"code": "EMPLOYEE_NOT_FOUND"})
-                db.add(HumanVisitIdentityRevision(
-                    visit_id=visit_id, revision=current + 1, mode=mode, employee_id=employee_id,
-                    actor=payload.actor, reason=payload.reason, created_at=self.now(), request_id=str(payload.request_id)))
-                db.flush()
-                result = {"visit_id": visit_id, **effective_identity(db, visit)}
+                result = append_identity_revision(
+                    db, visit, expected_revision=payload.expected_revision, mode=mode, employee_id=employee_id,
+                    actor=payload.actor, reason=payload.reason, request_id=payload.request_id,
+                    created_at=self.now())
                 db.add(OperatorRequest(id=str(payload.request_id), operation=operation,
                                        payload_sha256=digest, result=result))
                 return result

@@ -216,11 +216,14 @@ def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace
     image = decode_photo(image_bytes, filename)
     if isinstance(image, FaceEnrollResult):
         return image
+    return prepare_detected_face(face_engine.detect(image), face_engine, filename)
 
+
+def prepare_detected_face(observations, face_engine, filename: str) -> PreparedFace | FaceEnrollResult:
+    """Strict enrollment gate over detections this engine already produced; never reruns inference."""
     def failed(message):
         return FaceEnrollResult(filename=filename, success=False, error=message)
 
-    observations = face_engine.detect(image)
     if len(observations) != 1:
         return failed("На фотографии должно быть ровно одно лицо")
     observation = observations[0]

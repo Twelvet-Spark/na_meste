@@ -12,8 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from app.database.models import Employee, HumanVisit, OperatorRequest
+from sqlalchemy import text
+from app.database.models import (
+    AttendanceRuntime, Employee, EmployeeFace, HumanVisit, OperatorRequest, RecognitionExample,
+    RecognitionFeedback, RecognitionLearningRuntime,
+)
 from app.services.employee_service import delete_employee
+from app.services.recognition_feedback_repository import advance_learning, revoke_feedback_rows
+from app.services.visit_sample_service import _sample_key
 from app.time_utils import utcnow
 from test_human_visits_api import api, visit
 
@@ -169,6 +175,133 @@ class IdentityTests(unittest.TestCase):
             client.json("POST", f"/api/global-persons/visits/{uuid4()}/identity", identity_body(), status=404)
             with Session(engine) as db:
                 self.assertEqual(db.query(OperatorRequest).count(), 0)
+
+    # ---- dependent training ----
+    def _feedback(self, engine, visit_id, employee_id, *, source="PHOTO_CROP", action="ACCEPT", face=False):
+        identifier, face_id = str(uuid4()), None
+        with Session(engine) as db:
+            row = None
+            if face:
+                row = EmployeeFace(employee_id=employee_id, embedding=b"\0" * 2048, thumbnail=b"thumb",
+                                   created_at=utcnow())
+                db.add(row)
+                db.flush()
+            db.add(RecognitionFeedback(
+                id=identifier, visit_id=visit_id, employee_id=employee_id, action=action, source=source,
+                source_sha256="a" * 64, image_sha256="b" * 64, crop=[0, 0, 1, 1], actor="Operator",
+                reason="Seed", created_at=utcnow(), image_jpeg=b"\xff\xd8x\xff\xd9",
+                face_id=row.id if row else None, face_key=_sample_key(row) if row else None,
+                face_status="ADDED" if row else "INELIGIBLE"))
+            db.flush()
+            db.add(RecognitionExample(feedback_id=identifier, modality="BODY", polarity="POSITIVE",
+                                      model_id="c" * 64, embedding=b"\0" * 2048))
+            db.commit()
+            return identifier, (row.id if row else None)
+
+    def _revisions(self, engine):
+        with Session(engine) as db:
+            return (db.get(RecognitionLearningRuntime, 1).revision, db.get(AttendanceRuntime, 1).gallery_revision,
+                    db.get(Employee, 7).revision)
+
+    def test_identity_change_revokes_only_dependent_visit_photo_training(self):
+        with api() as (client, engine):
+            with Session(engine) as db:
+                db.add(Employee(id=8, name="Other"))
+                db.commit()
+            identifier = visit(engine)
+            url = f"/api/global-persons/visits/{identifier}"
+            crop, face_id = self._feedback(engine, identifier, 7, face=True)
+            upload, _ = self._feedback(engine, identifier, 7, source="UPLOAD")
+            rejected, _ = self._feedback(engine, identifier, 7, action="REJECT")
+            before = self._revisions(engine)
+            same = client.json("POST", url + "/identity", identity_body(expected_revision=0, employee_id=7))
+            self.assertEqual(same["revoked_feedback_ids"], [])
+            self.assertEqual(self._revisions(engine), before)
+            changed = client.json("POST", url + "/identity", identity_body(expected_revision=1, employee_id=8))
+            self.assertEqual((changed["revoked_feedback_ids"], changed["removed_face_ids"],
+                              changed["face_removal_skipped_ids"]), ([crop], [face_id], []))
+            after = self._revisions(engine)
+            self.assertEqual((after[0], after[1], after[2]), (before[0] + 1, before[1] + 1, before[2] + 1))
+            with Session(engine) as db:
+                self.assertIsNotNone(db.get(RecognitionFeedback, crop).revoked_at)
+                self.assertIsNone(db.get(RecognitionFeedback, crop).image_jpeg)
+                self.assertIsNone(db.get(RecognitionFeedback, upload).revoked_at)
+                self.assertIsNone(db.get(RecognitionFeedback, rejected).revoked_at)
+                self.assertIsNone(db.get(EmployeeFace, face_id))
+                self.assertEqual(db.query(RecognitionExample).filter_by(feedback_id=crop).count(), 0)
+                self.assertEqual(db.query(RecognitionExample).filter_by(feedback_id=upload).count(), 1)
+                receipt = db.query(OperatorRequest).filter_by(operation="visit.identity.set").all()[-1]
+                self.assertEqual(receipt.result["revoked_feedback_ids"], [crop])
+            # Restoring the earlier label must not resurrect revoked training.
+            restore = dict(request_id=str(uuid4()), actor="Operator", reason="Undo", expected_revision=2,
+                           restore_revision=1)
+            client.json("POST", url + "/identity/restore", restore)
+            with Session(engine) as db:
+                self.assertIsNotNone(db.get(RecognitionFeedback, crop).revoked_at)
+                self.assertEqual(db.query(RecognitionExample).filter_by(feedback_id=crop).count(), 0)
+            client.json("POST", url + "/identity", identity_body(expected_revision=3, mode="UNKNOWN",
+                                                                  employee_id=None))
+            with Session(engine) as db:
+                self.assertIsNone(db.get(RecognitionFeedback, upload).revoked_at)
+
+    def test_changed_or_reused_face_is_not_removed(self):
+        with api() as (client, engine):
+            identifier = visit(engine)
+            crop, face_id = self._feedback(engine, identifier, 7, face=True)
+            with Session(engine) as db:
+                db.get(EmployeeFace, face_id).thumbnail = b"different photograph"
+                db.commit()
+            changed = client.json("POST", f"/api/global-persons/visits/{identifier}/identity",
+                                  identity_body(mode="UNKNOWN", employee_id=None))
+            self.assertEqual((changed["revoked_feedback_ids"], changed["removed_face_ids"],
+                              changed["face_removal_skipped_ids"]), ([crop], [], [face_id]))
+            with Session(engine) as db:
+                self.assertIsNotNone(db.get(EmployeeFace, face_id))
+
+    def test_helper_is_idempotent_and_requires_existing_rows_and_runtime(self):
+        with api() as (client, engine):
+            identifier = visit(engine)
+            crop, _ = self._feedback(engine, identifier, 7)
+            with Session(engine) as db:
+                first = revoke_feedback_rows(db, [crop, crop], actor="A", reason="R", at=utcnow())
+                self.assertEqual(first["revoked_feedback_ids"], [crop])
+                revision = db.get(RecognitionLearningRuntime, 1).revision
+                again = revoke_feedback_rows(db, [crop], actor="B", reason="Later", at=utcnow())
+                self.assertEqual(again["revoked_feedback_ids"], [crop])
+                self.assertEqual(db.get(RecognitionLearningRuntime, 1).revision, revision)
+                self.assertEqual(db.get(RecognitionFeedback, crop).revoked_by, "A")
+                with self.assertRaises(HTTPException) as missing:
+                    revoke_feedback_rows(db, [str(uuid4())], actor="A", reason="R", at=utcnow())
+                self.assertEqual(missing.exception.status_code, 404)
+                db.execute(text("DELETE FROM operator_learning_runtime"))
+                with self.assertRaises(HTTPException) as absent:
+                    advance_learning(db)
+                self.assertEqual(absent.exception.status_code, 503)
+                db.rollback()
+
+    def test_failed_identity_or_audit_write_leaves_no_partial_state(self):
+        for trigger in (
+                "CREATE TRIGGER fail_identity BEFORE INSERT ON human_visit_identity_revisions "
+                "BEGIN SELECT RAISE(ABORT, 'identity write failed'); END",
+                "CREATE TRIGGER fail_audit BEFORE UPDATE ON recognition_feedback "
+                "BEGIN SELECT RAISE(ABORT, 'audit write failed'); END"):
+            with api() as (client, engine):
+                identifier = visit(engine)
+                crop, face_id = self._feedback(engine, identifier, 7, face=True)
+                before = self._revisions(engine)
+                with engine.begin() as connection:
+                    connection.exec_driver_sql(trigger)
+                client.json("POST", f"/api/global-persons/visits/{identifier}/identity",
+                            identity_body(mode="UNKNOWN", employee_id=None), status=503)
+                self.assertEqual(self._revisions(engine), before)
+                with Session(engine) as db:
+                    row = db.get(RecognitionFeedback, crop)
+                    self.assertIsNone(row.revoked_at)
+                    self.assertIsNotNone(row.image_jpeg)
+                    self.assertIsNotNone(db.get(EmployeeFace, face_id))
+                    self.assertEqual(db.query(RecognitionExample).filter_by(feedback_id=crop).count(), 1)
+                    self.assertEqual(db.query(OperatorRequest).count(), 0)
+                    self.assertEqual(client.json("GET", f"/api/global-persons/visits/{identifier}")["identity_revision"], 0)
 
 
 if __name__ == "__main__":
