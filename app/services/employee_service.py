@@ -263,7 +263,8 @@ def check_prepared_faces(db, employee_id, prepared_faces, model_id):
             errors.append({"index": index, "filename": sample.filename,
                            "error": "Несовместимый или некорректный образец лица"})
             continue
-        match = gallery.match(np.frombuffer(sample.embedding, dtype=np.float32), exclude_employee_id=employee_id)
+        match = gallery.match(np.frombuffer(sample.embedding, dtype=np.float32),
+                              exclude_employee_id=employee_id, use_feedback=False)
         if match.employee_id is not None and match.score >= .60 and match.margin >= .10:
             errors.append({"index": index, "filename": sample.filename,
                            "error": "Лицо совпадает с другим активным сотрудником"})
