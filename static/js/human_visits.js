@@ -4,7 +4,6 @@
   const $ = (id) => document.getElementById(id);
   const UI = window.OperatorUI;
   const form = $('visits-filters');
-  const tabs = ['visits', 'archive'];
   const labels = { PROVISIONAL: 'Предварительное', ACTIVE: 'Активное', CLOSED: 'Завершено',
     UNKNOWN: 'Неизвестный человек', FACE_CONFIRMED: 'Подтверждено лицом', CONFLICT: 'Конфликт личности',
     AVAILABLE: 'сохранено', MISSING: 'нет', EXPIRED: 'срок истёк', PURGED: 'удалено по сроку' };
@@ -89,31 +88,12 @@
     if (form.elements.unknown_only.checked) filters.set('unknown_only', 'true');
     load();
   }
-  function selectTab(name, focus = false) {
-    active = tabs.includes(name) ? name : 'visits';
-    for (const tab of tabs) {
-      const selected = active === tab;
-      $(`tab-${tab}`).setAttribute('aria-selected', String(selected));
-      $(`tab-${tab}`).tabIndex = selected ? 0 : -1;
-      $(`panel-${tab}`).hidden = !selected;
-    }
-    if (focus) $(`tab-${active}`).focus();
+  function tabChanged(name) {
+    active = name;
     $('summary').textContent = active === 'visits' ? `Наблюдений: ${shown.size} · не рабочие часы` : 'Межкамерный архив · только чтение';
     document.dispatchEvent(new CustomEvent('journal-tabchange', { detail: active }));
     if (active === 'visits' && !loaded) load();
   }
-  for (const tab of tabs) {
-    $(`tab-${tab}`).addEventListener('click', () => {
-      history.replaceState(null, '', `#${tab}`); selectTab(tab);
-    });
-    $(`tab-${tab}`).addEventListener('keydown', (event) => {
-      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-      event.preventDefault();
-      const next = event.key === 'Home' ? 'visits' : event.key === 'End' ? 'archive' : tabs[1 - tabs.indexOf(tab)];
-      history.replaceState(null, '', `#${next}`); selectTab(next, true);
-    });
-  }
-  window.addEventListener('hashchange', () => selectTab(location.hash.slice(1)));
   form.addEventListener('submit', (event) => { event.preventDefault(); applyFilters(); });
   form.addEventListener('reset', () => { queueMicrotask(applyFilters); });
   $('visits-refresh').addEventListener('click', () => load());
@@ -132,5 +112,5 @@
   }
   choices('/api/cameras', $('visits-camera'));
   choices('/api/employees', $('visits-employee'));
-  selectTab(location.hash.slice(1));
+  UI.tabs(document.querySelector('[role="tablist"]'), { onChange: tabChanged });
 })();

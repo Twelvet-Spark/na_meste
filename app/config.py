@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from app.operator_settings import normalize_camera_ids, read_document, settings_path, OverrideError
+from app.operator_settings import read_document, settings_path, OverrideError
 
 # Корень проекта — папка, в которой лежит main.py
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -55,7 +55,6 @@ class Settings(BaseSettings):
     # --- AI (детекция людей, трекинг, распознавание лиц) ---
     ai_enabled: bool = True
     ai_fps: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False)
-    ai_cameras: str = ""                    # canonical sorted IDs; empty = all cameras
     ai_device: Literal["auto", "cpu", "cuda"] = "auto"
     ai_batch_size: int = Field(default=4, ge=1, le=8)
     ai_batch_wait_ms: int = Field(default=10, ge=0, le=50)
@@ -119,20 +118,11 @@ class Settings(BaseSettings):
     w_aspect: float = 0.05
     w_face: float = 0.10
 
-    @field_validator("ai_cameras", mode="before")
-    @classmethod
-    def validate_camera_ids(cls, value):
-        return normalize_camera_ids(value)
-
     @model_validator(mode="after")
     def attendance_window(self):
         if self.attendance_face_interval > self.attendance_face_window:
             raise ValueError("ATTENDANCE_INTERVAL_EXCEEDS_WINDOW")
         return self
-
-    def ai_camera_ids(self) -> set[int] | None:
-        """Идентификаторы камер для AI; None = все."""
-        return {int(part) for part in self.ai_cameras.split(",")} if self.ai_cameras else None
 
 
 def load_settings(*, path=None, env_file=BASE_DIR / ".env"):

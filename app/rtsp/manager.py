@@ -109,6 +109,15 @@ class ReaderManager:
         with self._lock:
             return list(self._readers.keys())
 
+    def restart(self, camera_id: int) -> bool:
+        """Replace the reader of a published enabled camera; False when there is nothing to reconnect."""
+        with self._lock:
+            source = self._published_sources.get(camera_id)
+            if not isinstance(source, CameraSource) or not source.enabled:
+                return False
+            self._start_locked(source)
+            return True
+
     def sync(self, camera: CameraSource, changed_fields: Optional[set[str]] = None) -> None:
         """Apply a complete immutable source under the same publication lock."""
         with self._lock:

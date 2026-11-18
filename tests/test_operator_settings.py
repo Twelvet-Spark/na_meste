@@ -52,7 +52,7 @@ SECRETS = (TOKEN, OTHER_TOKEN, PASSWORD, USERNAME, AUTH, COOKIE)
 EDITABLE = {
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
     "stream_output_fps", "stream_hwaccel",
-    "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "ai_enabled", "ai_device", "ai_fps",
     "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
@@ -262,7 +262,7 @@ def test_each_editable_field_accepts_valid_value_and_remains_pending():
         "preview_fps": 30, "rtsp_connect_timeout": 60, "rtsp_reconnect_max_delay": 300,
         "frame_stall_timeout": 120, "ai_enabled": False, "ai_device": "cpu", "ai_fps": 30,
         "stream_output_fps": 30, "stream_hwaccel": "none", "ai_batch_size": 8, "ai_batch_wait_ms": 50,
-        "ai_cameras": "", "attendance_ai_fps": 12.5, "attendance_frame_max_age": 2.,
+        "attendance_ai_fps": 12.5, "attendance_frame_max_age": 2.,
         "min_recognition_confidence": .72, "min_confirmations": 4,
         "face_recognition_retry_interval": .4, "live_face_min_size": 64,
         "live_face_margin": .12, "live_face_window": 3., "live_face_recheck_interval": 3.,
@@ -326,21 +326,35 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
 
 
 @test
-def test_ai_camera_ids_normalize_existing_unique_ids_and_reject_partial_parse():
-    with api() as f:
-        with Session(f.engine) as db:
-            db.add_all([Camera(id=ident, name=f"Camera {ident}", nvr_host="127.0.0.1",
-                               username=USERNAME, password=PASSWORD, channel=ident, enabled=False)
-                        for ident in (1, 3)])
-            db.commit()
-        view = save(f, {"ai_cameras": " 3 ; 1, 3 "})
-        assert view["pending"]["ai_cameras"] == "1,3"
-        assert load(f.path, f.env_file).ai_camera_ids() == {1, 3}
-        before = f.path.read_bytes()
-        for value in ("1,999", "1,garbage", "-1", "0", "1.5", "1,,3"):
-            save(f, {"ai_cameras": value}, status=422)
-            assert f.path.read_bytes() == before
-        assert save(f, {"ai_cameras": ""})["pending"]["ai_cameras"] == ""
+def test_retired_ai_cameras_key_is_dropped_on_read_and_absent_after_save():
+    with api(overrides={"preview_fps": 9, "ai_cameras": "1,3"}) as f:
+        assert get(f)["pending"].get("ai_cameras") is None
+        assert load(f.path, f.env_file).preview_fps == 9
+        save(f, {"ai_fps": 4})
+        assert json.loads(f.path.read_text(encoding="utf-8")) == {
+            "version": 1, "values": {"preview_fps": 9, "ai_fps": 4}}
+        # The key is no longer editable either.
+        save(f, {"ai_cameras": "1"}, status=422)
+
+
+@test
+def test_legacy_ai_camera_selection_precedence_is_environment_then_document_then_dotenv():
+    from app.operator_settings import legacy_ai_camera_ids
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        dotenv, path = root / "fixture.env", root / "operator-settings.json"
+        dotenv.write_text("AI_CAMERAS=5\n", encoding="utf-8")
+        with patch.dict(os.environ, {"OPERATOR_SETTINGS_PATH": str(path)}, clear=True):
+            assert legacy_ai_camera_ids(dotenv) == {5}
+            document(path, {"ai_cameras": " 3 ; 1, 3 "})
+            assert legacy_ai_camera_ids(dotenv) == {1, 3}
+            with patch.dict(os.environ, {"AI_CAMERAS": "2"}):
+                assert legacy_ai_camera_ids(dotenv) == {2}
+            # An empty value selects every camera.
+            with patch.dict(os.environ, {"AI_CAMERAS": ""}):
+                assert legacy_ai_camera_ids(dotenv) is None
+            with patch.dict(os.environ, {"AI_CAMERAS": "1,garbage"}):
+                assert legacy_ai_camera_ids(dotenv) is None
 
 
 @test
@@ -781,8 +795,9 @@ def test_pending_threshold_does_not_change_commission_until_next_startup():
                               password=PASSWORD, channel=ident))
                 db.flush()
                 db.add(AttendanceCamera(camera_id=ident, role=role, enabled=True,
-                                        line_start=[.2, .5], line_end=[.8, .5],
-                                        inside_point=[.5, .8], reference_width=640, reference_height=480))
+                                        line_start=[.2, .5], line_end=[.8, .5], inside_point=[.5, .8],
+                                        door_kind="DOOR", door_top=[[.2, .1], [.8, .1]],
+                                        reference_width=640, reference_height=480))
             db.flush()
             commission = AttendanceCommission(request_id=str(uuid4()), actor="Fixture", reason="Fixture",
                 configuration_fingerprint=service.configuration_fingerprint(db, providers=providers),

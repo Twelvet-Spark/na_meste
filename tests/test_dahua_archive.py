@@ -593,6 +593,7 @@ def test_two_absent_archive_drafts_use_null_and_stale_save_rolls_back_live_chang
             config = db.get(AttendanceCamera, saved["id"])
             config.role, config.enabled = "ENTRY", True
             config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
+            config.door_kind, config.door_top = "DOOR", [[0., .1], [1., .1]]
             config.reference_width, config.reference_height = 1920, 1080
             commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Verified",
                                              configuration_fingerprint={"version": 1}, acceptance_record={})
@@ -687,6 +688,7 @@ def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidati
             config = db.get(AttendanceCamera, camera_id)
             config.role, config.enabled = "ENTRY", True
             config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
+            config.door_kind, config.door_top = "DOOR", [[0., .1], [1., .1]]
             config.reference_width, config.reference_height = 1920, 1080
             commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Verified",
                                              configuration_fingerprint={"version": 1}, acceptance_record={})

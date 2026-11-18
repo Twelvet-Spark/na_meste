@@ -277,11 +277,6 @@
     } finally { if (token === searchGeneration) $('recordings-find').disabled = false; }
   }
   function sourceView() {
-    for (const button of document.querySelectorAll('[data-source]')) {
-      const selected = button.dataset.source === source;
-      button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;
-    }
-    $('recordings-results').setAttribute('aria-labelledby', `source-${source}`);
     $('recordings-basis').textContent = source === 'local'
       ? 'Локальное видео: приблизительное серверное время записи, не время экспозиции камеры и не доказательство отметок рабочего времени.'
       : 'Архив Dahua: время пересчитано по настроенному смещению часов устройства. Убедитесь, что смещение подходит для выбранной даты; переход на летнее время не определяется автоматически.';
@@ -297,14 +292,6 @@
   }
   $('recordings-search').addEventListener('submit', (event) => { event.preventDefault(); search(); });
   $('recordings-camera').addEventListener('change', switchSelection);
-  for (const button of document.querySelectorAll('[data-source]')) {
-    button.addEventListener('click', () => { if (source !== button.dataset.source) { source = button.dataset.source; switchSelection(); } });
-    button.addEventListener('keydown', (event) => {
-      if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
-        event.preventDefault(); const other = $(button.id === 'source-local' ? 'source-dahua' : 'source-local'); other.focus(); other.click();
-      }
-    });
-  }
   $('recordings-seek').addEventListener('submit', (event) => { event.preventDefault(); try { seek(inputDate('recordings-at').getTime()); } catch (error) { message(error.message, true); } });
   function skip(seconds) {
     try { seek((pausedAt ?? absoluteTime() ?? wanted ?? inputDate('recordings-at').getTime()) + seconds * 1000); }
@@ -393,6 +380,11 @@
     $('recordings-from').value = localInput(start); $('recordings-to').value = localInput(end);
     $('recordings-at').value = localInput(initial);
     $('recordings-zone').textContent = `Ввод и отображение: часовой пояс браузера (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Период — не больше 24 часов. Сервер получает время с явным UTC-смещением.`;
+    let sourceTabs;
+    sourceTabs = ui.tabs(document.querySelector('[role="tablist"]'), { hash: false, onChange(name) {
+      if (sourceTabs && source !== name) { source = name; switchSelection(); }
+    } });
+    sourceTabs.select(source);
     sourceView();
     if (await loadCameras()) {
       const initialCamera = $('recordings-camera').value;

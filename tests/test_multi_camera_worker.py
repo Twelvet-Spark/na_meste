@@ -10,7 +10,7 @@ from app.ai.scheduler import DeadlineScheduler
 from app.ai.inference_metrics import InferenceMetrics
 from app.config import settings
 from app.database.database import immediate_session
-from app.database.models import AttendanceCamera, AttendanceEvent, Camera
+from app.database.models import AttendanceCamera, AttendanceEvent, Camera, CameraProfile
 from sqlalchemy.orm import Session
 from test_attendance_lifecycle import Clock, FRAME, BufferedReader, worker_for
 from test_attendance_service import database
@@ -81,8 +81,7 @@ def test_capacity_hysteresis_latency_and_retention_use_real_completions():
 
 def contexts(clock):
     return (patch("app.ai.worker.time.monotonic", side_effect=clock.monotonic),
-            patch("app.ai.worker.utcnow", side_effect=clock.utcnow),
-            patch.object(settings, "ai_cameras", ""))
+            patch("app.ai.worker.utcnow", side_effect=clock.utcnow))
 
 
 def publish(manager, clock, camera_id=1, stream="stream-a"):
@@ -99,8 +98,8 @@ def test_disabled_attendance_camera_still_runs_general_person_tracking():
             db.get(AttendanceCamera, 1).enabled = False
         observations.y = .3
         publish(manager, clock)
-        a, b, c = contexts(clock)
-        with a, b, c:
+        a, b = contexts(clock)
+        with a, b:
             assert worker.step()
         assert worker.state.camera(1)["people_count"] == 1
         assert worker._configurations[1].attendance is False
@@ -122,8 +121,8 @@ def test_replacement_during_native_inference_publishes_no_old_boxes_or_crossings
             manager.readers[1] = replacement
             publish(manager, clock, stream="replacement")
             return outcomes
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(worker.service, "process_batch", side_effect=replace_reader):
+        a, b = contexts(clock)
+        with a, b, patch.object(worker.service, "process_batch", side_effect=replace_reader):
             assert worker.step()
         assert worker.state.camera(1) is None
         assert queue.pending() == ()
@@ -151,8 +150,8 @@ def test_newer_slot_is_refreshed_at_admission_and_batch_failures_are_rate_limite
         def fail(inputs):
             captured.extend(inputs)
             raise RuntimeError("controlled batch failure")
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(worker, "_read_configurations", side_effect=read), \
+        a, b = contexts(clock)
+        with a, b, patch.object(worker, "_read_configurations", side_effect=read), \
                 patch.object(worker.service, "process_batch", side_effect=fail) as inference:
             import logging
             from unittest import TestCase
@@ -175,7 +174,8 @@ def test_ten_cameras_are_batched_once_and_attendance_deadlines_remain_faster():
                 db.add(Camera(id=camera_id, name=f"Fixture {camera_id}", nvr_host="unused",
                               username="test", password="test", channel=camera_id))
                 db.flush()
-                db.add(AttendanceCamera(camera_id=camera_id))
+                db.add_all([AttendanceCamera(camera_id=camera_id),
+                            CameraProfile(camera_id=camera_id, zone="INTERIOR", ai_enabled=True, revision=0)])
                 reader = BufferedReader()
                 reader.source_revision = 1
                 manager.readers[camera_id] = reader
@@ -185,8 +185,8 @@ def test_ten_cameras_are_batched_once_and_attendance_deadlines_remain_faster():
         def capture(inputs):
             batches.append([item.camera_id for item in inputs])
             return original(inputs)
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(settings, "ai_fps", 5.), \
+        a, b = contexts(clock)
+        with a, b, patch.object(settings, "ai_fps", 5.), \
                 patch.object(settings, "attendance_ai_fps", 10.), \
                 patch.object(worker.service, "process_batch", side_effect=capture):
             for camera_id in manager.reader_ids():
@@ -205,6 +205,69 @@ def test_ten_cameras_are_batched_once_and_attendance_deadlines_remain_faster():
             assert set(batches[-1]) == {1, 2} and len(batches[-1]) == 2
             assert worker.step() is False
 
+def interior_camera(engine, manager, camera_id, **profile):
+    with immediate_session(engine) as db:
+        db.add(Camera(id=camera_id, name=f"Fixture {camera_id}", nvr_host="unused",
+                      username="test", password="test", channel=camera_id))
+        db.flush()
+        db.add_all([AttendanceCamera(camera_id=camera_id),
+                    CameraProfile(camera_id=camera_id, zone="INTERIOR", revision=0,
+                                  **dict(dict(ai_enabled=True), **profile))])
+    reader = BufferedReader()
+    reader.source_revision = 1
+    manager.readers[camera_id] = reader
+
+
+def run_rounds(worker, manager, clock, batches, advances):
+    original = worker.service.process_batch
+
+    def capture(inputs):
+        batches.append([item.camera_id for item in inputs])
+        return original(inputs)
+
+    a, b = contexts(clock)
+    with a, b, patch.object(settings, "ai_fps", 5.), patch.object(settings, "attendance_ai_fps", 10.), \
+            patch.object(worker.service, "process_batch", side_effect=capture):
+        for seconds in advances:
+            clock.advance(seconds)
+            for camera_id in manager.reader_ids():
+                publish(manager, clock, camera_id)
+            while worker.step():
+                pass
+
+
+def test_camera_with_ai_switched_off_is_never_submitted_but_stays_online():
+    with database() as (engine, service):
+        clock = Clock()
+        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        interior_camera(engine, manager, 3, ai_enabled=False)
+        interior_camera(engine, manager, 4)
+        observations.y = .3
+        batches = []
+        run_rounds(worker, manager, clock, batches, [.1, .1])
+        admitted = {camera_id for batch in batches for camera_id in batch}
+        assert admitted == {1, 2, 4}, admitted
+        assert worker.state.camera(3) is None
+
+
+def test_interior_camera_runs_at_its_own_ai_rate():
+    with database() as (engine, service):
+        clock = Clock()
+        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        interior_camera(engine, manager, 3)
+        interior_camera(engine, manager, 4, ai_fps=2.)
+        observations.y = .3
+        batches = []
+        run_rounds(worker, manager, clock, batches, [.1])
+        assert {3, 4} <= {camera_id for batch in batches for camera_id in batch}
+        batches.clear()
+        # 0.3 s later the 5 FPS camera is due again (0.2 s); the 2 FPS camera (0.5 s) is not.
+        run_rounds(worker, manager, clock, batches, [.3])
+        second = {camera_id for batch in batches for camera_id in batch}
+        assert 3 in second and 4 not in second, second
+        batches.clear()
+        run_rounds(worker, manager, clock, batches, [.25])
+        assert 4 in {camera_id for batch in batches for camera_id in batch}
 
 if __name__ == "__main__":
     import traceback

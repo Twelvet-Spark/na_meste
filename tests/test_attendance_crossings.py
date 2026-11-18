@@ -31,16 +31,20 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.ai.doorway import DoorwayCalibration, DoorwayDetector
+from app.attendance_roles import covered_directions
 from app.ai.face_quality import FaceQuality
 from app.ai.recognition_service import DetectionResult, FaceEvidence, FrameOutcome
 from app.ai.tracker import TrackLifecycle
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import get_db
-from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime, Camera
+from app.database.models import (
+    AttendanceCamera, AttendanceCommission, AttendanceRuntime, Camera, CameraProfile,
+)
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
 from app.services import camera_service
+from app.scene_geometry import extruded_door_top, validate_door
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4, 0, 0, 123456)
@@ -230,6 +234,45 @@ def test_opposite_camera_direction_never_creates_a_duplicate_attendance_event():
         path = Trajectory(role=role)
         path.walk(points)
         assert path.finish() == [], role
+
+
+@test
+def test_both_camera_emits_entry_and_exit_for_one_track_walking_both_ways():
+    path = Trajectory(role="BOTH")
+    path.walk([.25, .3, .45, .55, .7, .7, .55, .45, .3, .25])
+    events = path.finish()
+    assert [item.direction for item in events] == ["ENTRY", "EXIT"], events
+    assert [item.crossing_index for item in events] == [1, 2]
+
+
+@test
+def test_role_covers_only_the_directions_it_counts():
+    assert covered_directions(["ENTRY"]) == {"ENTRY"}
+    assert covered_directions(["EXIT", "ENTRY"]) == {"ENTRY", "EXIT"}
+    assert covered_directions(["BOTH"]) == {"ENTRY", "EXIT"}
+    assert covered_directions([]) == frozenset()
+
+
+@test
+def test_door_top_validation_and_extrusion_use_pixel_height_of_the_threshold():
+    start, end = (.2, .8), (.6, .8)
+    top = extruded_door_top(start, end, 1000, 500, "DOOR")
+    # threshold = .4 * 1000 = 400 px; a door is 1.8 * 400 = 720 px, clamped to the frame top.
+    assert top == [[.2, 0.], [.6, 0.]]
+    top = extruded_door_top((.2, .6), (.6, .6), 1000, 500, "PASSAGE")  # 300 px baseline < 400 px passage
+    assert top == [[.2, 0.], [.6, 0.]]
+    top = extruded_door_top((.2, .9), (.3, .9), 1000, 500, "PASSAGE")
+    # 100 px threshold, 100 px tall passage, 450 px baseline: y = (450 - 100) / 500.
+    assert all(abs(point[1] - .7) < 1e-12 for point in top) and [point[0] for point in top] == [.2, .3]
+    # A threshold on the first pixel row has no room above it.
+    assert extruded_door_top((.2, 0.), (.6, .5), 1000, 500, "DOOR") is None
+    validate_door((.2, .8), (.6, .8), [[.2, .2], [.6, .2]])
+    for bad in ([[.2, .9], [.6, .2]], [[.2, .2], [.6, .8]], [[.2, .2]]):
+        try:
+            validate_door((.2, .8), (.6, .8), bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"Accepted invalid door top {bad}")
 
 
 @test
@@ -740,7 +783,7 @@ def test_calibration_rejects_degenerate_nonfinite_and_out_of_bounds_geometry():
         dict(line_end=(.21, .5)), dict(inside_point=(.5, .52)),
         dict(line_start=(-.1, .5)), dict(line_end=(1.1, .5)),
         dict(inside_point=(.5, float("nan"))), dict(line_start=(float("inf"), .5)),
-        dict(reference_width=0), dict(reference_height=-1), dict(role="BOTH"),
+        dict(reference_width=0), dict(reference_height=-1), dict(role="NEITHER"),
     ]
     for fields in invalid:
         try:
@@ -771,6 +814,8 @@ def calibration_app():
                 camera_service.create_camera(db, camera_service.CameraCreate(
                     name=f"Door {ident}", nvr_host="unused", username="u", password="p",
                     channel=ident, stream_type="main"))
+            db.query(CameraProfile).update({"zone": "ENTRANCE"})
+            db.commit()
         app = FastAPI()
         app.include_router(attendance_api.router)
         app.include_router(cameras_api.router)
@@ -856,7 +901,8 @@ def request(fixture, method, path, payload=None):
 
 def save_payload(**changes):
     payload = dict(role="ENTRY", enabled=True, line_start=[.2, .5], line_end=[.8, .5],
-                   inside_point=[.5, .8], reference_width=640, reference_height=480,
+                   inside_point=[.5, .8], door_kind="DOOR", door_top=[[.2, .1], [.8, .1]],
+                   reference_width=640, reference_height=480,
                    expected_revision=0, expected_source_revision=1)
     payload.update(changes)
     return payload
@@ -906,7 +952,8 @@ def test_calibration_put_rejects_invalid_geometry_without_changing_saved_configu
     invalid = [dict(line_end=[.21, .5]), dict(inside_point=[.5, .52]),
                dict(line_start=[-.1, .5]), dict(line_end=[1.1, .5]),
                dict(reference_width=0), dict(reference_height=-1),
-               dict(line_start=None), dict(role=None), dict(role="BOTH")]
+               dict(line_start=None), dict(role=None), dict(role="NEITHER"), dict(door_kind=None),
+               dict(door_top=None), dict(door_top=[[.2, .9], [.8, .1]]), dict(door_kind="GATE")]
     with calibration_app() as fixture:
         for changes in invalid:
             status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload(**changes))
@@ -917,19 +964,56 @@ def test_calibration_put_rejects_invalid_geometry_without_changing_saved_configu
 
 
 @test
-def test_calibration_rejects_stale_revision_source_and_enabled_role_conflicts():
+def test_calibration_rejects_stale_revision_and_source():
     with calibration_app() as fixture:
         assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-        for path, payload in (
-                ("/api/attendance/cameras/1", save_payload()),
-                ("/api/attendance/cameras/1", save_payload(expected_revision=1, expected_source_revision=2)),
-                ("/api/attendance/cameras/2", save_payload())):
-            status, body = request(fixture, "PUT", path, payload)
+        for payload in (save_payload(),
+                        save_payload(expected_revision=1, expected_source_revision=2)):
+            status, body = request(fixture, "PUT", "/api/attendance/cameras/1", payload)
             assert status == 409, body
         with Session(fixture.engine) as db:
             assert db.get(AttendanceCamera, 1).revision == 1
-            assert db.get(AttendanceCamera, 2).revision == 0
-            assert not db.get(AttendanceCamera, 2).enabled
+
+
+@test
+def test_any_number_of_cameras_may_count_the_same_direction_and_one_camera_may_count_both():
+    with calibration_app() as fixture:
+        for ident in (1, 2):
+            assert request(fixture, "PUT", f"/api/attendance/cameras/{ident}", save_payload())[0] == 200
+        with Session(fixture.engine) as db:
+            assert db.get(AttendanceRuntime, 1).monitoring_started_at is None, "Two entries never cover exits"
+        status, body = request(fixture, "PUT", "/api/attendance/cameras/3", save_payload(role="BOTH"))
+        assert status == 200 and body["role"] == "BOTH", body
+        assert body["door_kind"] == "DOOR" and body["door_top"] == [[.2, .1], [.8, .1]]
+        with Session(fixture.engine) as db:
+            assert db.get(AttendanceRuntime, 1).monitoring_started_at is not None
+
+
+@test
+def test_a_single_both_camera_starts_monitoring():
+    with calibration_app() as fixture:
+        assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload(role="BOTH"))[0] == 200
+        with Session(fixture.engine) as db:
+            assert db.get(AttendanceRuntime, 1).monitoring_started_at is not None
+
+
+@test
+def test_enabling_requires_an_entrance_camera_with_ai_but_saving_a_disabled_gate_does_not():
+    with calibration_app() as fixture:
+        for field, value, text in (("zone", "INTERIOR", "входам"), ("ai_enabled", False, "AI")):
+            with Session(fixture.engine) as db:
+                db.get(CameraProfile, 1).zone = "ENTRANCE"
+                db.get(CameraProfile, 1).ai_enabled = True
+                setattr(db.get(CameraProfile, 1), field, value)
+                db.commit()
+            status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())
+            assert status == 409 and text in body["detail"], body
+            status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload(enabled=False))
+            assert status == 200, body
+            with Session(fixture.engine) as db:
+                row = db.get(AttendanceCamera, 1)
+                row.revision, row.enabled = 0, False
+                db.commit()
 
 
 @test

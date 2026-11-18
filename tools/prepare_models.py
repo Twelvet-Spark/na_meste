@@ -405,6 +405,62 @@ def _graph_io(path, component, role="model"):
     return inputs, outputs
 
 
+def _scene_vocabulary():
+    # Loading pure data by path must not initialize the application/configuration.
+    spec = importlib.util.spec_from_file_location("scene_vocabulary", ROOT / "app/ai/scene_vocabulary.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _owlv2(torch, auxiliary_dir, weights, destination):
+    from unittest.mock import patch
+    import onnx
+    vocabulary = _scene_vocabulary()
+    with tempfile.TemporaryDirectory(prefix="owlv2-") as directory, \
+            patch.dict(os.environ, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}):
+        directory = Path(directory)
+        for source in auxiliary_dir.iterdir():
+            shutil.copyfile(source, directory / source.name)
+        shutil.copyfile(weights, directory / "model.safetensors")
+        from transformers import Owlv2ForObjectDetection, Owlv2Processor
+        model = Owlv2ForObjectDetection.from_pretrained(
+            directory, local_files_only=True, attn_implementation="eager").float().eval()
+        processor = Owlv2Processor.from_pretrained(directory, local_files_only=True)
+        tokens = processor(text=[[prompt for prompt, _, _ in vocabulary.VOCABULARY]],
+                           return_tensors="pt")
+        with torch.inference_mode():
+            # transformers 5.23.0 Owlv2Model.forward: projected pooled text,
+            # L2-normalized before image_text_embedder returns query_embeds.
+            text = model.owlv2.text_model(input_ids=tokens["input_ids"],
+                                         attention_mask=tokens.get("attention_mask")).pooler_output
+            queries = model.owlv2.text_projection(text)
+            queries = queries / torch.linalg.vector_norm(queries, ord=2, dim=-1, keepdim=True)
+            queries = queries.reshape(1, len(vocabulary.VOCABULARY), -1)
+        class FixedVocabulary(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = model
+                self.register_buffer("query_embeds", queries)
+                self.register_buffer("query_mask", torch.ones(1, len(vocabulary.VOCABULARY), dtype=torch.bool))
+
+            def forward(self, pixel_values):
+                feature_map = self.model.image_embedder(pixel_values)[0]
+                image_feats = feature_map.reshape(1, -1, feature_map.shape[-1])
+                logits, _ = self.model.class_predictor(image_feats, self.query_embeds, self.query_mask)
+                boxes = self.model.box_predictor(image_feats, feature_map)
+                return logits, boxes
+        wrapper = FixedVocabulary().eval()
+        _export(torch, wrapper, (torch.zeros(1, 3, 960, 960),), destination,
+                ["pixel_values"], ["logits", "boxes"], {})
+    graph = onnx.load(str(destination))
+    metadata = graph.metadata_props.add()
+    metadata.key = "na_meste.scene_vocabulary"
+    metadata.value = vocabulary.VOCABULARY_ID
+    onnx.save(graph, str(destination))
+    return wrapper
+
+
 def _validate_io(component, role, inputs, outputs):
     def check(item, dtype, shape):
         actual = item["shape"]
@@ -443,6 +499,12 @@ def _validate_io(component, role, inputs, outputs):
             raise BuildError("Wrong YuNet named heads")
         for item in outputs:
             check(item, "float32", [1, None, expected[item["name"]]])
+    elif component == "scene_detector":
+        named(inputs, ["pixel_values"])
+        named(outputs, ["logits", "boxes"])
+        check(inputs[0], "float32", [1, 3, 960, 960])
+        check(outputs[0], "float32", [1, 3600, len(_scene_vocabulary().VOCABULARY)])
+        check(outputs[1], "float32", [1, 3600, 4])
     elif role == "encoder":
         named(inputs, ["images"])
         named(outputs, ["image_embeddings"])
@@ -647,6 +709,12 @@ def _images(rgb, count, purpose):
             value = (value - np.array([.485, .456, .406], dtype=np.float32)) / np.array([.229, .224, .225], dtype=np.float32)
         elif purpose == "face":
             value = (np.asarray(image.resize((112, 112), Image.Resampling.BILINEAR), dtype=np.float32) - 127.5) / 127.5
+        elif purpose == "scene_detector":
+            side = max(image.size)
+            square = Image.new("RGB", (side, side), (127, 127, 127))
+            square.paste(image, (0, 0))
+            value = np.asarray(square.resize((960, 960), Image.Resampling.BOX), dtype=np.float32) / 255
+            value = (value - np.array([.48145466, .4578275, .40821073], np.float32)) / np.array([.26862954, .26130258, .27577711], np.float32)
         else:
             raise BuildError("Unknown preprocessing purpose")
         rows.append(value.transpose(2, 0, 1))
@@ -756,6 +824,28 @@ def _check_scene(torch, encoder, decoder, encoder_path, decoder_path, rgb, thres
     return {"providers": ["CPUExecutionProvider"], "prompt_counts": [2, 5], "fp32_parity": "PASS"}
 
 
+def _check_scene_detector(torch, model, path, rgb, device, thresholds):
+    import numpy as np
+    _graph_io(path, "scene_detector")
+    images, _ = _images(rgb, 1, "scene_detector")
+    feeds = {"pixel_values": images}
+    expected = _numpy(torch, model, feeds)
+    with _session(path, device) as (session, report):
+        actual = _run(session, feeds)
+        if len(expected) != 2 or len(actual) != 2:
+            raise BuildError("OWLv2 output count mismatch")
+        errors = {}
+        for name, left, right, limit in zip(
+                ("logit_absolute_error", "box_absolute_error"), expected, actual,
+                (thresholds["scene_detector_logit_absolute"], thresholds["scene_detector_box_absolute"])):
+            if left.shape != right.shape or not np.isfinite(left).all() or not np.isfinite(right).all():
+                raise BuildError("OWLv2 output shape/nonfinite mismatch")
+            errors[name] = float(np.max(np.abs(left - right)))
+            if errors[name] > limit:
+                raise BuildError(f"OWLv2 {name} {errors[name]:g} exceeds {limit:g}")
+    return {"fp32_parity": "PASS", **errors, **report}
+
+
 def _try_fp16(path, component, checker, device):
     """A failed candidate never replaces the verified, full FP32 network."""
     if device != "cuda":
@@ -798,7 +888,7 @@ def _repair_auraface_batch(source: Path, destination: Path):
 def _file_metadata(stage, path, component, role, lock, exporter_hash):
     artifact = lock["artifacts"][component]
     inputs, outputs = _graph_io(path, component, role)
-    converted = "source" in artifact or component == "face_recognition"
+    converted = "source" in artifact or component in ("face_recognition", "scene_detector")
     upstream = lock["sources"][artifact["source"]]["revision"] if "source" in artifact else artifact["revision"]
     return {"role": role, "path": path.relative_to(stage).as_posix(), "sha256": sha256_file(path),
             "source_url": artifact["url"], "source_revision": artifact["revision"],
@@ -833,13 +923,17 @@ def _build_components(stage, cache, device, reference_image):
     report = {"version": 1, "requested_device": device, "exporter_sha256": exporter_hash,
               "lock_sha256": sha256_file(LOCK_PATH), "capacity": "NOT_EVALUATED",
               "reference": {"kind": "local_image", "sha256": sha256_file(Path(reference_image))} if reference_image else {"kind": "DETERMINISTIC_SYNTHETIC"},
-              "dependencies": {name: importlib.metadata.version(name) for name in ("torch", "torchvision", "timm", "onnx", "onnxruntime-gpu", "onnxconverter-common", "numpy", "Pillow")},
+              "dependencies": {name: importlib.metadata.version(name) for name in ("torch", "torchvision", "timm", "onnx", "onnxruntime-gpu", "onnxconverter-common", "numpy", "Pillow", "transformers")},
               "components": {}}
     rgb = _reference_rgb(reference_image)
     thresholds = lock["parity"]
     with tempfile.TemporaryDirectory(prefix="source-", dir=cache) as work:
         work = Path(work)
         roots = {name: extract_source(archive, work / name) for name, archive in sources.items()}
+        auxiliary = work / "owlv2-auxiliary"
+        auxiliary.mkdir()
+        for name, spec in lock["auxiliary"]["scene_detector"].items():
+            shutil.copyfile(download_verified(spec, cache), auxiliary / name)
         for name, root in roots.items():
             license_path = root / "LICENSE"
             if not license_path.is_file():
@@ -864,6 +958,11 @@ def _build_components(stage, cache, device, reference_image):
         encoder, decoder = _mobilesam(torch, roots["mobilesam"], artifacts["scene"], encoder_path, decoder_path)
         report["components"]["scene"] = _check_scene(torch, encoder, decoder, encoder_path, decoder_path, rgb, thresholds)
         del encoder, decoder
+        scene_detector_path = stage / "owlv2_scene_detector_fp32.onnx"
+        scene_detector = _owlv2(torch, auxiliary, artifacts["scene_detector"], scene_detector_path)
+        report["components"]["scene_detector"] = _check_scene_detector(
+            torch, scene_detector, scene_detector_path, rgb, device, thresholds)
+        del scene_detector
     face_detection = stage / "face_detection_yunet_2026may.onnx"
     face_recognition = stage / "glintr100.onnx"
     shutil.copyfile(artifacts["face_detection"], face_detection)
@@ -873,7 +972,8 @@ def _build_components(stage, cache, device, reference_image):
     report["components"]["face_recognition"]["preparation"] = "DYNAMIC_OUTPUT_BATCH_DECLARATION_V1"
     paths = {"person": [("model", person_active)], "face_detection": [("model", face_detection)],
              "face_recognition": [("model", face_recognition)], "body": [("model", body_active)],
-             "scene": [("encoder", encoder_path), ("decoder", decoder_path)]}
+             "scene": [("encoder", encoder_path), ("decoder", decoder_path)],
+             "scene_detector": [("model", scene_detector_path)]}
     manifest = {"version": 1, "alignment_id": ALIGNMENT_ID, "components": {}}
     for component, files in paths.items():
         manifest["components"][component] = {"preprocessing_id": lock["artifacts"][component]["preprocessing_id"],

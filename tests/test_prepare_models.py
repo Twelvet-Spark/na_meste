@@ -71,6 +71,58 @@ def profiled_cpu_sessions():
 
 
 class PrepareBoundaryTests(unittest.TestCase):
+    def test_scene_detector_io_is_fixed_and_distinct_from_mobilesam(self):
+        tensor = lambda name, shape: {"name": name, "dtype": "float32", "shape": shape}
+        inputs = [tensor("pixel_values", [1, 3, 960, 960])]
+        outputs = [tensor("logits", [1, 3600, 20]), tensor("boxes", [1, 3600, 4])]
+        prepare._validate_io("scene_detector", "model", inputs, outputs)
+        for name, shape in (("logits", [1, 3600, 19]), ("boxes", [1, 3600, 5])):
+            invalid = deepcopy(outputs)
+            next(item for item in invalid if item["name"] == name)["shape"] = shape
+            with self.assertRaises(prepare.BuildError):
+                prepare._validate_io("scene_detector", "model", inputs, invalid)
+
+    def test_scene_detector_lock_covers_offline_processor_and_fp32_parity(self):
+        lock = json.loads(prepare.LOCK_PATH.read_text(encoding="utf-8"))
+        spec = lock["artifacts"]["scene_detector"]
+        self.assertRegex(spec["revision"], r"^[0-9a-f]{40}$")
+        self.assertEqual(spec["license"], "Apache-2.0")
+        self.assertEqual(spec["preprocessing_id"], "owlv2-rgb960-padsquare-clipnorm-v1")
+        self.assertIn(f"/resolve/{spec['revision']}/model.safetensors", spec["url"])
+        required = {"config.json", "preprocessor_config.json", "tokenizer_config.json",
+                    "vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json"}
+        self.assertLessEqual(required, set(lock["auxiliary"]["scene_detector"]))
+        for item in lock["auxiliary"]["scene_detector"].values():
+            self.assertRegex(item["sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(item["size"], 0)
+            self.assertIn(f"/resolve/{spec['revision']}/", item["url"])
+        self.assertIn("owlv2-README.md", lock["notices"])
+        self.assertEqual(lock["parity"]["scene_detector_logit_absolute"], .01)
+        self.assertEqual(lock["parity"]["scene_detector_box_absolute"], .001)
+    def test_scene_detector_parity_reports_both_errors_and_rejects_either_limit(self):
+        import numpy as np
+        expected = [np.zeros((1, 3600, 20), np.float32), np.zeros((1, 3600, 4), np.float32)]
+        thresholds = {"scene_detector_logit_absolute": .01, "scene_detector_box_absolute": .001}
+        @contextmanager
+        def session(*args):
+            yield object(), {"device": "cpu"}
+        for logit_error, box_error, passes in ((.005, .0005, True), (.02, 0, False), (0, .002, False)):
+            actual = [np.full_like(expected[0], logit_error), np.full_like(expected[1], box_error)]
+            with self.subTest(errors=(logit_error, box_error)), \
+                    patch.object(prepare, "_graph_io"), patch.object(prepare, "_session", session), \
+                    patch.object(prepare, "_numpy", return_value=expected), patch.object(prepare, "_run", return_value=actual):
+                operation = lambda: prepare._check_scene_detector(
+                    None, object(), Path("detector.onnx"), np.zeros((8, 16, 3), np.uint8), "cpu", thresholds)
+                if passes:
+                    report = operation()
+                    self.assertEqual(report["fp32_parity"], "PASS")
+                    self.assertAlmostEqual(report["logit_absolute_error"], logit_error)
+                    self.assertAlmostEqual(report["box_absolute_error"], box_error)
+                else:
+                    with self.assertRaises(prepare.BuildError):
+                        operation()
+
+
     def assert_profiles_closed(self, root, count):
         profiles = list(root.glob("*.profile*.json"))
         self.assertEqual(len(profiles), count)

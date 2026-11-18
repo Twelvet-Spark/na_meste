@@ -2092,20 +2092,28 @@ class ApprovedInference:
 
 def configure_replay_cameras(engine, specs):
     from app.database.database import immediate_session
-    from app.database.models import Camera, AttendanceCamera
+    from app.database.models import Camera, AttendanceCamera, CameraProfile
+    from app.scene_geometry import extruded_door_top
+    from app.time_utils import utcnow
     with immediate_session(engine) as db:
         for spec in specs:
             db.add(Camera(id=spec.camera_id, name=f"Replay {spec.camera_id}", nvr_host="invalid.local",
                           username="", password="", channel=spec.camera_id, enabled=True))
         db.flush()
         for spec in specs:
+            line = ([.2, .5], [.8, .5])
             db.add(AttendanceCamera(
                 camera_id=spec.camera_id, source_revision=1, revision=1, enabled=spec.attendance,
                 role=("ENTRY" if spec.camera_id == 1 else "EXIT") if spec.attendance else None,
-                line_start=[.2, .5] if spec.attendance else None,
-                line_end=[.8, .5] if spec.attendance else None,
+                line_start=line[0] if spec.attendance else None,
+                line_end=line[1] if spec.attendance else None,
                 inside_point=[.5, .8] if spec.attendance else None,
+                door_kind="DOOR" if spec.attendance else None,
+                door_top=extruded_door_top(*line, spec.probe.width, spec.probe.height, "DOOR")
+                if spec.attendance else None,
                 reference_width=spec.probe.width, reference_height=spec.probe.height))
+            db.add(CameraProfile(camera_id=spec.camera_id, zone="ENTRANCE" if spec.attendance else "INTERIOR",
+                                 ai_enabled=True, revision=0, updated_at=utcnow()))
 
 
 

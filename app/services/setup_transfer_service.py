@@ -16,9 +16,10 @@ from app.ai.face_recognition import is_normalized_embedding
 
 from app.database import attendance_schema, operator_schema
 from app.database.database import immediate_session
-from app.database.models import (AttendanceCamera, AttendanceRuntime, Camera, CameraArchive, CameraScene,
-                                 Employee, EmployeeFace, EmployeeWorkplace, FaceModelMetadata,
+from app.database.models import (AttendanceCamera, AttendanceRuntime, Camera, CameraArchive, CameraProfile,
+                                 CameraScene, Employee, EmployeeFace, EmployeeWorkplace, FaceModelMetadata,
                                  OperatorRequest, Workplace)
+from app.scene_geometry import extruded_door_top
 from app.services.gallery_migration import reembed_aligned_thumbnails
 from app.setup_transfer import (ALIGNMENT_ID, MAX_FILE_BYTES, TransferError, decode_binary,
                                 decode_transfer, encode_transfer, validate_document)
@@ -27,12 +28,13 @@ from app.setup_transfer import (ALIGNMENT_ID, MAX_FILE_BYTES, TransferError, dec
 PROJECTIONS = {
     "cameras": (Camera, ("id", "name", "nvr_host", "rtsp_port", "username", "password", "channel", "stream_type", "enabled", "created_at", "updated_at"), 10000),
     "archives": (CameraArchive, ("camera_id", "http_scheme", "http_port", "utc_offset_minutes"), 10000),
-    "calibrations": (AttendanceCamera, ("camera_id", "role", "line_start", "line_end", "inside_point", "reference_width", "reference_height"), 10000),
+    "calibrations": (AttendanceCamera, ("camera_id", "role", "line_start", "line_end", "inside_point", "door_kind", "door_top", "reference_width", "reference_height"), 10000),
     "workplaces": (Workplace, ("id", "name", "active"), 10000),
     "employees": (Employee, ("id", "name", "first_name", "last_name", "external_id", "active", "created_at", "updated_at"), 10000),
     "faces": (EmployeeFace, ("id", "employee_id", "embedding", "thumbnail", "created_at", "face_model_id", "alignment_id"), 150000),
     "assignments": (EmployeeWorkplace, ("employee_id", "workplace_id"), 100000),
     "scenes": (CameraScene, ("camera_id", "reference_width", "reference_height", "geometry"), 10000),
+    "profiles": (CameraProfile, ("camera_id", "workplace_id", "zone", "ai_enabled", "ai_fps"), 10000),
 }
 
 
@@ -52,9 +54,21 @@ def _dates(record):
     return values
 
 
+def _upgraded_calibration(values, camera):
+    """A v1/v2 gate becomes a DOOR; with no room above its threshold it must be redrawn."""
+    if values.get("line_start") is not None:
+        top = extruded_door_top(values["line_start"], values["line_end"],
+                                values["reference_width"], values["reference_height"], "DOOR")
+        if top is None:
+            return {"camera_id": camera.id, "role": values["role"]}
+        values = {**values, "door_kind": "DOOR", "door_top": top}
+    return values
+
+
 def _schema(connection):
     try:
-        if not attendance_schema._preflight(connection) or operator_schema.preflight(connection) != 4:
+        if (attendance_schema._preflight(connection) != attendance_schema.SCHEMA_VERSION
+                or operator_schema.preflight(connection) != operator_schema.VERSION):
             raise TransferError("TRANSFER_INCOMPATIBLE")
     except TransferError:
         raise
@@ -187,8 +201,9 @@ class SetupTransferService:
 
     def export(self, password: str) -> bytes:
         try:
-            payload = {"transfer_version": 2, "exported_at": datetime.now(timezone.utc).isoformat(),
-                       "attendance_schema_version": 1, "operator_schema_version": 4,
+            payload = {"transfer_version": 3, "exported_at": datetime.now(timezone.utc).isoformat(),
+                       "attendance_schema_version": attendance_schema.SCHEMA_VERSION,
+                       "operator_schema_version": operator_schema.VERSION,
                        "face_model_id": self.face_model_id, "embedding_encoding": "float32-le-512"}
             budget = 0
             with self.engine.connect() as connection:
@@ -264,11 +279,23 @@ class SetupTransferService:
                 for row in document.cameras:
                     calibration = by_camera.get(row.id)
                     values = calibration.model_dump() if calibration else {"camera_id": row.id}
+                    if document.transfer_version < 3:
+                        values = _upgraded_calibration(values, row)
                     db.add(AttendanceCamera(**values, enabled=False, revision=0, source_revision=1))
+                profiles = {row.camera_id: row for row in getattr(document, "profiles", [])}
+                for row in document.cameras:
+                    profile = profiles.get(row.id)
+                    values = profile.model_dump() if profile else dict(
+                        camera_id=row.id, workplace_id=None, ai_fps=None, ai_enabled=True,
+                        zone="ENTRANCE" if by_camera.get(row.id) and by_camera[row.id].role else "INTERIOR")
+                    db.add(CameraProfile(**values, revision=0))
                 for row in document.archives:
                     db.add(CameraArchive(**row.model_dump(), revision=0))
                 for row in getattr(document, "scenes", []):
-                    db.add(CameraScene(**row.model_dump(), source_revision=0, revision=1))
+                    values = row.model_dump()
+                    values["geometry"] = {**values["geometry"], "version": 2,
+                                          "doors": values["geometry"].get("doors", [])}
+                    db.add(CameraScene(**values, source_revision=0, revision=1))
                 for row, face in zip(document.faces, faces):
                     values = _dates(row)
                     values.pop("face_model_id", None)

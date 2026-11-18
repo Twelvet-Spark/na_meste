@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, func
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.attendance_roles import ROLE_DIRECTIONS, covered_directions
 from app.attendance_types import EventView, GapView, milliseconds
 from app.config import settings
 from app.database.database import immediate_session
@@ -105,7 +106,7 @@ class AttendanceService:
         for row in db.query(AttendanceCamera).filter_by(enabled=True).order_by(AttendanceCamera.camera_id):
             cameras.append({key: getattr(row, key) for key in (
                 "camera_id", "role", "revision", "source_revision", "line_start", "line_end",
-                "inside_point", "reference_width", "reference_height")})
+                "inside_point", "door_kind", "door_top", "reference_width", "reference_height")})
         names = ("ai_fps", "frame_max_age", "max_frame_gap", "face_threshold", "face_margin",
                  "face_confirmations", "face_window", "face_interval", "face_min_size",
                  "face_det_score", "face_blur_min")
@@ -122,7 +123,7 @@ class AttendanceService:
         identity = deepcopy(self._model_identity) if self._model_identity is not None else {
             "models": None, "face_model_id": None, "alignment_id": None,
         }
-        return dict(version=2, cameras=cameras, thresholds=thresholds, live_policy=live_policy,
+        return dict(version=3, cameras=cameras, thresholds=thresholds, live_policy=live_policy,
                     **identity, math_policy={"cuda_use_tf32": 0}, providers=providers)
 
     def _commission_valid(self, db, *, invalidate=True, providers=None):
@@ -135,7 +136,7 @@ class AttendanceService:
         cuda = all("CUDAExecutionProvider" in providers[key] for key in REQUIRED_PROVIDER_KEYS)
         roles = {row["role"] for row in fingerprint["cameras"]}
         valid = (self._model_identity is not None and commission is not None
-                 and cuda and roles == {"ENTRY", "EXIT"}
+                 and cuda and covered_directions(roles) == {"ENTRY", "EXIT"}
                  and commission.configuration_fingerprint == fingerprint)
         if not valid and invalidate:
             runtime.commission_id = None
@@ -194,7 +195,8 @@ class AttendanceService:
                 reasons.add("SOURCE_CHANGED")
             if config.revision != crossing.calibration_revision:
                 reasons.add("CALIBRATION_CHANGED")
-            if not config.enabled or not camera.enabled or config.role != crossing.direction:
+            if (not config.enabled or not camera.enabled or config.role is None
+                    or crossing.direction not in ROLE_DIRECTIONS[config.role]):
                 reasons.add("CAMERA_UNCONFIGURED")
             if not self._commission_valid(db):
                 reasons.add("COMMISSIONING_REQUIRED")
@@ -340,14 +342,14 @@ class AttendanceService:
                     return request.result
                 if self._model_identity is None:
                     raise HTTPException(422, "Verified person and face models are required")
-                configs = {row.role: row for row in db.query(AttendanceCamera).filter_by(enabled=True)}
-                if set(configs) != {"ENTRY", "EXIT"}:
-                    raise HTTPException(422, "Both attendance roles must be configured")
-                if (configs["ENTRY"].revision != payload.expected_entry_revision
-                        or configs["EXIT"].revision != payload.expected_exit_revision):
+                configs = list(db.query(AttendanceCamera).filter_by(enabled=True))
+                if covered_directions(row.role for row in configs) != {"ENTRY", "EXIT"}:
+                    raise HTTPException(422, "Attendance cameras must cover entry and exit")
+                if ({(row.camera_id, row.revision) for row in configs}
+                        != {(item.camera_id, item.revision) for item in payload.expected_cameras}):
                     raise HTTPException(409, "Attendance configuration changed; refresh before commissioning")
-                if any(not db.get(Camera, row.camera_id).enabled for row in configs.values()):
-                    raise HTTPException(422, "Both attendance cameras must be enabled")
+                if any(not db.get(Camera, row.camera_id).enabled for row in configs):
+                    raise HTTPException(422, "All attendance cameras must be enabled")
                 enrolled = db.query(func.count(func.distinct(Employee.id))).join(
                     EmployeeFace, EmployeeFace.employee_id == Employee.id).filter(Employee.active.is_(True)).scalar()
                 record = payload.acceptance_record
@@ -362,14 +364,14 @@ class AttendanceService:
                 snapshot = self.health.snapshot()
                 providers = snapshot["providers"]
                 cuda = all("CUDAExecutionProvider" in providers[key] for key in REQUIRED_PROVIDER_KEYS)
-                role_matches = all(
-                    snapshot["roles"].get(role, {}).get("camera_id") == config.camera_id
-                    and snapshot["roles"].get(role, {}).get("source_revision") == config.source_revision
-                    for role, config in configs.items())
+                camera_matches = all(
+                    any(item["camera_id"] == config.camera_id and item["source_revision"] == config.source_revision
+                        for item in snapshot["cameras"])
+                    for config in configs)
                 pending_technical = any(
                     any(reason != "COMMISSIONING_REQUIRED" for reason in fault.reason_codes)
                     for fault in self.health.pending_faults())
-                if (not cuda or not snapshot["technical_ready"] or not role_matches
+                if (not cuda or not snapshot["technical_ready"] or not camera_matches
                         or snapshot["technically_healthy_seconds"] < 10 or pending_technical):
                     raise HTTPException(422, "Live CUDA models and ten technically healthy seconds are required")
                 row = AttendanceCommission(

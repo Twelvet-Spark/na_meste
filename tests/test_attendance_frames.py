@@ -26,7 +26,7 @@ from app.ai.worker import AIWorker, DetectionState
 from app.api import cameras as api
 from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
-from app.database.models import AttendanceCamera, Camera
+from app.database.models import AttendanceCamera, Camera, CameraProfile
 from app.rtsp.jpeg_cache import JPEGCache
 from app.rtsp.reader import CameraStatus, ConnectionLost, FrameBuffer, RTSPReader
 from app.services.attendance_service import AttendanceService
@@ -66,7 +66,8 @@ def database():
                 db.add(Camera(id=1, name="Door", nvr_host="unused", username="u",
                               password="p", channel=1))
                 db.commit()
-                db.add(AttendanceCamera(camera_id=1))
+                db.add_all([AttendanceCamera(camera_id=1),
+                            CameraProfile(camera_id=1, zone="INTERIOR", ai_enabled=True, revision=0)])
                 db.commit()
                 yield db
         finally:
@@ -291,6 +292,7 @@ def run_worker(stages, *, attendance=False, on_stage=None):
             config = db.get(AttendanceCamera, 1)
             config.role, config.enabled = "ENTRY", True
             config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
+            config.door_kind, config.door_top = "DOOR", [[0., .1], [1., .1]]
             config.reference_width, config.reference_height = 320, 240
             db.commit()
 
@@ -305,7 +307,7 @@ def run_worker(stages, *, attendance=False, on_stage=None):
         # rate, leaving real scheduler slack for optional appearance work.
         with patch.object(service, "process_batch", side_effect=collect), \
                 patch("app.ai.worker.time.monotonic", side_effect=lambda: clock[0]), \
-                patch.object(settings, "ai_cameras", ""), patch.object(settings, "ai_fps", 10.0):
+                patch.object(settings, "ai_fps", 10.0):
             try:
                 while True:
                     worker.step()
@@ -422,7 +424,8 @@ def test_disabling_attendance_calibration_immediately_clears_identity():
 def test_ai_exclusion_immediately_clears_old_detections():
     def change(index, db):
         if index == 1:
-            settings.ai_cameras = "2"
+            db.get(CameraProfile, 1).ai_enabled = False
+            db.commit()
 
     _service, state, outcomes = run_worker([
         (FrameReader("a", 1, 100.0), 100.0),

@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from sqlalchemy.orm import Session
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
@@ -86,9 +87,10 @@ def _camera_or_404(db: Session, camera_id: int):
     return camera
 
 
-def _camera_response(camera, manager: ReaderManager, request: Request, db: Session) -> dict:
+def _camera_response(camera, manager: ReaderManager, request: Request, db: Session,
+                     profiles: dict | None = None) -> dict:
     """Камера без пароля + live-статус + счётчики людей (AI)."""
-    data = service.camera_out(db, camera)
+    data = service.camera_out(db, camera, profiles)
     data.update(manager.status(camera.id))
     state = _detection_state(request)
     if state is not None:
@@ -206,7 +208,9 @@ def api_list_cameras(
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
 ):
-    return [_camera_response(c, manager, request, db) for c in service.list_cameras(db)]
+    cameras = service.list_cameras(db)
+    profiles = service.profiles_by_camera(db, [camera.id for camera in cameras])
+    return [_camera_response(c, manager, request, db, profiles) for c in cameras]
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_operator_request)])
@@ -235,6 +239,18 @@ def api_get_camera(
     return _camera_response(camera, manager, request, db)
 
 
+def _apply_camera_update(request: Request, db: Session, manager: ReaderManager, camera_id: int,
+                         payload: service.CameraUpdate):
+    camera = _camera_or_404(db, camera_id)
+    camera, changed = service.update_camera(db, camera, payload)
+    _setup(request).source_changed(camera)
+    _publish_recording_source(request, camera)
+    manager.sync(camera, changed)
+    if changed & service.CONNECTION_FIELDS or ("enabled" in changed and not camera.enabled):
+        _invalidate_analysis(request, camera_id)
+    return camera
+
+
 @router.put("/{camera_id}", dependencies=[Depends(require_operator_request)])
 def api_update_camera(
     camera_id: int,
@@ -243,14 +259,81 @@ def api_update_camera(
     db: Session = Depends(get_db),
     manager: ReaderManager = Depends(get_manager),
 ):
-    camera = _camera_or_404(db, camera_id)
-    camera, changed = service.update_camera(db, camera, payload)
-    _setup(request).source_changed(camera)
-    _publish_recording_source(request, camera)
-    manager.sync(camera, changed)
-    if changed & service.CONNECTION_FIELDS or ("enabled" in changed and not camera.enabled):
-        _invalidate_analysis(request, camera_id)
+    camera = _apply_camera_update(request, db, manager, camera_id, payload)
     return _camera_response(camera, manager, request, db)
+
+
+@router.put("/{camera_id}/profile", dependencies=[Depends(require_operator_request)])
+def api_update_profile(
+    camera_id: int,
+    payload: service.CameraProfileInput,
+    request: Request,
+    db: Session = Depends(get_db),
+    manager: ReaderManager = Depends(get_manager),
+):
+    _camera_or_404(db, camera_id)
+    service.update_profile(db, camera_id, payload, expected_revision=payload.expected_revision)
+    return _camera_response(_camera_or_404(db, camera_id), manager, request, db)
+
+
+@router.post("/{camera_id}/reconnect", dependencies=[Depends(require_operator_request)])
+def api_reconnect_camera(
+    camera_id: int,
+    db: Session = Depends(get_db),
+    manager: ReaderManager = Depends(get_manager),
+):
+    _camera_or_404(db, camera_id)
+    if not manager.restart(camera_id):
+        raise HTTPException(409, "Камера отключена или ещё не запущена")
+    return manager.status(camera_id)
+
+
+class BulkCameraAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    camera_ids: list[StrictInt] = Field(min_length=1, max_length=200)
+    action: Literal["ENABLE", "DISABLE", "ASSIGN_WORKPLACE", "SET_ENTRANCE", "SET_INTERIOR", "AI_ON", "AI_OFF"]
+    workplace_id: StrictInt | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_action(self):
+        if len(set(self.camera_ids)) != len(self.camera_ids) or any(item <= 0 for item in self.camera_ids):
+            raise ValueError("camera_ids must be unique positive identifiers")
+        if (self.action == "ASSIGN_WORKPLACE") != ("workplace_id" in self.model_fields_set):
+            raise ValueError("workplace_id is required for, and only for, ASSIGN_WORKPLACE")
+        return self
+
+
+_BULK_PROFILE_CHANGES = {
+    "SET_ENTRANCE": {"zone": "ENTRANCE"}, "SET_INTERIOR": {"zone": "INTERIOR"},
+    "AI_ON": {"ai_enabled": True}, "AI_OFF": {"ai_enabled": False},
+}
+
+
+@router.post("/bulk", dependencies=[Depends(require_operator_request)])
+def api_bulk_cameras(
+    payload: BulkCameraAction,
+    request: Request,
+    db: Session = Depends(get_db),
+    manager: ReaderManager = Depends(get_manager),
+):
+    """Each camera commits on its own; one failure is reported without stopping the rest."""
+    results = []
+    for camera_id in payload.camera_ids:
+        try:
+            if payload.action in ("ENABLE", "DISABLE"):
+                _apply_camera_update(request, db, manager, camera_id,
+                                     service.CameraUpdate(enabled=payload.action == "ENABLE"))
+            else:
+                changes = ({"workplace_id": payload.workplace_id} if payload.action == "ASSIGN_WORKPLACE"
+                           else _BULK_PROFILE_CHANGES[payload.action])
+                _camera_or_404(db, camera_id)
+                service.update_profile(db, camera_id, service.CameraProfileUpdate(**changes),
+                                       expected_revision=None)
+            results.append({"camera_id": camera_id, "ok": True, "detail": None})
+        except HTTPException as exc:
+            results.append({"camera_id": camera_id, "ok": False, "detail": str(exc.detail)})
+    return {"results": results}
 
 
 @router.delete("/{camera_id}", status_code=204, dependencies=[Depends(require_operator_request)])

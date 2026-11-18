@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.config import settings
 from app.database.database import immediate_session
-from app.database.models import AttendanceCamera, Camera
+from app.database.models import AttendanceCamera, Camera, CameraProfile
 from test_attendance_lifecycle import Clock, FRAME, BufferedReader, worker_for
 from test_attendance_service import database
 from test_multi_camera_worker import contexts, publish
@@ -21,7 +21,8 @@ def add_camera(engine, manager, camera_id):
         db.add(Camera(id=camera_id, name=f"Fixture {camera_id}", nvr_host="unused",
                       username="test", password="test", channel=camera_id))
         db.flush()
-        db.add(AttendanceCamera(camera_id=camera_id))
+        db.add_all([AttendanceCamera(camera_id=camera_id),
+                    CameraProfile(camera_id=camera_id, zone="INTERIOR", ai_enabled=True, revision=0)])
     reader = BufferedReader()
     reader.source_revision = 1
     manager.readers[camera_id] = reader
@@ -32,8 +33,8 @@ def test_repeated_failed_batches_cannot_restart_capacity_hysteresis():
         clock = Clock()
         worker, manager, observations, _queue = worker_for(engine, service, clock)
         observations.y = .3
-        a, b, c = contexts(clock)
-        with a, b, c:
+        a, b = contexts(clock)
+        with a, b:
             with patch.object(worker.service, "process_batch", side_effect=RuntimeError("injected inference failure")), \
                     TestCase().assertLogs("app.ai.worker", level=logging.ERROR):
                 for _ in range(12):
@@ -64,8 +65,8 @@ def test_reconnect_keeps_both_windows_until_expiry_but_analysis_removal_retires_
                 clock.advance(.2)
                 slow_once = False
             return result
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(worker.service, "process_batch", side_effect=inferred):
+        a, b = contexts(clock)
+        with a, b, patch.object(worker.service, "process_batch", side_effect=inferred):
             publish(manager, clock)
             assert worker.step()
             clock.advance(.2)
@@ -101,8 +102,8 @@ def test_offline_and_cooldown_do_not_force_tight_polling_or_block_healthy_camera
         def inferred(inputs):
             batches.append([item.camera_id for item in inputs])
             return original(inputs)
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(worker.service, "process_batch", side_effect=inferred):
+        a, b = contexts(clock)
+        with a, b, patch.object(worker.service, "process_batch", side_effect=inferred):
             publish(manager, clock, 1)
             publish(manager, clock, 3)
             assert worker.step()
@@ -130,8 +131,8 @@ def test_source_frame_skips_are_not_missed_deadlines_and_restart_never_inflates_
         with immediate_session(engine) as db:
             db.get(AttendanceCamera, 1).enabled = False
         observations.y = .3
-        a, b, c = contexts(clock)
-        with a, b, c, patch.object(settings, "ai_fps", 5.):
+        a, b = contexts(clock)
+        with a, b, patch.object(settings, "ai_fps", 5.):
             publish(manager, clock)
             assert worker.step()
             clock.advance(.2)
@@ -164,8 +165,8 @@ def test_ten_and_thirty_cameras_with_nonzero_batch_cost_keep_due_service_fair():
                 clock.advance(.005 + .002 * len(inputs))
                 return result
             started, next_source = clock.mono, clock.mono
-            a, b, c = contexts(clock)
-            with a, b, c, patch.object(settings, "ai_fps", 5.), \
+            a, b = contexts(clock)
+            with a, b, patch.object(settings, "ai_fps", 5.), \
                     patch.object(settings, "attendance_ai_fps", 10.), \
                     patch.object(worker.service, "process_batch", side_effect=costed):
                 while clock.mono - started < 25.:

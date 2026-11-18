@@ -3,9 +3,10 @@
 Validate each committed predecessor against its own DDL before upgrading.
 Recording metadata is installed explicitly by version 3, never via create_all.
 """
+from app.operator_settings import legacy_ai_camera_ids
 from app.time_utils import utcnow
 
-VERSION = 4
+VERSION = 5
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -208,9 +209,27 @@ V4_INDEXES = {
     "ix_human_visit_events_visit_occurred": "CREATE INDEX ix_human_visit_events_visit_occurred ON human_visit_events (visit_id, occurred_at, id)",
     "ix_human_journal_gaps_camera_started": "CREATE INDEX ix_human_journal_gaps_camera_started ON human_journal_gaps (camera_id, started_at)",
 }
-INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES}
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES}
-TABLES = frozenset(V4_TABLES)
+V5_TABLES = {
+    **V4_TABLES,
+    "camera_profiles": """CREATE TABLE camera_profiles (
+        camera_id INTEGER NOT NULL PRIMARY KEY,
+        workplace_id INTEGER,
+        zone VARCHAR(8) NOT NULL CHECK (zone IN ('INTERIOR','ENTRANCE')),
+        ai_enabled BOOLEAN NOT NULL CHECK (ai_enabled IN (0,1)),
+        ai_fps FLOAT CHECK (ai_fps IS NULL OR (ai_fps > 0 AND ai_fps <= 30)),
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE CASCADE,
+        FOREIGN KEY(workplace_id) REFERENCES workplaces (id) ON DELETE RESTRICT
+    )""",
+}
+V5_INDEXES = {
+    **V4_INDEXES,
+    "ix_camera_profiles_workplace": "CREATE INDEX ix_camera_profiles_workplace ON camera_profiles (workplace_id)",
+}
+INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES}
+TABLES = frozenset(V5_TABLES)
 
 
 def _refuse(detail):
@@ -299,3 +318,28 @@ def install(connection, installed=0):
                 connection.exec_driver_sql(ddl)
         connection.exec_driver_sql(
             "UPDATE operator_schema SET version=4,updated_at=? WHERE id=1", (utcnow().isoformat(sep=" "),))
+        installed = 4
+    if installed == 4:
+        for name, ddl in V5_TABLES.items():
+            if name not in V4_TABLES:
+                connection.exec_driver_sql(ddl)
+        for name, ddl in V5_INDEXES.items():
+            if name not in V4_INDEXES:
+                connection.exec_driver_sql(ddl)
+        now = utcnow().isoformat(sep=" ")
+        # AI_CAMERAS is retired: its selection becomes each camera's own AI switch.
+        legacy = legacy_ai_camera_ids()
+        cameras = connection.exec_driver_sql(
+            "SELECT cameras.id, attendance_cameras.role FROM cameras "
+            "LEFT JOIN attendance_cameras ON attendance_cameras.camera_id = cameras.id").all()
+        for camera_id, role in cameras:
+            connection.exec_driver_sql(
+                "INSERT INTO camera_profiles (camera_id, workplace_id, zone, ai_enabled, ai_fps, revision, "
+                "updated_at) VALUES (?, NULL, ?, ?, NULL, 0, ?)",
+                (camera_id, "ENTRANCE" if role is not None else "INTERIOR",
+                 int(legacy is None or camera_id in legacy), now))
+        # Scene geometry v2 adds doors; existing scenes have none.
+        connection.exec_driver_sql(
+            "UPDATE camera_scenes SET geometry = json_set(json_set(geometry, '$.version', 2), "
+            "'$.doors', json('[]'))")
+        connection.exec_driver_sql("UPDATE operator_schema SET version=5,updated_at=? WHERE id=1", (now,))

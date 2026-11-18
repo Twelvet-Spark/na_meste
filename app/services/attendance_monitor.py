@@ -6,7 +6,7 @@ from collections import deque
 from uuid import uuid4
 
 from app.config import settings
-from app.database.models import AttendanceCamera, Camera
+from app.database.models import AttendanceCamera, Camera, CameraProfile
 from app.rtsp.reader import CameraStatus
 from app.services.attendance_queries import read_snapshot
 from app.services.attendance_health import CoverageFault
@@ -92,25 +92,21 @@ class AttendanceMonitor(threading.Thread):
         if self.manager is None:
             return
         def read(db):
-            return [(row.role, row.camera_id, row.source_revision, row.enabled and enabled)
-                    for row, enabled in db.query(AttendanceCamera, Camera.enabled).join(
-                        Camera, Camera.id == AttendanceCamera.camera_id) if row.role is not None]
-        configurations = read_snapshot(self.service.engine, read)
-        allowed = settings.ai_camera_ids()
-        for role in ("ENTRY", "EXIT"):
-            matching = [row for row in configurations if row[0] == role and row[3]]
-            if matching:
-                _, camera_id, revision, enabled = matching[0]
-                reader = self.manager.get(camera_id)
-                online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
-                          and reader.source_revision == revision)
-                included = (settings.ai_enabled and self.worker is not None and self.worker.is_alive()
-                            and (allowed is None or camera_id in allowed))
-                self.health.configure_role(role, camera_id=camera_id, source_revision=revision,
-                                           enabled=enabled, online=online, included=included)
-            else:
-                self.health.configure_role(role, camera_id=None, source_revision=0,
-                                           enabled=False, online=False, included=False)
+            return [(row.camera_id, row.role, row.source_revision, row.enabled and enabled, profile.ai_enabled)
+                    for row, enabled, profile in db.query(AttendanceCamera, Camera.enabled, CameraProfile).join(
+                        Camera, Camera.id == AttendanceCamera.camera_id).join(
+                        CameraProfile, CameraProfile.camera_id == AttendanceCamera.camera_id)
+                    if row.role is not None]
+        worker_alive = settings.ai_enabled and self.worker is not None and self.worker.is_alive()
+        rows = []
+        for camera_id, role, revision, enabled, ai_enabled in read_snapshot(self.service.engine, read):
+            if not enabled:
+                continue
+            reader = self.manager.get(camera_id)
+            online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
+                      and reader.source_revision == revision)
+            rows.append((camera_id, role, revision, True, online, worker_alive and ai_enabled))
+        self.health.configure_cameras(rows)
 
     def run(self):
         while not self._stop_event.is_set():

@@ -13,9 +13,9 @@
       <div><h1>Журнал людей</h1><p class="muted">Наблюдения людей на камерах, в том числе без распознанного лица. Это не записи рабочего времени.</p></div>
       <a class="btn" href="/presence">Рабочее время</a>
     </div>
-    <nav class="attendance-tabs" role="tablist" aria-label="Разделы журнала">
-      <button class="btn" type="button" id="tab-visits" role="tab" aria-controls="panel-visits" aria-selected="true">Наблюдения</button>
-      <button class="btn" type="button" id="tab-archive" role="tab" aria-controls="panel-archive" aria-selected="false" tabindex="-1">Межкамерный архив</button>
+    <nav class="tabs" role="tablist" aria-label="Разделы журнала">
+      <button type="button" id="tab-visits" role="tab" data-tab="visits" aria-controls="panel-visits" aria-selected="true">Наблюдения</button>
+      <button type="button" id="tab-archive" role="tab" data-tab="archive" aria-controls="panel-archive" aria-selected="false" tabindex="-1">Межкамерный архив</button>
     </nav>
     <section class="panel attendance-tabpanel" id="panel-visits" role="tabpanel" aria-labelledby="tab-visits">
       <div class="panel-head"><h2>Наблюдения на камерах</h2><button class="btn" type="button" id="visits-refresh">Обновить список</button></div>

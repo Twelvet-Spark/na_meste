@@ -168,9 +168,15 @@ class CommissionAcceptance(BaseModel):
     site_confirmed: bool
 
 
+class ExpectedCamera(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    camera_id: int = Field(gt=0)
+    revision: int = Field(ge=0)
+
+
 class CommissionInput(HumanInput):
-    expected_entry_revision: int = Field(ge=0)
-    expected_exit_revision: int = Field(ge=0)
+    expected_cameras: list[ExpectedCamera] = Field(min_length=1, max_length=64)
     acceptance_record: CommissionAcceptance
 
 

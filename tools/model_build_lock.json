@@ -2,7 +2,7 @@
   "version": 1,
   "alignment_id": "arcface-5pt-112-v1",
   "opset": 16,
-  "authentication": "Official bytes fetched 2026-11-16 without loading checkpoints; release asset metadata and MobileSAM Git blob identity verified.",
+  "authentication": "Official bytes fetched 2026-11-16; OWLv2 revision, weights, processor files and model card downloaded and SHA256/size authenticated 2026-11-18.",
   "sources": {
     "dfine": {
       "revision": "956d1709314c2c6a4df6f34de232054578a7449f",
@@ -81,6 +81,62 @@
       "license": "Apache-2.0",
       "license_url": "https://github.com/ChaoningZhang/MobileSAM/blob/f706ad9c4eb7f219c00d9050e46328518ffb65d2/LICENSE",
       "preprocessing_id": "mobilesam-rgb-longest1024-meanstd-pad-v1"
+    },
+    "scene_detector": {
+      "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/model.safetensors",
+      "revision": "cfd3195ba4ea9592eec887ded089f4c08eff231d",
+      "sha256": "e1e130b9e404cf91a75ad45644c1da9d7fa5284085eecc864266a6923efb99e7",
+      "size": 619918824,
+      "cache_name": "owlv2-model.safetensors",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/blob/cfd3195ba4ea9592eec887ded089f4c08eff231d/README.md",
+      "preprocessing_id": "owlv2-rgb960-padsquare-clipnorm-v1"
+    }
+  },
+  "auxiliary": {
+    "scene_detector": {
+      "config.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/config.json",
+        "sha256": "ba9df8c25a4b8461887dd0a93d9252c9cd84697fe8d49a9d8794ce409af9acb2",
+        "size": 414,
+        "cache_name": "owlv2-config.json"
+      },
+      "preprocessor_config.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/preprocessor_config.json",
+        "sha256": "cf3e396635b797ee1a464e1b2836e98748f8edac19e89aaa2c93b55ac15b0064",
+        "size": 425,
+        "cache_name": "owlv2-preprocessor_config.json"
+      },
+      "tokenizer_config.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/tokenizer_config.json",
+        "sha256": "b55cda6198e152ded427c8a9b3faf1cccf27a7fa080697a62f6ff143f511f44f",
+        "size": 1100,
+        "cache_name": "owlv2-tokenizer_config.json"
+      },
+      "vocab.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/vocab.json",
+        "sha256": "e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349",
+        "size": 1059962,
+        "cache_name": "owlv2-vocab.json"
+      },
+      "merges.txt": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/merges.txt",
+        "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+        "size": 524619,
+        "cache_name": "owlv2-merges.txt"
+      },
+      "special_tokens_map.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/special_tokens_map.json",
+        "sha256": "d6e2b9cf664efbad2d22998b8d3da986abcbeed3e0825ad33605c9401f9cf73e",
+        "size": 121,
+        "cache_name": "owlv2-special_tokens_map.json"
+      },
+      "added_tokens.json": {
+        "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/added_tokens.json",
+        "sha256": "e5dc0da35d20111e8ff3fdfc03682beca23d5f94ed74331bce81786b2636a24f",
+        "size": 67,
+        "cache_name": "owlv2-added_tokens.json"
+      }
     }
   },
   "notices": {
@@ -107,6 +163,12 @@
       "sha256": "75ed396c0659298d3b37ec0e87d075c18a9f18c4664ae8bd15542fa182f15954",
       "size": 2881,
       "cache_name": "osnet-model-card.md"
+    },
+    "owlv2-README.md": {
+      "url": "https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/cfd3195ba4ea9592eec887ded089f4c08eff231d/README.md",
+      "sha256": "7c7426bc5ec939a42d1f96fb093031b6263400cceac4129ebb941a0c8c11b9b9",
+      "size": 4838,
+      "cache_name": "owlv2-README.md"
     }
   },
   "parity": {
@@ -116,6 +178,8 @@
     "body_cosine_delta": 0.0001,
     "body_fp16_cosine_delta": 0.001,
     "scene_relative": 0.001,
-    "scene_absolute": 0.005
+    "scene_absolute": 0.005,
+    "scene_detector_logit_absolute": 0.01,
+    "scene_detector_box_absolute": 0.001
   }
 }

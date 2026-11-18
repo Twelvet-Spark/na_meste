@@ -14,7 +14,7 @@ from app.ai.doorway import DoorwayCalibration
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from app.rtsp.dahua import normalize_host
-from app.scene_geometry import validate_geometry
+from app.scene_geometry import validate_door, validate_geometry
 
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_BODY_BYTES = MAX_FILE_BYTES + 16 * 1024
@@ -78,7 +78,7 @@ class ArchiveRecord(Record):
     utc_offset_minutes: int = Field(ge=-720, le=840)
 
 
-class CalibrationRecord(Record):
+class LegacyCalibrationRecord(Record):
     camera_id: ID
     role: Literal["ENTRY", "EXIT"] | None
     line_start: list[float] | None
@@ -96,6 +96,30 @@ class CalibrationRecord(Record):
                 raise ValueError("incomplete geometry")
             DoorwayCalibration(self.camera_id, self.role or "ENTRY", 0, 1,
                                *points, self.reference_width, self.reference_height)
+        return self
+
+
+class CalibrationRecord(Record):
+    camera_id: ID
+    role: Literal["ENTRY", "EXIT", "BOTH"] | None
+    line_start: list[float] | None
+    line_end: list[float] | None
+    inside_point: list[float] | None
+    door_kind: Literal["DOOR", "PASSAGE"] | None
+    door_top: Annotated[list[Point], Field(min_length=2, max_length=2)] | None
+    reference_width: int | None = Field(gt=0)
+    reference_height: int | None = Field(gt=0)
+
+    @model_validator(mode="after")
+    def geometry(self):
+        points = (self.line_start, self.line_end, self.inside_point)
+        values = (*points, self.door_kind, self.door_top, self.reference_width, self.reference_height)
+        if any(v is not None for v in values):
+            if any(v is None for v in values):
+                raise ValueError("incomplete geometry")
+            DoorwayCalibration(self.camera_id, self.role or "ENTRY", 0, 1,
+                               *points, self.reference_width, self.reference_height)
+            validate_door(self.line_start, self.line_end, self.door_top)
         return self
 
 
@@ -189,11 +213,39 @@ class SceneMetricRecord(Record):
         return value
 
 
-class TransferSceneGeometry(Record):
-    """Transfer's bounded wire contract; geometric authority is app.scene_geometry."""
+class LegacySceneGeometry(Record):
+    """Version 1 scenes, accepted from v1/v2 documents and upgraded on import."""
     version: Annotated[int, Field(strict=True, ge=1, le=1)]
     floor: Polygon | None
     objects: list[SceneObjectRecord] = Field(max_length=32)
+    metric: SceneMetricRecord | None
+
+    @model_validator(mode="after")
+    def structure(self):
+        validate_geometry({**self.model_dump(), "version": 2, "doors": []})
+        return self
+
+
+class SceneDoorRecord(Record):
+    id: str = Field(min_length=36, max_length=36)
+    label: str = Field(min_length=1, max_length=80)
+    kind: Literal["DOOR", "PASSAGE"]
+    quad: list[Point] = Field(min_length=4, max_length=4)
+
+    @field_validator("id")
+    @classmethod
+    def door_id(cls, value):
+        if str(UUID(value)) != value:
+            raise ValueError("invalid door identifier")
+        return value
+
+
+class TransferSceneGeometry(Record):
+    """Transfer's bounded wire contract; geometric authority is app.scene_geometry."""
+    version: Annotated[int, Field(strict=True, ge=2, le=2)]
+    floor: Polygon | None
+    objects: list[SceneObjectRecord] = Field(max_length=32)
+    doors: list[SceneDoorRecord] = Field(max_length=8)
     metric: SceneMetricRecord | None
 
     @model_validator(mode="after")
@@ -202,11 +254,26 @@ class TransferSceneGeometry(Record):
         return self
 
 
+class LegacySceneRecord(Record):
+    camera_id: ID
+    reference_width: int = Field(gt=0)
+    reference_height: int = Field(gt=0)
+    geometry: LegacySceneGeometry
+
+
 class SceneRecord(Record):
     camera_id: ID
     reference_width: int = Field(gt=0)
     reference_height: int = Field(gt=0)
     geometry: TransferSceneGeometry
+
+
+class CameraProfileRecord(Record):
+    camera_id: ID
+    workplace_id: ID | None
+    zone: Literal["INTERIOR", "ENTRANCE"]
+    ai_enabled: bool
+    ai_fps: float | None = Field(gt=0, le=30)
 
 
 class AssignmentRecord(Record):
@@ -221,6 +288,7 @@ class TransferCounts(Record):
     faces: int
     assignments: int
     scenes: int
+    profiles: int
 
 
 class _SetupRecords(Record):
@@ -229,7 +297,7 @@ class _SetupRecords(Record):
     embedding_encoding: Literal["float32-le-512"]
     cameras: list[CameraRecord] = Field(max_length=10000)
     archives: list[ArchiveRecord] = Field(max_length=10000)
-    calibrations: list[CalibrationRecord] = Field(max_length=10000)
+    calibrations: list[LegacyCalibrationRecord] = Field(max_length=10000)
     workplaces: list[WorkplaceRecord] = Field(max_length=10000)
     employees: list[EmployeeRecord] = Field(max_length=10000)
     faces: list[LegacyFaceRecord] = Field(max_length=150000, repr=False)
@@ -247,9 +315,12 @@ class _SetupRecords(Record):
         employees = unique(self.employees, "id")
         workplaces = unique(self.workplaces, "id")
         unique(self.faces, "id")
-        for rows in (self.archives, self.calibrations, getattr(self, "scenes", [])):
+        for rows in (self.archives, self.calibrations, getattr(self, "scenes", []), getattr(self, "profiles", [])):
             if not unique(rows, "camera_id") <= cameras:
                 raise ValueError("missing camera")
+        if any(r.workplace_id is not None and r.workplace_id not in workplaces
+               for r in getattr(self, "profiles", [])):
+            raise ValueError("missing workplace")
         if any(r.employee_id not in employees for r in self.faces):
             raise ValueError("missing employee")
         links = {(r.employee_id, r.workplace_id) for r in self.assignments}
@@ -270,15 +341,27 @@ class LegacySetupDocument(_SetupRecords):
     embedding_model: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
-class SetupDocument(_SetupRecords):
+class SetupDocumentV2(_SetupRecords):
+    """Authenticated v2 data: one gate per role, scene geometry without doors."""
     transfer_version: Literal[2]
     operator_schema_version: Literal[4]
     face_model_id: FaceModelID
     faces: list[FaceRecord] = Field(max_length=150000, repr=False)
+    scenes: list[LegacySceneRecord] = Field(max_length=10000)
+
+
+class SetupDocument(_SetupRecords):
+    transfer_version: Literal[3]
+    attendance_schema_version: Literal[2]
+    operator_schema_version: Literal[5]
+    face_model_id: FaceModelID
+    faces: list[FaceRecord] = Field(max_length=150000, repr=False)
+    calibrations: list[CalibrationRecord] = Field(max_length=10000)
     scenes: list[SceneRecord] = Field(max_length=10000)
+    profiles: list[CameraProfileRecord] = Field(max_length=10000)
 
 
-TransferDocument = SetupDocument | LegacySetupDocument
+TransferDocument = SetupDocument | SetupDocumentV2 | LegacySetupDocument
 
 
 def decode_binary(value: str) -> bytes:
@@ -363,14 +446,14 @@ def validate_document(payload: bytes, *, expected_face_model_id: str | None = No
         if not isinstance(raw, dict):
             raise TransferError("TRANSFER_INVALID")
         version = raw.get("transfer_version")
-        schema_version = {1: 3, 2: 4}.get(version) if type(version) is int else None
-        if schema_version is None or any(type(raw.get(k)) is not type(v) or raw.get(k) != v for k, v in (
-            ("attendance_schema_version", 1), ("operator_schema_version", schema_version),
+        schemas = {1: (3, 1), 2: (4, 1), 3: (5, 2)}.get(version) if type(version) is int else None
+        if schemas is None or any(type(raw.get(k)) is not type(v) or raw.get(k) != v for k, v in (
+            ("operator_schema_version", schemas[0]), ("attendance_schema_version", schemas[1]),
             ("embedding_encoding", "float32-le-512"))):
             raise TransferError("TRANSFER_INCOMPATIBLE")
-        model = SetupDocument if version == 2 else LegacySetupDocument
+        model = {1: LegacySetupDocument, 2: SetupDocumentV2, 3: SetupDocument}[version]
         result = model.model_validate(raw)
-        if version == 2 and expected_face_model_id is not None:
+        if version >= 2 and expected_face_model_id is not None:
             if result.face_model_id != expected_face_model_id or any(
                 face.face_model_id is not None and (
                     face.face_model_id != expected_face_model_id or face.alignment_id != ALIGNMENT_ID

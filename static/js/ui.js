@@ -86,7 +86,64 @@
       clear() { panel.hidden = true; },
     };
   }
-  window.OperatorUI = { api, newRequestId, setBusy, message, dialog, conflict };
+  function tabs(tablist, { hash = true, onChange = () => {} } = {}) {
+    const owner = tablist.ownerDocument;
+    let buttons = [], panels = [], selected = null;
+    function hashName() {
+      try { return decodeURIComponent(location.hash.slice(1)); }
+      catch { return ''; }
+    }
+    function select(name, { focus = false } = {}) {
+      const available = buttons.filter((button) => !button.disabled && !button.hidden);
+      const button = available.find((item) => item.dataset.tab === name) || available[0];
+      const next = button?.dataset.tab ?? null;
+      const changed = next !== selected;
+      selected = next;
+      for (const item of buttons) {
+        const active = item === button;
+        item.setAttribute('aria-selected', String(active));
+        item.tabIndex = active ? 0 : -1;
+      }
+      const panelId = button?.getAttribute('aria-controls');
+      for (const panel of panels) {
+        panel.hidden = panel.id !== panelId;
+        if (!panel.hidden && button.id) panel.setAttribute('aria-labelledby', button.id);
+      }
+      if (hash && next !== null) {
+        const target = `#${encodeURIComponent(next)}`;
+        if (location.hash !== target) history.replaceState(history.state, '', target);
+      }
+      if (focus) button?.focus();
+      if (changed) onChange(next);
+    }
+    function refresh() {
+      for (const panel of panels) panel.hidden = true;
+      buttons = [...tablist.querySelectorAll('[role="tab"][data-tab]')];
+      panels = [...new Set(buttons.map((button) => owner.getElementById(button.getAttribute('aria-controls'))).filter(Boolean))];
+      select(hash ? hashName() : selected ?? buttons.find((button) => button.getAttribute('aria-selected') === 'true')?.dataset.tab);
+    }
+    tablist.addEventListener('click', (event) => {
+      const button = event.target.closest('[role="tab"][data-tab]');
+      if (buttons.includes(button) && !button.disabled && !button.hidden) select(button.dataset.tab);
+    });
+    tablist.addEventListener('keydown', (event) => {
+      const button = event.target.closest('[role="tab"][data-tab]');
+      const available = buttons.filter((item) => !item.disabled && !item.hidden);
+      let index = available.indexOf(button);
+      if (index < 0 || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') index = (index + 1) % available.length;
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') index = (index + available.length - 1) % available.length;
+      else if (event.key === 'Home') index = 0;
+      else if (event.key === 'End') index = available.length - 1;
+      else return;
+      event.preventDefault();
+      select(available[index].dataset.tab, { focus: true });
+    });
+    if (hash) window.addEventListener('hashchange', () => select(hashName()));
+    refresh();
+    return { select, current: () => selected, refresh };
+  }
+  window.OperatorUI = { api, newRequestId, setBusy, message, dialog, conflict, tabs };
 
   const toggle = document.getElementById('nav-toggle');
   const nav = document.getElementById('app-nav');

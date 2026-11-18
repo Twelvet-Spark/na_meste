@@ -239,18 +239,19 @@ class DiagnosticsService:
     def _attendance(self):
         health = self.state.attendance.health.snapshot()
         reasons = [safe_code(item) for item in health.get("reasons", [])]
-        roles = {}
-        for role in ("ENTRY", "EXIT"):
-            row = health.get("roles", {}).get(role)
-            if not isinstance(row, dict):
+        cameras = []
+        for row in health.get("cameras", []):
+            if not isinstance(row, dict) or row.get("role") not in ("ENTRY", "EXIT", "BOTH"):
                 continue
-            roles[role] = {key: number(row.get(key)) for key in (
+            item = {key: number(row.get(key)) for key in (
                 "camera_id", "source_revision", "processed_fps", "frame_age_seconds",
                 "processing_age_p95_seconds", "completion_age_p95_seconds")}
-            roles[role]["reasons"] = [safe_code(item) for item in row.get("reasons", [])]
+            item["role"] = row["role"]
+            item["reasons"] = [safe_code(reason) for reason in row.get("reasons", [])]
+            cameras.append(item)
         return {"technical_ready": health.get("technical_ready") is True,
                 "automatic_ready": health.get("automatic_ready") is True,
-                "reasons": reasons, "roles": roles,
+                "reasons": reasons, "cameras": cameras,
                 "pending_fault_count": number(health.get("pending_fault_count"), integer=True),
                 "pending_write_count": number(health.get("pending_write_count"), integer=True),
                 "providers": provider_summary(health.get("providers")), "error_code": None}
@@ -430,7 +431,7 @@ class DiagnosticsService:
 
     def status(self):
         attendance = self._isolated(self._attendance, {"automatic_ready": False, "technical_ready": False,
-            "reasons": ["DIAGNOSTICS_UNAVAILABLE"], "providers": provider_summary({}), "roles": {}})
+            "reasons": ["DIAGNOSTICS_UNAVAILABLE"], "providers": provider_summary({}), "cameras": []})
         def tools():
             manager = self.state.manager
             return {"ffmpeg_available": bool(manager.ffmpeg), "ffprobe_available": bool(manager.ffprobe)}

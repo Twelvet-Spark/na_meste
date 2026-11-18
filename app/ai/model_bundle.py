@@ -17,6 +17,8 @@ from urllib.parse import unquote, urlsplit
 import onnx
 from onnx import TensorProto
 
+from app.ai.scene_vocabulary import VOCABULARY
+
 _ALIGNMENT_ID = "arcface-5pt-112-v1"
 _PREPROCESSING = {
     "person": "dfine-rgb-letterbox640-black-div255-v1",
@@ -24,9 +26,12 @@ _PREPROCESSING = {
     "face_recognition": "auraface-rgb112-minus127.5-div127.5-v1",
     "body": "osnet-rgb256x128-imagenet-v1",
     "scene": "mobilesam-rgb-longest1024-meanstd-pad-v1",
+    "scene_detector": "owlv2-rgb960-padsquare-clipnorm-v1",
 }
 _LICENSES = {"person": "Apache-2.0", "face_detection": "MIT",
-             "face_recognition": "Apache-2.0", "body": "MIT", "scene": "Apache-2.0"}
+             "face_recognition": "Apache-2.0", "body": "MIT", "scene": "Apache-2.0",
+             "scene_detector": "Apache-2.0"}
+_OPTIONAL_COMPONENTS = frozenset({"scene_detector"})
 _FILE_FIELDS = {"role", "path", "sha256", "source_url", "source_revision",
                 "source_sha256", "license", "license_url", "exporter_revision", "inputs", "outputs"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -114,6 +119,8 @@ def _official_url(value, component, *, source, revision):
             "face_recognition": ("huggingface.co", f"/fal/AuraFace-v1/resolve/{revision}/glintr100.onnx"),
             "body": ("huggingface.co", f"/kaiyangzhou/osnet/resolve/{revision}/{_BODY_FILENAME}"),
             "scene": ("raw.githubusercontent.com", f"/ChaoningZhang/MobileSAM/{revision}/weights/mobile_sam.pt"),
+            "scene_detector": ("huggingface.co",
+                               f"/google/owlv2-base-patch16-ensemble/resolve/{revision}/model.safetensors"),
         }[component]
         if (url.hostname, path) != expected:
             raise _invalid("Source is not the selected official artifact")
@@ -125,13 +132,15 @@ def _official_url(value, component, *, source, revision):
         "face_recognition": ("fal/AuraFace-v1",),
         "body": ("kaiyangzhou/osnet", "KaiyangZhou/deep-person-reid"),
         "scene": ("ChaoningZhang/MobileSAM",),
+        "scene_detector": ("google/owlv2-base-patch16-ensemble",),
     }[component]
     if url.hostname not in ("github.com", "raw.githubusercontent.com", "huggingface.co"):
         raise _invalid("License URL is not official upstream")
     if not any(path.startswith(f"/{repository}/") for repository in repositories):
         raise _invalid("License URL is not the selected upstream repository")
     # Do not accept a repository path on a different service as an official source.
-    huggingface_repositories = {"fal/AuraFace-v1", "kaiyangzhou/osnet"}
+    huggingface_repositories = {"fal/AuraFace-v1", "kaiyangzhou/osnet",
+                                "google/owlv2-base-patch16-ensemble"}
     allowed = [repository for repository in repositories
                if (repository in huggingface_repositories) == (url.hostname == "huggingface.co")]
     if not any(path.startswith(f"/{repository}/") for repository in allowed):
@@ -162,7 +171,10 @@ def _validate_manifest(document):
         raise _invalid("Unsupported manifest version")
     if document["alignment_id"] != _ALIGNMENT_ID:
         raise _invalid("Unsupported face alignment")
-    _exact_keys(document["components"], _PREPROCESSING, "components")
+    components = document["components"]
+    required = set(_PREPROCESSING) - _OPTIONAL_COMPONENTS
+    if not isinstance(components, dict) or not required <= set(components) <= set(_PREPROCESSING):
+        raise _invalid("Invalid components fields")
     paths = set()
     for component, declaration in document["components"].items():
         _exact_keys(declaration, {"preprocessing_id", "files"}, "component")
@@ -309,6 +321,12 @@ def _known_contract(component, file, inputs, outputs):
         height, width = (112, 112) if component == "face_recognition" else (256, 128)
         _tensor_contract(inputs[0], ["dynamic", 3, height, width])
         _tensor_contract(outputs[0], ["dynamic", 512])
+    elif component == "scene_detector":
+        if set(by_input) != {"pixel_values"} or set(by_output) != {"logits", "boxes"}:
+            raise ValueError("OWLv2 names do not match the fixed-vocabulary export")
+        _tensor_contract(by_input["pixel_values"], [1, 3, 960, 960])
+        _tensor_contract(by_output["logits"], [1, 3600, len(VOCABULARY)])
+        _tensor_contract(by_output["boxes"], [1, 3600, 4])
     elif file["role"] == "encoder":
         if len(inputs) != 1 or len(outputs) != 1:
             raise ValueError("MobileSAM encoder requires exactly one input and output")
@@ -394,12 +412,13 @@ class ModelBundle:
     def __init__(self, document, paths, errors):
         self.alignment_id = document["alignment_id"]
         self.metadata = document
-        self.bundle_id = _identifier(document, _PREPROCESSING)
+        self.bundle_id = _identifier(document, document["components"])
         self.face_model_id = _identifier(document, ("face_detection", "face_recognition"))
         self.component_paths: dict[str, Path] = paths
         self._errors: dict[str, ModelBundleError] = errors
         self.component_status: dict[str, str] = {
-            component: errors[component].code if component in errors else "READY"
+            component: ("NOT_INSTALLED" if component not in document["components"]
+                        else errors[component].code if component in errors else "READY")
             for component in _PREPROCESSING
         }
 
@@ -417,7 +436,7 @@ class ModelBundle:
 
         root = manifest.parent
         paths, errors = {}, {}
-        for component in _PREPROCESSING:
+        for component in document["components"]:
             files = sorted(document["components"][component]["files"], key=lambda item: item["role"])
             for file in files:
                 key = f"scene_{file['role']}" if component == "scene" else component
@@ -433,6 +452,8 @@ class ModelBundle:
     def require(self, component: str) -> Path:
         if component not in self.component_status:
             raise _invalid("Unknown model component", component)
+        if self.component_status[component] == "NOT_INSTALLED":
+            raise ModelBundleError("MODEL_COMPONENT_MISSING", component)
         if component in self._errors:
             raise self._errors[component]
         return self.component_paths["scene_encoder" if component == "scene" else component]

@@ -35,7 +35,7 @@ from app.database.database import immediate_session
 from app.database.models import (
     AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
     AttendanceEmployeeReference, AttendanceEvent, AttendanceEvidence, AttendanceRequest,
-    AttendanceRuntime, Camera, Employee, PresenceSession, WorkSession,
+    AttendanceRuntime, Camera, CameraProfile, Employee, PresenceSession, WorkSession,
 )
 from app.rtsp.reader import FramePacket
 from app.services.attendance_health import AttendanceHealth
@@ -121,10 +121,13 @@ def database(*, commissioned=False):
                     db.add(Camera(id=camera_id, name=role, nvr_host="unused", username="u",
                                   password="p", channel=camera_id, enabled=True))
                 db.flush()
+                db.add_all([CameraProfile(camera_id=camera_id, zone="ENTRANCE", ai_enabled=True, revision=0)
+                            for camera_id in (1, 2)])
                 for camera_id, role in ((1, "ENTRY"), (2, "EXIT")):
                     db.add(AttendanceCamera(
                         camera_id=camera_id, role=role, enabled=True, revision=3, source_revision=2,
                         line_start=[.2, .5], line_end=[.8, .5], inside_point=[.5, .8],
+                        door_kind="DOOR", door_top=[[.2, .1], [.8, .1]],
                         reference_width=640, reference_height=480,
                     ))
                 runtime = db.get(AttendanceRuntime, 1)
@@ -209,7 +212,7 @@ def projection(engine):
 def test_commission_fingerprint_uses_critical_declared_hashes_not_file_metadata_or_optional_models():
     with database(commissioned=True) as (engine, service), Session(engine) as db:
         baseline = service.configuration_fingerprint(db)
-        assert baseline["version"] == 2
+        assert baseline["version"] == 3
         assert service._commission_valid(db, invalidate=False)
         assert baseline["math_policy"] == {"cuda_use_tf32": 0}
         assert set(baseline["models"]) == {"person", "face_detection", "face_recognition"}
@@ -507,18 +510,16 @@ def test_capture_eligibility_and_disqualifying_reasons_independently_override_id
         health = AttendanceHealth(now=lambda: utc, monotonic=lambda: mono)
         health.set_providers(CUDA_PROVIDERS)
         service.health = health
-        for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
-            health.configure_role(role, camera_id=camera_id, source_revision=2,
-                                  enabled=True, online=True, included=True)
+        health.configure_cameras([(1, "ENTRY", 2, True, True, True), (2, "EXIT", 2, True, True, True)])
         frame = np.zeros((1, 1, 3), dtype=np.uint8)
         frame.setflags(write=False)
         for seq in range(1, 211):
             mono += .1
             utc += timedelta(seconds=.1)
-            for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
+            for camera_id in (1, 2):
                 packet = FramePacket(f"stream-{camera_id}", 2, seq,
                                      utc - timedelta(seconds=.07), mono - .07, frame)
-                health.record_frame(role, packet, tracking_generation=f"generation-{camera_id}",
+                health.record_frame(camera_id, packet, tracking_generation=f"generation-{camera_id}",
                                     started_mono=mono - .05, completed_mono=mono)
             health.snapshot()
         monitor = AttendanceMonitor(service, now=lambda: utc, monotonic=lambda: mono)

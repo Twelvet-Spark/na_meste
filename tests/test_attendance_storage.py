@@ -97,7 +97,7 @@ def test_fresh_seed_and_idempotence():
     with database() as (engine, root):
         with Session(engine) as db:
             runtime = db.get(AttendanceRuntime, 1)
-            assert runtime.schema_version == 1 and runtime.gallery_revision == 0
+            assert runtime.schema_version == 2 and runtime.gallery_revision == 0
             assert runtime.monitoring_started_at is None and runtime.commission_id is None
         assert not (root / "backups").exists()
         schema.initialize_attendance_schema(engine)
@@ -208,41 +208,93 @@ def test_altered_enum_literal_refused_without_mutation():
         with engine.begin() as connection:
             table_sql = connection.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='attendance_cameras'").scalar_one()
-            index_sql = connection.exec_driver_sql(
-                "SELECT sql FROM sqlite_master WHERE name='uq_attendance_cameras_enabled_role'").scalar_one()
             trigger_sql = connection.exec_driver_sql(
                 "SELECT sql FROM sqlite_master WHERE name='attendance_camera_role_retained'").scalar_one()
             assert "'ENTRY'" in table_sql
             connection.exec_driver_sql("DROP TABLE attendance_cameras")
             connection.exec_driver_sql(table_sql.replace("'ENTRY'", "'entry'"))
-            connection.exec_driver_sql(index_sql)
             # DROP TABLE also removes its trigger; restore it so only the
             # case-sensitive enum literal differs from the recognized schema.
             connection.exec_driver_sql(trigger_sql)
         with engine.connect() as connection:
             before = tuple(connection.connection.driver_connection.iterdump())
         exc = rejects(RuntimeError, lambda: schema.initialize_attendance_schema(engine))
-        assert "table attendance_cameras differs from version 1" in str(exc)
+        assert "table attendance_cameras differs from version 2" in str(exc)
         with engine.connect() as connection:
             assert tuple(connection.connection.driver_connection.iterdump()) == before
 
 
 @test
-def test_quoted_partial_index_predicate_refused_without_mutation():
+def test_version_one_role_index_is_unexpected_in_version_two():
     with database() as (engine, _root):
         with engine.begin() as connection:
-            connection.exec_driver_sql("DROP INDEX uq_attendance_cameras_enabled_role")
-            # SQLite treats this unknown double-quoted name as a string literal,
-            # not as the enabled-column comparison. Removing quotes hides that.
-            connection.exec_driver_sql(
-                'CREATE UNIQUE INDEX uq_attendance_cameras_enabled_role '
-                'ON attendance_cameras(role) WHERE "enabled = 1"')
+            connection.exec_driver_sql(schema._V1_ROLE_INDEX_DDL)
         with engine.connect() as connection:
             before = tuple(connection.connection.driver_connection.iterdump())
         exc = rejects(RuntimeError, lambda: schema.initialize_attendance_schema(engine))
-        assert "index uq_attendance_cameras_enabled_role differs from version 1" in str(exc)
+        assert "unexpected attendance schema objects ['uq_attendance_cameras_enabled_role']" in str(exc)
         with engine.connect() as connection:
             assert tuple(connection.connection.driver_connection.iterdump()) == before
+
+
+@test
+def test_version_one_upgrade_keeps_roles_and_adds_door_frames_after_backup():
+    with database(False) as (engine, root):
+        with engine.begin() as connection:
+            connection.exec_driver_sql(LEGACY_EMPLOYEE_DDL)
+            connection.exec_driver_sql("CREATE INDEX ix_employees_external_id ON employees (external_id)")
+            names = BASE_TABLES | schema._ATTENDANCE_TABLES
+            Base.metadata.create_all(connection, tables=[t for t in Base.metadata.sorted_tables if t.name in names])
+            for name in ("attendance_cameras", "attendance_runtime"):
+                connection.exec_driver_sql(f"DROP TABLE {name}")
+            for ddl in (schema._V1_ATTENDANCE_CAMERAS_DDL, schema._V1_ROLE_INDEX_DDL,
+                        schema._V1_ATTENDANCE_RUNTIME_DDL, schema._ROLE_TRIGGER):
+                connection.exec_driver_sql(ddl)
+            connection.exec_driver_sql(
+                "INSERT INTO attendance_runtime (id, schema_version, gallery_revision) VALUES (1, 1, 9)")
+            for ident in (1, 2, 3, 4):
+                connection.exec_driver_sql(
+                    "INSERT INTO cameras (id,name,nvr_host,rtsp_port,username,password,channel,stream_type,"
+                    "enabled,created_at,updated_at) VALUES (?,'Door','unused',554,'u','p',?,'main',1,"
+                    "'2026-11-11 04:00:00','2026-11-11 04:00:00')", (ident, ident))
+            rows = (
+                (1, "ENTRY", 1, 3, 2, "[0.2, 0.8]", "[0.6, 0.8]", "[0.4, 0.95]", 1000, 500),
+                (2, "EXIT", 0, 0, 1, "[0.2, 0.9]", "[0.3, 0.9]", "[0.25, 0.99]", 1000, 500),
+                (3, "ENTRY", 0, 5, 1, None, None, None, None, None),
+                (4, "EXIT", 1, 1, 1, "[0.2, 0.0]", "[0.6, 0.5]", "[0.4, 0.9]", 1000, 500),
+            )
+            for row in rows:
+                connection.exec_driver_sql(
+                    "INSERT INTO attendance_cameras (camera_id, role, enabled, revision, source_revision, "
+                    "line_start, line_end, inside_point, reference_width, reference_height, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,'2026-11-11 04:00:00')", row)
+        schema.initialize_attendance_schema(engine)
+        assert len(list((root / "backups").glob("*.db"))) == 1
+        with Session(engine) as db:
+            runtime = db.get(AttendanceRuntime, 1)
+            assert runtime.schema_version == 2 and runtime.gallery_revision == 9
+            saved = {row.camera_id: row for row in db.query(AttendanceCamera)}
+            assert {ident: row.role for ident, row in saved.items()} == {1: "ENTRY", 2: "EXIT", 3: "ENTRY", 4: "EXIT"}
+            assert (saved[1].revision, saved[1].source_revision, saved[1].enabled) == (3, 2, True)
+            assert saved[1].line_start == [0.2, 0.8] and saved[1].door_kind == "DOOR"
+            # 400 px threshold, 1.8 * 400 = 720 px door, clamped to the first pixel row of the frame.
+            assert saved[1].door_top == [[0.2, 0.0], [0.6, 0.0]]
+            # 100 px threshold at y=450: a 180 px door ends at y=270.
+            assert all(abs(point[1] - 0.54) < 1e-9 for point in saved[2].door_top)
+            assert saved[3].door_kind is None and saved[3].door_top is None and not saved[3].enabled
+            # No room above a threshold on the first row: the gate must be redrawn, never guessed.
+            assert saved[4].line_start is None and saved[4].door_top is None and not saved[4].enabled
+            assert saved[4].role == "EXIT"
+        with engine.connect() as connection:
+            names = {row[0] for row in connection.exec_driver_sql("SELECT name FROM sqlite_master")}
+            assert "attendance_camera_role_retained" in names
+            assert "uq_attendance_cameras_enabled_role" not in names
+            assert "attendance_cameras_v1" not in names and "attendance_runtime_v1" not in names
+        with Session(engine) as db:
+            for ident in (1, 2):
+                row = db.get(AttendanceCamera, ident)
+                row.role = "BOTH"
+            db.commit()
 
 
 @test
@@ -314,15 +366,19 @@ def test_configuration_and_gap_constraints():
             db.add_all([camera(id=1), camera(id=2)])
             db.commit()
         rejects_integrity(engine, AttendanceCamera(camera_id=1, role="ENTRY", enabled=True))
+        door = dict(line_start=[0.1, 0.5], line_end=[0.9, 0.5], inside_point=[0.5, 0.9],
+                    reference_width=1280, reference_height=720)
+        # An enabled gate needs its door frame too.
+        rejects_integrity(engine, AttendanceCamera(camera_id=1, role="ENTRY", enabled=True, **door))
+        rejects_integrity(engine, AttendanceCamera(camera_id=1, role="ENTRY", enabled=True, door_kind="GATE",
+                                                   door_top=[[0.1, 0.1], [0.9, 0.1]], **door))
         with Session(engine) as db:
-            db.add(AttendanceCamera(camera_id=1, role="ENTRY", enabled=True,
-                   line_start=[0.1, 0.5], line_end=[0.9, 0.5], inside_point=[0.5, 0.9],
-                   reference_width=1280, reference_height=720))
+            # Any number of cameras may count the same direction, and one camera may count both.
+            db.add_all([AttendanceCamera(camera_id=ident, role=role, enabled=True, door_kind="DOOR",
+                                         door_top=[[0.1, 0.1], [0.9, 0.1]], **door)
+                        for ident, role in ((1, "ENTRY"), (2, "BOTH"))])
             db.add(AttendanceCoverageGap(started_at=datetime(2026, 11, 11), reason_codes=["FRAME_GAP"]))
             db.commit()
-        rejects_integrity(engine, AttendanceCamera(camera_id=2, role="ENTRY", enabled=True,
-            line_start=[0.1, 0.5], line_end=[0.9, 0.5], inside_point=[0.5, 0.9],
-            reference_width=1280, reference_height=720))
         rejects_integrity(engine, AttendanceCoverageGap(started_at=datetime(2026, 11, 11)))
         rejects_integrity(engine, AttendanceCoverageGap(singleton=2, started_at=datetime(2026, 11, 11)))
 

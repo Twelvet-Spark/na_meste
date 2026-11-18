@@ -282,18 +282,19 @@ class OperatorRequest(Base):
 class AttendanceCamera(Base):
     __tablename__ = "attendance_cameras"
     __table_args__ = (
-        CheckConstraint("role IS NULL OR role IN ('ENTRY', 'EXIT')", name="ck_attendance_camera_role"),
+        CheckConstraint("role IS NULL OR role IN ('ENTRY', 'EXIT', 'BOTH')", name="ck_attendance_camera_role"),
+        CheckConstraint("door_kind IS NULL OR door_kind IN ('DOOR', 'PASSAGE')",
+                        name="ck_attendance_camera_door_kind"),
         CheckConstraint("revision >= 0 AND source_revision >= 1", name="ck_attendance_camera_revisions"),
         CheckConstraint("enabled IN (0, 1)", name="ck_attendance_camera_enabled"),
         CheckConstraint(
             "enabled = 0 OR (role IS NOT NULL AND line_start IS NOT NULL AND "
             "line_end IS NOT NULL AND inside_point IS NOT NULL AND "
+            "door_kind IS NOT NULL AND door_top IS NOT NULL AND "
             "reference_width IS NOT NULL AND reference_height IS NOT NULL AND "
             "reference_width > 0 AND reference_height > 0)",
             name="ck_attendance_camera_complete",
         ),
-        Index("uq_attendance_cameras_enabled_role", "role", unique=True,
-              sqlite_where=text("enabled = 1")),
     )
 
     camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"), primary_key=True)
@@ -304,6 +305,8 @@ class AttendanceCamera(Base):
     line_start: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     line_end: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     inside_point: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    door_kind: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    door_top: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
     reference_width: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reference_height: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -454,12 +457,12 @@ class AttendanceRuntime(Base):
     __tablename__ = "attendance_runtime"
     __table_args__ = (
         CheckConstraint("id = 1", name="ck_attendance_runtime_singleton"),
-        CheckConstraint("schema_version = 1", name="ck_attendance_runtime_version"),
+        CheckConstraint("schema_version = 2", name="ck_attendance_runtime_version"),
         CheckConstraint("gallery_revision >= 0", name="ck_attendance_runtime_gallery"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    schema_version: Mapped[int] = mapped_column(Integer, default=2, server_default=text("2"))
     gallery_revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     commission_id: Mapped[int | None] = mapped_column(ForeignKey("attendance_commissions.id", ondelete="RESTRICT"), nullable=True)
     monitoring_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -489,6 +492,18 @@ class CameraScene(Base):
     __table_args__ = (CheckConstraint("revision >= 0"), CheckConstraint("source_revision >= 0"),
                       CheckConstraint("reference_width > 0"), CheckConstraint("reference_height > 0"),
                       CheckConstraint("json_valid(geometry)"))
+
+
+class CameraProfile(Base):
+    """Operator grouping/AI settings; DDL is frozen in operator_schema (queries only here)."""
+    __tablename__ = "camera_profiles"
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="CASCADE"), primary_key=True)
+    workplace_id: Mapped[int | None] = mapped_column(ForeignKey("workplaces.id", ondelete="RESTRICT"), nullable=True)
+    zone: Mapped[str] = mapped_column(String(8))
+    ai_enabled: Mapped[bool] = mapped_column(Boolean)
+    ai_fps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class HumanVisit(Base):

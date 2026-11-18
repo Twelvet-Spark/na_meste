@@ -187,7 +187,7 @@ def _mask_polygon(binary, *, diagnostics=None):
         height, width = binary.shape
         points = [[float(x) / width, float(y) / height] for x, y in simplified[:, 0, :]]
         try:
-            validate_geometry(dict(version=1, floor=points, objects=[], metric=None))
+            validate_geometry(dict(version=2, floor=points, objects=[], doors=[], metric=None))
         except GeometryError as exc:
             if diagnostics is not None:
                 diagnostics['rejection_reason'] = attempt['rejection_reason'] = 'INVALID_SCENE_POLYGON'

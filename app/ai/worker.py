@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
@@ -29,7 +29,7 @@ from app.ai.scheduler import DeadlineScheduler
 from app.ai.inference_metrics import InferenceMetrics
 from app.config import BASE_DIR, settings
 from app.database.database import publication_guard
-from app.database.models import AttendanceCamera, AttendanceRuntime, Camera
+from app.database.models import AttendanceCamera, AttendanceRuntime, Camera, CameraProfile
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus
 from app.services.attendance_health import CoverageFault
@@ -123,6 +123,9 @@ class _CameraConfiguration:
     role: str | None
     calibration: DoorwayCalibration | None
     gallery_revision: int
+    ai_enabled: bool
+    # Changing the AI rate must neither reset a camera nor discard in-flight frames.
+    ai_fps: float | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
@@ -315,8 +318,7 @@ class AIWorker(threading.Thread):
             if self._streams.get(camera_id) != (packet.stream_id, packet.source_revision):
                 self._reset_camera(camera_id, "STREAM_RESET")
                 self._streams[camera_id] = (packet.stream_id, packet.source_revision)
-                self.metrics.configure(camera_id, settings.attendance_ai_fps if config.attendance else settings.ai_fps,
-                                       time.monotonic())
+                self.metrics.configure(camera_id, self._fps(config), time.monotonic())
             epoch = self._reset_epochs.get(camera_id, 0)
             if not self._is_current(camera_id, packet, config, reader, epoch, revision, configurations):
                 self._reset_camera(camera_id, "SOURCE_CHANGED")
@@ -348,7 +350,7 @@ class AIWorker(threading.Thread):
             for camera_id, packet, config, _reader, _epoch in submissions:
                 self._reset_camera(camera_id, "AI_UNAVAILABLE")
                 self._retry_after[camera_id] = completed + 1.
-                fps = settings.attendance_ai_fps if config.attendance else settings.ai_fps
+                fps = self._fps(config)
                 skipped = self.scheduler.advance(camera_id, fps, completed)
                 self.metrics.configure(camera_id, fps, completed)
                 self.metrics.complete(camera_id, packet.received_mono, completed,
@@ -374,7 +376,7 @@ class AIWorker(threading.Thread):
             self._drain_journal(configurations)
             for submission, outcome in zip(submissions, outcomes):
                 camera_id, packet, config, reader, epoch = submission
-                fps = settings.attendance_ai_fps if config.attendance else settings.ai_fps
+                fps = self._fps(config)
                 skipped = self.scheduler.advance(camera_id, fps, completed)
                 if not self._is_current(camera_id, packet, config, reader, epoch, revision, configurations):
                     self._reset_camera(camera_id, "SOURCE_CHANGED")
@@ -397,7 +399,7 @@ class AIWorker(threading.Thread):
                                       face_deferred=outcome.face_deferred, started_mono=started,
                                       stage_times_ms=outcome.stage_times_ms)
                 if config.calibration is not None:
-                    self.health.record_frame(config.role, packet, tracking_generation=outcome.tracking_generation,
+                    self.health.record_frame(camera_id, packet, tracking_generation=outcome.tracking_generation,
                                              started_mono=started, completed_mono=finished)
             self._journal_health()
 
@@ -653,8 +655,9 @@ class AIWorker(threading.Thread):
             runtime = db.get(AttendanceRuntime, 1)
             if runtime is None:
                 raise SQLAlchemyError("Attendance runtime unavailable")
-            for config, camera_enabled in db.query(AttendanceCamera, Camera.enabled).join(
-                    Camera, Camera.id == AttendanceCamera.camera_id):
+            for config, camera_enabled, profile in db.query(AttendanceCamera, Camera.enabled, CameraProfile).join(
+                    Camera, Camera.id == AttendanceCamera.camera_id).join(
+                    CameraProfile, CameraProfile.camera_id == AttendanceCamera.camera_id):
                 attendance = config.enabled and config.role is not None
                 calibration = None
                 if attendance:
@@ -664,30 +667,28 @@ class AIWorker(threading.Thread):
                         config.reference_width, config.reference_height)
                 result[config.camera_id] = _CameraConfiguration(
                     config.source_revision, config.revision, camera_enabled,
-                    attendance, config.role, calibration, runtime.gallery_revision)
+                    attendance, config.role, calibration, runtime.gallery_revision,
+                    profile.ai_enabled, profile.ai_fps)
             return result
         return read_snapshot(self.attendance.engine, read)
 
     def _collect_frames(self):
         self._runnable_ids.clear()
         now = time.monotonic()
-        camera_ids = self._camera_ids()
+        reader_ids = self.manager.reader_ids()
         configurations = self._read_configurations()
-        included = {key for key in camera_ids if key in configurations and configurations[key].enabled}
+        camera_ids = self._camera_ids(reader_ids, configurations)
+        included = {key for key in camera_ids if configurations[key].enabled}
         self.scheduler.retain(included, now)
-        for role in ("ENTRY", "EXIT"):
-            assigned = [(key, config) for key, config in configurations.items()
-                        if config.role == role and config.enabled and config.attendance]
-            if assigned:
-                key, config = assigned[0]
-                reader = self.manager.get(key)
-                online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
-                          and reader.source_revision == config.source_revision)
-                self.health.configure_role(role, camera_id=key, source_revision=config.source_revision,
-                                           enabled=True, online=online, included=key in included)
-            else:
-                self.health.configure_role(role, camera_id=None, source_revision=0,
-                                           enabled=False, online=False, included=False)
+        rows = []
+        for key, config in configurations.items():
+            if not (config.enabled and config.attendance):
+                continue
+            reader = self.manager.get(key)
+            online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
+                      and reader.source_revision == config.source_revision)
+            rows.append((key, config.role, config.source_revision, True, online, key in included))
+        self.health.configure_cameras(rows)
         for camera_id in set(self._configurations) - included:
             self._reset_camera(camera_id, "CAMERA_DISABLED")
             self.metrics.drop(camera_id)
@@ -705,7 +706,7 @@ class AIWorker(threading.Thread):
                           "CALIBRATION_CHANGED")
                 self._reset_camera(camera_id, reason)
             self._configurations[camera_id] = config
-            self.metrics.configure(camera_id, settings.attendance_ai_fps if config.attendance else settings.ai_fps, now)
+            self.metrics.configure(camera_id, self._fps(config), now)
             if now < self._retry_after.get(camera_id, float("-inf")):
                 continue
             reader = self.manager.get(camera_id)
@@ -722,7 +723,7 @@ class AIWorker(threading.Thread):
             stream = (packet.stream_id, packet.source_revision)
             if camera_id in self._streams and self._streams[camera_id] != stream:
                 self._reset_camera(camera_id, "STREAM_RESET")
-                self.metrics.configure(camera_id, settings.attendance_ai_fps if config.attendance else settings.ai_fps, now)
+                self.metrics.configure(camera_id, self._fps(config), now)
             self._streams[camera_id] = stream
             age = now - packet.received_mono
             if config.attendance and age > settings.attendance_frame_max_age:
@@ -739,16 +740,19 @@ class AIWorker(threading.Thread):
             if previous_receipt is not None and packet.received_mono - previous_receipt > settings.attendance_max_frame_gap:
                 self._reset_camera(camera_id, "FRAME_GAP")
                 self._streams[camera_id] = stream
-                self.metrics.configure(camera_id, settings.attendance_ai_fps if config.attendance else settings.ai_fps, now)
+                self.metrics.configure(camera_id, self._fps(config), now)
             packets.append((camera_id, packet, config))
             self.metrics.pending(camera_id, packet.received_mono)
         self._runnable_ids = {camera_id for camera_id, _packet, _config in packets}
         return packets
 
-    def _camera_ids(self):
-        ids = set(self.manager.reader_ids())
-        allowed = settings.ai_camera_ids()
-        return sorted(ids if not allowed else ids & allowed)
+    @staticmethod
+    def _fps(config):
+        return settings.attendance_ai_fps if config.attendance else (config.ai_fps or settings.ai_fps)
+
+    @staticmethod
+    def _camera_ids(reader_ids, configurations):
+        return sorted(key for key in reader_ids if key in configurations and configurations[key].ai_enabled)
 
 
 # ------------------------------------------------------------- инициализация

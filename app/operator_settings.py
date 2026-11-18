@@ -1,6 +1,7 @@
 """Strict operator-only overrides; deployment configuration is never rewritten."""
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -8,13 +9,15 @@ from pathlib import Path
 from typing import Annotated
 
 from pydantic import AliasChoices, TypeAdapter, ValidationError
+from dotenv import dotenv_values
 from pydantic_settings import EnvSettingsSource, DotEnvSettingsSource
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger("app.operator_settings")
 EDITABLE = (
     "preview_fps", "rtsp_connect_timeout", "rtsp_reconnect_max_delay", "frame_stall_timeout",
     "stream_output_fps", "stream_hwaccel",
-    "ai_enabled", "ai_device", "ai_fps", "ai_cameras",
+    "ai_enabled", "ai_device", "ai_fps",
     "ai_batch_size", "ai_batch_wait_ms",
     "min_recognition_confidence", "min_confirmations", "face_recognition_retry_interval",
     "live_face_min_size", "live_face_margin", "live_face_window", "live_face_recheck_interval",
@@ -27,6 +30,8 @@ EDITABLE = (
     "telegram_notify_global_transition", "telegram_notify_global_new",
     "recording_retention_days", "recording_max_bytes", "mc_debug",
 )
+# Keys that older documents may still carry; dropped on read, so the next save rewrites without them.
+RETIRED_KEYS = frozenset({"ai_cameras"})
 SECRET = "telegram_bot_token"
 # One writer across service instances in this single-worker deployment. Read/CAS/
 # validate/replace all hold this lock; no separate read-then-write race.
@@ -52,6 +57,30 @@ def normalize_camera_ids(value):
     if any(not part.isascii() or not part.isdecimal() or int(part) <= 0 for part in parts):
         raise ValueError("AI_CAMERAS_INVALID")
     return ",".join(str(item) for item in sorted({int(part) for part in parts}))
+
+
+def legacy_ai_camera_ids(env_file=BASE_DIR / ".env"):
+    """The retired AI_CAMERAS selection (environment > operator document > .env), or None for all cameras.
+
+    Read once while upgrading to per-camera AI settings; an unusable value selects every camera.
+    """
+    raw = next((value for key, value in os.environ.items() if key.lower() == "ai_cameras"), None)
+    if raw is None:
+        try:
+            document = json.loads(settings_path().read_text("utf-8"))
+            raw = document["values"]["ai_cameras"]
+        except (OSError, ValueError, KeyError, TypeError):
+            raw = None
+    if raw is None:
+        raw = next((value for key, value in dotenv_values(env_file).items() if key.lower() == "ai_cameras"), None)
+    if raw is None:
+        return None
+    try:
+        normalized = normalize_camera_ids(raw)
+    except ValueError:
+        logger.warning("LEGACY_AI_CAMERAS_INVALID")
+        return None
+    return {int(part) for part in normalized.split(",")} if normalized else None
 
 
 def _names(name, field):
@@ -85,8 +114,6 @@ def validate_values(values, settings_cls):
             field = settings_cls.model_fields[name]
             annotation = Annotated[field.annotation, *field.metadata] if field.metadata else field.annotation
             result[name] = TypeAdapter(annotation).validate_python(value, strict=True)
-        if "ai_cameras" in result:
-            result["ai_cameras"] = normalize_camera_ids(result["ai_cameras"])
         if ("attendance_face_window" in result and "attendance_face_interval" in result
                 and result["attendance_face_interval"] > result["attendance_face_window"]):
             raise ValueError("ATTENDANCE_INTERVAL_EXCEEDS_WINDOW")
@@ -125,7 +152,10 @@ def read_document(path, settings_cls):
             raise ValueError("shape")
     except (ValueError, UnicodeError, RecursionError):
         raise OverrideError("OPERATOR_SETTINGS_INVALID_DOCUMENT: исправьте JSON версии 1 перед запуском") from None
-    return validate_values(value["values"], settings_cls), hashlib.sha256(raw).hexdigest()
+    values = value["values"]
+    if type(values) is dict:
+        values = {key: item for key, item in values.items() if key not in RETIRED_KEYS}
+    return validate_values(values, settings_cls), hashlib.sha256(raw).hexdigest()
 
 
 def replace_document(path, values, expected_version, settings_cls):

@@ -336,6 +336,24 @@ def test_manager_replacement_stop_and_deletion_invalidate_cached_derivatives():
 
 
 @test
+def test_restart_replaces_the_reader_of_a_published_enabled_camera_only():
+    from dataclasses import replace
+    with patch("app.rtsp.manager.resolve_ffmpeg", return_value=("unused", "unused")), \
+            patch.object(RTSPReader, "start"):
+        manager = ReaderManager()
+        assert manager.restart(1) is False, "Nothing published yet"
+        first = manager.start(source(4, 1))
+        assert manager.restart(1) is True
+        second = manager.get(1)
+        assert second is not first and second.source_revision == 4
+        assert first.read() is None, "The replaced reader must be stopped"
+        manager.sync(replace(source(4, 2), enabled=False), None)
+        assert manager.get(1) is None and manager.restart(1) is False
+        manager.stop(CameraDeletion(1, 3))
+        assert manager.restart(1) is False
+
+
+@test
 def test_snapshot_native_default_and_only_explicit_bounded_sizes_are_accepted():
     reader = make_reader()
     publish(reader)

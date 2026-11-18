@@ -1,4 +1,4 @@
-"""Authoritative scene v1 geometry; isolated, no cameras or model sessions.
+"""Authoritative scene v2 geometry; isolated, no cameras or model sessions.
 
 Run: .venv/Scripts/python.exe tests/test_scene_geometry.py
 Execution belongs to the integration owner.
@@ -17,7 +17,7 @@ import numpy as np
 
 from app.scene_geometry import (
     GeometryError, build_metric_transform, point_in_polygon, rectified_size,
-    validate_geometry,
+    validate_door_quad, validate_geometry,
 )
 
 TESTS = []
@@ -29,7 +29,7 @@ def test(fn):
 
 
 def geometry(*, metric=False):
-    return dict(version=1, floor=[[0, 0], [1, 0], [1, 1], [0, 1]], objects=[],
+    return dict(version=2, floor=[[0, 0], [1, 0], [1, 1], [0, 1]], objects=[], doors=[],
                 metric=dict(corners=[[.2, .2], [.8, .2], [.8, .8], [.2, .8]],
                             width_m=4, depth_m=3) if metric else None)
 
@@ -54,7 +54,7 @@ def test_preserves_native_coordinate_precision_and_concave_floor():
     assert point_in_polygon([.5, .8], result['floor'])
     result['floor'][0][0] = 0
     assert value['floor'][0][0] == .123456789012345
-    assert validate_geometry(dict(version=1, floor=None, objects=[], metric=None))['floor'] is None
+    assert validate_geometry(dict(version=2, floor=None, objects=[], doors=[], metric=None))['floor'] is None
     # A nonzero polygon must not become \"zero area\" through float underflow.
     tiny = [[0, 0], [1e-200, 0], [0, 1e-200]]
     assert validate_geometry(dict(geometry(), floor=tiny))['floor'] == tiny
@@ -62,13 +62,14 @@ def test_preserves_native_coordinate_precision_and_concave_floor():
 
 @test
 def test_rejects_unknown_keys_and_non_json_numeric_abuse():
-    for key in ('version', 'floor', 'objects', 'metric'):
+    for key in ('version', 'floor', 'objects', 'doors', 'metric'):
         value = geometry()
         del value[key]
         rejects(value)
     rejects(dict(geometry(), extra=True))
     rejects(dict(geometry(), version=True))
-    rejects(dict(geometry(), version=1.0))
+    rejects(dict(geometry(), version=2.0))
+    rejects(dict(geometry(), version=1))
     for number in (True, False, float('nan'), float('inf'), -float('inf'), -.01, 1.01, '0.5', None, 10 ** 1000):
         value = geometry()
         value['floor'][0][0] = number
@@ -104,6 +105,46 @@ def test_polygon_distinctness_area_intersection_and_limits():
     rejects(dict(geometry(), objects=[objects[0], dict(objects[0], id=objects[0]['id'].upper())]))
     huge_objects = [dict(id=str(uuid4()), label='x' * 80, polygon=circle) for _ in range(32)]
     rejects(dict(geometry(), objects=huge_objects))
+
+
+def door(**changes):
+    return dict(dict(id=str(uuid4()), label='Дверь', kind='DOOR',
+                     quad=[[.4, .8], [.6, .8], [.6, .2], [.4, .2]]), **changes)
+
+
+@test
+def test_door_is_validated_and_copied_without_rounding():
+    value = dict(geometry(), doors=[door(quad=[[.1234567890123, .8], [.6, .8], [.6, .2], [.1234567890123, .2]],
+                                         kind='PASSAGE')])
+    result = validate_geometry(value)
+    assert result == value and result['doors'][0]['quad'] is not value['doors'][0]['quad']
+    # A door seen edge-on has a zero-area quad but is still valid.
+    edge_on = door(quad=[[.5, .8], [.5, .7], [.5, .1], [.5, .2]])
+    assert len(validate_geometry(dict(geometry(), doors=[edge_on]))['doors']) == 1
+
+
+@test
+def test_door_rejects_inverted_posts_short_threshold_and_bad_shape():
+    for quad in (
+        [[.4, .8], [.6, .8], [.6, .9], [.4, .2]],   # right post top below its bottom
+        [[.4, .8], [.6, .8], [.6, .8], [.4, .2]],   # top level with bottom
+        [[.4, .8], [.41, .8], [.41, .2], [.4, .2]],  # threshold shorter than .02
+        [[.4, .8], [.6, .8], [.6, .2]],              # three points
+        [[.4, .8], [.6, .8], [.6, .2], [.4, 1.2]],   # outside the frame
+    ):
+        rejects(dict(geometry(), doors=[door(quad=quad)]))
+    for changed in (door(kind='GATE'), door(label=''), door(label='x' * 81), door(id='bad'), dict(door(), extra=1)):
+        rejects(dict(geometry(), doors=[changed]))
+    rejects(dict(geometry(), doors=[door() for _ in range(9)]))
+    assert len(validate_geometry(dict(geometry(), doors=[door() for _ in range(8)]))['doors']) == 8
+
+
+@test
+def test_ids_are_unique_across_objects_and_doors():
+    shared = str(uuid4())
+    obj = dict(id=shared, label='Стол', polygon=[[0, 0], [1, 0], [1, 1]])
+    rejects(dict(geometry(), objects=[obj], doors=[door(id=shared)]))
+    rejects(dict(geometry(), doors=[door(id=shared), door(id=shared.upper())]))
 
 
 @test

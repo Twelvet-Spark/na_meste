@@ -552,7 +552,6 @@ STREAM_HWACCEL=auto            # auto | cuda | none; только auto допу�
 # AI
 AI_ENABLED=true
 AI_FPS=5                      # кадров/сек на камеру для AI
-AI_CAMERAS=                   # "1,3,5" — пусто = все камеры
 AI_DEVICE=auto                # auto | cpu | cuda
 AI_BATCH_SIZE=4               # 1–8 разных камер
 AI_BATCH_WAIT_MS=10            # не позже ближайшего срока

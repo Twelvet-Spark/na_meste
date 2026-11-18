@@ -1,7 +1,9 @@
-"""Strict scene-v1 JSON and planar geometry in normalized native coordinates.
+"""Strict scene-v2 JSON and planar geometry in normalized native coordinates.
 
-Objects describe silhouettes; they are not exclusion masks. Measured rectangles
-assume a stationary camera, a coplanar floor and no lens-distortion correction.
+Objects describe silhouettes; they are not exclusion masks. Doors are 4-point
+frames [threshold_start, threshold_end, top_end, top_start]; the threshold
+edge is on the floor. Measured rectangles assume a stationary camera, a
+coplanar floor and no lens-distortion correction.
 """
 import json
 import math
@@ -15,6 +17,9 @@ import numpy as np
 MAX_DOCUMENT_BYTES = 128 * 1024
 MAX_VERTICES = 128
 MAX_OBJECTS = 32
+MAX_DOORS = 8
+MIN_DOOR_THRESHOLD = .02
+DOOR_HEIGHT_RATIO = {'DOOR': 1.8, 'PASSAGE': 1.0}
 MAX_RECTIFIED_EDGE = 1280
 MAX_RECTIFIED_PIXELS = 1_700_000
 
@@ -84,7 +89,7 @@ def polygon_area(points):
                          for a, b in zip(points, points[1:] + points[:1]))) / 2
 
 
-def _polygon(value, name):
+def validate_polygon(value, name):
     if not isinstance(value, list) or not 3 <= len(value) <= MAX_VERTICES:
         raise GeometryError(f'{name} needs 3..{MAX_VERTICES} vertices')
     points = [_point(point, name) for point in value]
@@ -106,6 +111,41 @@ def _polygon(value, name):
     return points
 
 
+def validate_door_quad(value, name):
+    """Door frame [threshold_start, threshold_end, top_end, top_start], each top above its post.
+
+    A door seen edge-on is degenerate but legitimate, so no simple-polygon test.
+    """
+    if not isinstance(value, list) or len(value) != 4:
+        raise GeometryError(f'{name} needs exactly 4 points')
+    quad = [_point(point, name) for point in value]
+    if math.dist(quad[0], quad[1]) < MIN_DOOR_THRESHOLD:
+        raise GeometryError(f'{name} threshold must be at least {MIN_DOOR_THRESHOLD}')
+    if not (quad[3][1] < quad[0][1] and quad[2][1] < quad[1][1]):
+        raise GeometryError(f'{name} top must be above its threshold')
+    return quad
+
+
+def validate_door(line_start, line_end, door_top):
+    """door_top is [top_start, top_end]: the tops of the posts above line_start and line_end."""
+    if not isinstance(door_top, (list, tuple)) or len(door_top) != 2:
+        raise GeometryError('Door top needs exactly 2 points')
+    validate_door_quad([list(line_start), list(line_end), list(door_top[1]), list(door_top[0])], 'Door')
+
+
+def extruded_door_top(line_start, line_end, reference_width, reference_height, kind):
+    """Default door top, or None with no room above the threshold.
+
+    Posts rise 1.8 (DOOR) or 1.0 (PASSAGE) threshold lengths, measured in pixels and clamped to the frame.
+    """
+    if line_start[1] == 0 or line_end[1] == 0:
+        return None
+    length = math.hypot((line_end[0] - line_start[0]) * reference_width,
+                        (line_end[1] - line_start[1]) * reference_height)
+    height = DOOR_HEIGHT_RATIO[kind] * length
+    return [[x, max(0., y * reference_height - height) / reference_height] for x, y in (line_start, line_end)]
+
+
 def point_in_polygon(point, polygon):
     """Boundary-inclusive containment for a simple, possibly concave polygon."""
     inside = False
@@ -119,16 +159,18 @@ def point_in_polygon(point, polygon):
 
 
 def validate_geometry(value):
-    """Return independent JSON-compatible v1 data; never round coordinates.
+    """Return independent JSON-compatible v2 data; never round coordinates.
 
     This is the single validator for scene saves and encrypted-transfer import.
     Unknown/missing keys at every level are errors, not ignored extensions.
     """
-    _keys(value, ('version', 'floor', 'objects', 'metric'), 'Scene')
-    if type(value['version']) is not int or value['version'] != 1:
-        raise GeometryError('Scene version must be integer 1')
+    _keys(value, ('version', 'floor', 'objects', 'doors', 'metric'), 'Scene')
+    if type(value['version']) is not int or value['version'] != 2:
+        raise GeometryError('Scene version must be integer 2')
     if not isinstance(value['objects'], list) or len(value['objects']) > MAX_OBJECTS:
         raise GeometryError(f'Scene permits at most {MAX_OBJECTS} objects')
+    if not isinstance(value['doors'], list) or len(value['doors']) > MAX_DOORS:
+        raise GeometryError(f'Scene permits at most {MAX_DOORS} doors')
     # Reject non-JSON values and oversized documents before geometric work.
     try:
         size = len(json.dumps(value, ensure_ascii=False, allow_nan=False,
@@ -137,29 +179,41 @@ def validate_geometry(value):
         raise GeometryError('Scene must be finite UTF-8 JSON') from exc
     if size > MAX_DOCUMENT_BYTES:
         raise GeometryError('Scene exceeds 128 KiB')
-    floor = None if value['floor'] is None else _polygon(value['floor'], 'Floor')
-    objects, identifiers = [], set()
-    for item in value['objects']:
-        _keys(item, ('id', 'label', 'polygon'), 'Object')
+    floor = None if value['floor'] is None else validate_polygon(value['floor'], 'Floor')
+    objects, doors, identifiers = [], [], set()
+
+    def identify(item, name):
         if not isinstance(item['id'], str):
-            raise GeometryError('Object id must be a UUID')
+            raise GeometryError(f'{name} id must be a UUID')
         try:
             identifier = str(UUID(item['id']))
         except ValueError as exc:
-            raise GeometryError('Object id must be a UUID') from exc
+            raise GeometryError(f'{name} id must be a UUID') from exc
         if identifier in identifiers:
-            raise GeometryError('Object ids must be unique')
+            raise GeometryError('Object and door ids must be unique')
         identifiers.add(identifier)
         label = item['label']
         if not isinstance(label, str) or not 1 <= len(label) <= 80 or not label.strip():
-            raise GeometryError('Object label needs 1..80 characters')
-        objects.append(dict(id=identifier, label=label, polygon=_polygon(item['polygon'], 'Object polygon')))
+            raise GeometryError(f'{name} label needs 1..80 characters')
+        return identifier, label
+
+    for item in value['objects']:
+        _keys(item, ('id', 'label', 'polygon'), 'Object')
+        identifier, label = identify(item, 'Object')
+        objects.append(dict(id=identifier, label=label, polygon=validate_polygon(item['polygon'], 'Object polygon')))
+    for item in value['doors']:
+        _keys(item, ('id', 'label', 'kind', 'quad'), 'Door')
+        identifier, label = identify(item, 'Door')
+        if item['kind'] not in ('DOOR', 'PASSAGE'):
+            raise GeometryError('Door kind must be DOOR or PASSAGE')
+        doors.append(dict(id=identifier, label=label, kind=item['kind'],
+                          quad=validate_door_quad(item['quad'], 'Door')))
     metric = value['metric']
     if metric is not None:
         _keys(metric, ('corners', 'width_m', 'depth_m'), 'Metric')
         if floor is None:
             raise GeometryError('Metric calibration requires a floor')
-        corners = _polygon(metric['corners'], 'Metric corners')
+        corners = validate_polygon(metric['corners'], 'Metric corners')
         if len(corners) != 4 or polygon_area(corners) < 1e-4:
             raise GeometryError('Metric needs four corners and area >= 1e-4')
         turns = [_orientation(corners[i - 1], corners[i], corners[(i + 1) % 4]) for i in range(4)]
@@ -170,7 +224,7 @@ def validate_geometry(value):
         metric = dict(corners=corners,
                       width_m=_number(metric['width_m'], 'Width in metres', maximum=1000, exclusive_minimum=True),
                       depth_m=_number(metric['depth_m'], 'Depth in metres', maximum=1000, exclusive_minimum=True))
-    result = dict(version=1, floor=floor, objects=objects, metric=metric)
+    result = dict(version=2, floor=floor, objects=objects, doors=doors, metric=metric)
     if len(json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > MAX_DOCUMENT_BYTES:
         raise GeometryError('Normalized scene exceeds 128 KiB')
     build_metric_transform(result)

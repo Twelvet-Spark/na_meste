@@ -21,8 +21,9 @@ import onnxruntime as ort
 from onnx import TensorProto as T, helper, numpy_helper
 
 from app.ai.scene_segmenter import (SceneSegmenter, SceneSegmentationError,
-                                    _preprocess, _prompt_inputs, _mask_polygon,
+                                    _preprocess, _prompt_inputs, _mask_polygon, _floor_polygon,
                                     _rank_polygons, validate_prompts)
+from app.scene_geometry import point_in_polygon, polygon_area
 
 
 def snapshot(clock=lambda: 100., size=(80, 40), camera=1):
@@ -380,6 +381,36 @@ class SegmenterTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertEqual(len(errors), 1)
             self.assertEqual(errors[0].code, 'CAMERA_SOURCE_CHANGED')
+
+    def test_floor_polygon_fills_desk_holes_and_drops_detached_specks(self):
+        mask = np.zeros((100, 200), np.uint8)
+        mask[20:90, 10:190] = 1
+        mask[40:60, 80:120] = 0      # a desk standing on the floor
+        mask[5:8, 5:8] = 1           # detached speck
+        # The prompted-object tracer rejects this mask; the floor tracer repairs it deliberately.
+        self.assertIsNone(_mask_polygon(mask))
+        points = _floor_polygon(mask)
+        self.assertIsNotNone(points)
+        self.assertAlmostEqual(polygon_area(points), 180 * 70 / (200 * 100), delta=.02)
+        self.assertTrue(point_in_polygon([.5, .5], points), 'desk hole must be inside the floor outline')
+        self.assertFalse(point_in_polygon([.03, .06], points))
+        self.assertEqual(len(points), len({tuple(point) for point in points}))
+        self.assertIsNone(_floor_polygon(np.zeros((100, 200), np.uint8)))
+
+    def test_floor_uses_best_ranked_usable_mask_and_rejects_tiny_regions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            segmenter = SceneSegmenter(tiny_bundle(directory), monotonic=lambda: 100.)
+            segmenter.set_snapshot_validator(lambda token, camera: None)
+            floor = segmenter.floor(snapshot(), [[.5, .5]], [])
+            self.assertIsNotNone(floor)
+            self.assertAlmostEqual(polygon_area(floor.points), .36, delta=.03)
+            self.assertAlmostEqual(floor.score, .9, places=5)
+        with tempfile.TemporaryDirectory() as directory:
+            segmenter = SceneSegmenter(tiny_bundle(directory, foreground=False), monotonic=lambda: 100.)
+            segmenter.set_snapshot_validator(lambda token, camera: None)
+            self.assertIsNone(segmenter.floor(snapshot(), [[.5, .5]], []))
+            with self.assertRaises(ValueError):
+                segmenter.floor(snapshot(), [], [])
 
 
 if __name__ == '__main__':

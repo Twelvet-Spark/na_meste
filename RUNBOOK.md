@@ -173,7 +173,7 @@ Use current bodies/revisions/UUID request IDs from `/docs` and [README examples]
 |---|---|
 | Camera test fails | Server→device access, credentials, ports, channel/stream, tool and Windows containment readiness. |
 | Test passes, preview stalls | Camera status frame age, errors/reconnect count; test does not prove sustained decoding. Try a suitable substream and inspect source/network health. |
-| Video but unavailable AI/photos | Actual model/provider errors, complete compatible models, `AI_ENABLED`/`AI_CAMERAS`, accepted active employee photos and live face quality. |
+| Video but unavailable AI/photos | Actual model/provider errors, complete compatible models, `AI_ENABLED`/per-camera AI, accepted active employee photos and live face quality. |
 | Automatic attendance blocked | `/api/attendance/status`: current reasons, role calibration, commissioning, real CUDA providers, performance/coverage/clock/write faults. Do not lower identity thresholds blindly. |
 | Recording/playback unavailable | `/debug`: containment, storage ownership, quota/free space, FFmpeg/ffprobe/libx264, archive permissions/confirmed device offset. |
 | Config edit appears ignored | Compare active/pending values and precedence; restart. Do not reconnect every camera manually. |

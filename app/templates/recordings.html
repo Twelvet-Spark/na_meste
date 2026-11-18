@@ -7,9 +7,9 @@
     <div><h1>Записи</h1><p class="muted">Видео выбранной камеры. Архив регистратора и локальные записи независимы; поиск по сотрудникам и лицам здесь не выполняется.</p></div>
   </header>
   <section class="panel" aria-label="Поиск записей">
-    <div class="recordings-source" role="tablist" aria-label="Источник видео">
-      <button type="button" class="btn" id="source-local" role="tab" aria-selected="true" aria-controls="recordings-results" data-source="local">Локальные записи</button>
-      <button type="button" class="btn" id="source-dahua" role="tab" aria-selected="false" aria-controls="recordings-results" tabindex="-1" data-source="dahua">Архив Dahua</button>
+    <div class="tabs" role="tablist" aria-label="Источник видео">
+      <button type="button" id="source-local" role="tab" aria-selected="true" aria-controls="recordings-results" data-tab="local">Локальные записи</button>
+      <button type="button" id="source-dahua" role="tab" aria-selected="false" aria-controls="recordings-results" tabindex="-1" data-tab="dahua">Архив Dahua</button>
     </div>
     <form id="recordings-search" class="recordings-filters">
       <label class="field" for="recordings-camera">Камера<select id="recordings-camera" required><option value="">Загрузка камер…</option></select></label>

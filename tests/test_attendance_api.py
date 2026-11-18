@@ -131,7 +131,8 @@ def commission_payload(**counts):
                   retreat_trials=10, wrong_employee=0, duplicate_trips=0, missed_unflagged=0,
                   frontal_trials=100, frontal_eligible=95, performance_minutes=15, site_confirmed=True)
     record.update(counts)
-    return human(expected_entry_revision=3, expected_exit_revision=3, acceptance_record=record)
+    return human(expected_cameras=[dict(camera_id=1, revision=3), dict(camera_id=2, revision=3)],
+                 acceptance_record=record)
 
 
 def commission_ready(engine, service):
@@ -489,7 +490,8 @@ def test_commission_rejects_counts_stale_revisions_cpu_and_unhealthy_metrics():
                         dict(frontal_eligible=94), dict(frontal_eligible=101), dict(performance_minutes=14),
                         dict(site_confirmed=False)):
             client.json("POST", "/api/attendance/commission", commission_payload(**changes), status=422)
-        stale = dict(commission_payload(), expected_exit_revision=2)
+        stale = dict(commission_payload(), expected_cameras=[dict(camera_id=1, revision=3),
+                                                              dict(camera_id=2, revision=2)])
         client.json("POST", "/api/attendance/commission", stale, status=409)
         for key in ("person_detection", "live_face_detection", "live_face_recognition",
                     "enroll_face_detection", "enroll_face_recognition"):
@@ -554,7 +556,8 @@ def test_commission_rejects_short_technical_streak_and_slow_completion():
         assert health.snapshot()["technically_healthy_seconds"] < 10
         client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
         warm(health, clock, seconds=21, completion=1.1)
-        assert health.snapshot()["roles"]["ENTRY"]["completion_age_p95_seconds"] > 1
+        assert next(row for row in health.snapshot()["cameras"]
+                    if row["camera_id"] == 1)["completion_age_p95_seconds"] > 1
         client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
         with Session(engine) as db:
             assert db.get(AttendanceRuntime, 1).commission_id is None

@@ -17,14 +17,15 @@ from sqlalchemy.orm import Session
 
 from app.database.database import immediate_session
 from app.database.models import (
-    AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, CameraArchive,
+    AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, CameraArchive, CameraProfile,
     GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSession,
-    HumanVisit, HumanJournalGap,
+    HumanVisit, HumanJournalGap, Workplace,
 )
 from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraDeletion, CameraSource
 from app.rtsp.dahua import build_rtsp_url, normalize_host
 from app.rtsp.reader import parse_frame_rate
 from app.media.process_guard import MediaProcessGuard
+from app.time_utils import utcnow
 
 logger = logging.getLogger("app.services.cameras")
 
@@ -255,12 +256,92 @@ def list_cameras(db: Session) -> list[Camera]:
     return db.query(Camera).order_by(Camera.channel, Camera.id).all()
 
 
-def camera_out(db: Session, camera: Camera | CameraSource) -> dict:
+def profiles_by_camera(db: Session, ids) -> dict[int, dict]:
+    """Profile and attendance state for many cameras in one query."""
+    rows = db.query(CameraProfile, Workplace.name, Workplace.active, AttendanceCamera.enabled,
+                    AttendanceCamera.role).outerjoin(
+        Workplace, Workplace.id == CameraProfile.workplace_id).outerjoin(
+        AttendanceCamera, AttendanceCamera.camera_id == CameraProfile.camera_id).filter(
+        CameraProfile.camera_id.in_(list(ids))).all()
+    return {profile.camera_id: {
+        "profile": {"workplace_id": profile.workplace_id, "workplace_name": workplace_name,
+                    "workplace_active": workplace_active, "zone": profile.zone,
+                    "ai_enabled": profile.ai_enabled, "ai_fps": profile.ai_fps, "revision": profile.revision},
+        "attendance": {"enabled": bool(enabled), "role": role}}
+        for profile, workplace_name, workplace_active, enabled, role in rows}
+
+
+def camera_out(db: Session, camera: Camera | CameraSource, profiles: dict | None = None) -> dict:
     data = CameraOut.model_validate(camera).model_dump(mode="json")
     if not isinstance(camera, CameraSource):
         archive = db.get(CameraArchive, camera.id)
         data["archive"] = ArchiveOut.model_validate(archive).model_dump(mode="json") if archive else None
+    if profiles is None:
+        profiles = profiles_by_camera(db, [camera.id])
+    data.update(profiles.get(camera.id, {"profile": None, "attendance": None}))
     return data
+
+
+class CameraProfileUpdate(BaseModel):
+    """Only supplied fields change; null workplace unassigns and null ai_fps restores the default rate."""
+    model_config = ConfigDict(extra="forbid")
+
+    workplace_id: StrictInt | None = Field(default=None, gt=0)
+    zone: Literal["INTERIOR", "ENTRANCE"] | None = None
+    ai_enabled: StrictBool | None = None
+    ai_fps: float | None = Field(default=None, gt=0, le=30, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        for name in ("zone", "ai_enabled"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} не может быть null")
+        return self
+
+
+class CameraProfileInput(CameraProfileUpdate):
+    expected_revision: StrictInt = Field(ge=0)
+
+
+def update_profile(db: Session, camera_id: int, data: CameraProfileUpdate, *,
+                   expected_revision: int | None) -> None:
+    """One compare-and-set transaction; bulk actions pass None because they are not stale-draft saves."""
+    engine = db.get_bind().engine
+    db.rollback()
+    changes = data.model_dump(exclude_unset=True, exclude={"expected_revision"})
+    try:
+        with immediate_session(engine, publish=True) as writer:
+            if writer.get(Camera, camera_id) is None:
+                raise HTTPException(404, "Camera not found")
+            row = writer.get(CameraProfile, camera_id)
+            if row is None:
+                raise HTTPException(503, "Camera profile unavailable")
+            if expected_revision is not None and row.revision != expected_revision:
+                raise HTTPException(409, "Настройки камеры изменились; обновите страницу")
+            workplace_id = changes.get("workplace_id")
+            if workplace_id is not None:
+                workplace = writer.get(Workplace, workplace_id)
+                if workplace is None:
+                    raise HTTPException(422, "Рабочее место не найдено")
+                if not workplace.active and workplace_id != row.workplace_id:
+                    raise HTTPException(422, "Выберите активное рабочее место")
+            config = writer.get(AttendanceCamera, camera_id)
+            if config is not None and config.enabled:
+                if changes.get("zone", row.zone) != "ENTRANCE":
+                    raise HTTPException(409, "Сначала отключите учёт на этой камере")
+                if not changes.get("ai_enabled", row.ai_enabled):
+                    raise HTTPException(409, "Камера учёта требует AI; сначала отключите учёт")
+            changed = False
+            for name, value in changes.items():
+                if getattr(row, name) != value:
+                    setattr(row, name, value)
+                    changed = True
+            if changed:
+                row.revision += 1
+                row.updated_at = utcnow()
+        db.expire_all()
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Database unavailable; camera settings were not saved") from exc
 
 
 def camera_snapshot(db: Session, camera_id: int) -> CameraSource | None:
@@ -293,6 +374,7 @@ def _create_camera(writer: Session, data: CameraCreate) -> CameraSource:
     config = AttendanceCamera(camera_id=camera.id)
     archive = CameraArchive(camera_id=camera.id, **data.archive.model_dump()) if data.archive else None
     writer.add(config)
+    writer.add(CameraProfile(camera_id=camera.id, zone="INTERIOR", ai_enabled=True, revision=0))
     if archive is not None:
         writer.add(archive)
     writer.flush()
@@ -440,6 +522,10 @@ def delete_camera(db: Session, camera: Camera | CameraSource, *, has_pending=Non
                 raise HTTPException(status_code=409, detail="Camera has history; disable instead")
             if config is not None:
                 writer.delete(config)
+                writer.flush()
+            profile = writer.get(CameraProfile, camera_id)
+            if profile is not None:
+                writer.delete(profile)
                 writer.flush()
             archive = writer.get(CameraArchive, camera_id)
             if archive is not None:

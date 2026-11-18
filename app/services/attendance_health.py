@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
+from app.attendance_roles import covered_directions
 from app.config import settings
 from app.time_utils import attendance_iso, utcnow
 
@@ -38,7 +39,7 @@ class AttendanceHealth:
         # still describe an unsafe interval. Recovery has a new notification
         # UUID but retains the original start/monotonic/reason identity.
         self._technical_faults = {}
-        self._roles = {}
+        self._cameras = {}
         self._providers = {key: [] for key in PROVIDER_KEYS}
         self._commission_valid = False
         self._clock_blocked = False
@@ -115,20 +116,26 @@ class AttendanceHealth:
         with self._lock:
             self._providers = {key: list(providers.get(key, [])) for key in PROVIDER_KEYS}
 
-    def configure_role(self, role, *, camera_id, source_revision, enabled, online, included):
+    def configure_cameras(self, rows):
+        """Replace the whole attendance camera set; rows are (camera_id, role, source_revision, enabled, online, included)."""
         with self._lock:
-            row = self._roles.get(role)
-            if row is None or (row["camera_id"], row["source_revision"]) != (camera_id, source_revision):
-                row = dict(camera_id=camera_id, source_revision=source_revision, stream_id=None,
-                           tracking_generation=None, last_processed_at=None, last_mono=None,
-                           frames=deque(), samples=deque(maxlen=600),
-                           low_since=self._mono(), good_since=None, degraded=False)
-                self._roles[role] = row
-            row.update(enabled=enabled, online=online, included=included)
+            wanted = {}
+            for camera_id, role, source_revision, enabled, online, included in rows:
+                row = self._cameras.get(camera_id)
+                if row is None or row["source_revision"] != source_revision:
+                    row = dict(source_revision=source_revision, stream_id=None,
+                               tracking_generation=None, last_processed_at=None, last_mono=None,
+                               frames=deque(), samples=deque(maxlen=600),
+                               low_since=self._mono(), good_since=None, degraded=False)
+                row.update(role=role, enabled=enabled, online=online, included=included)
+                wanted[camera_id] = row
+            for camera_id in self._cameras.keys() - wanted.keys():
+                self.transition(f"camera:{camera_id}", ())
+            self._cameras = wanted
 
-    def record_frame(self, role, packet, *, tracking_generation, started_mono, completed_mono):
+    def record_frame(self, camera_id, packet, *, tracking_generation, started_mono, completed_mono):
         with self._lock:
-            row = self._roles.get(role)
+            row = self._cameras.get(camera_id)
             if row is None or row["source_revision"] != packet.source_revision:
                 return
             previous = row["last_mono"]
@@ -181,15 +188,11 @@ class AttendanceHealth:
     def snapshot(self):
         with self._lock:
             now, utc = self._mono(), self._now()
-            roles, reasons = {}, set()
+            cameras, reasons = [], set()
             models_ready = all(self._providers[key] for key in REQUIRED_PROVIDER_KEYS)
             if not models_ready:
                 reasons.add("AI_UNAVAILABLE")
-            for role in ("ENTRY", "EXIT"):
-                row = self._roles.get(role)
-                if row is None:
-                    reasons.add("CAMERA_UNCONFIGURED")
-                    continue
+            for camera_id, row in sorted(self._cameras.items()):
                 while row["frames"] and row["frames"][0] < now - 10:
                     row["frames"].popleft()
                 while row["samples"] and row["samples"][0][0] < now - 60:
@@ -224,21 +227,23 @@ class AttendanceHealth:
                     failures.add("PERFORMANCE_DEGRADED")
                 elif bad:
                     failures.add("PERFORMANCE_WARMUP")
-                self.transition(f"role:{role}", failures,
+                self.transition(f"camera:{camera_id}", failures,
                                 at=row["last_processed_at"] if "FRAME_GAP" in failures and row["last_processed_at"] else utc,
                                 mono=row["last_mono"] if "FRAME_GAP" in failures and row["last_mono"] is not None else now)
                 reasons.update(failures)
-                roles[role] = dict(camera_id=row["camera_id"], stream_id=row["stream_id"],
-                                   source_revision=row["source_revision"], tracking_generation=row["tracking_generation"],
-                                   last_processed_at=attendance_iso(row["last_processed_at"]), frame_age_seconds=age,
-                                   processed_fps=fps, processing_age_p95_seconds=start_p95,
-                                   completion_age_p95_seconds=end_p95, reasons=sorted(failures))
+                cameras.append(dict(camera_id=camera_id, role=row["role"], stream_id=row["stream_id"],
+                                    source_revision=row["source_revision"], tracking_generation=row["tracking_generation"],
+                                    last_processed_at=attendance_iso(row["last_processed_at"]), frame_age_seconds=age,
+                                    processed_fps=fps, processing_age_p95_seconds=start_p95,
+                                    completion_age_p95_seconds=end_p95, reasons=sorted(failures)))
+            if covered_directions(row["role"] for row in self._cameras.values()) != {"ENTRY", "EXIT"}:
+                reasons.add("CAMERA_UNCONFIGURED")
             self.transition("models", () if models_ready else ("AI_UNAVAILABLE",), at=utc, mono=now)
             for fault_reasons in self._technical_faults.values():
                 reasons.update(fault_reasons)
             if self._pending_writes:
                 reasons.add("PERSISTENCE_ERROR")
-            technical = not reasons and len(roles) == 2
+            technical = not reasons and bool(cameras)
             if not technical:
                 self._healthy_since = None
             elif self._healthy_since is None:
@@ -249,7 +254,7 @@ class AttendanceHealth:
                 admission_reasons.add("COMMISSIONING_REQUIRED")
             if self._clock_blocked:
                 admission_reasons.add("CLOCK_DISCONTINUITY")
-            return dict(roles=roles, providers=copy.deepcopy(self._providers), reasons=sorted(admission_reasons),
+            return dict(cameras=cameras, providers=copy.deepcopy(self._providers), reasons=sorted(admission_reasons),
                         technical_reasons=sorted(reasons),
                         technical_ready=technical, automatic_ready=automatic,
                         technically_healthy_seconds=0. if self._healthy_since is None else max(0., now - self._healthy_since),

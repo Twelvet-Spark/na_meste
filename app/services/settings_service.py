@@ -3,11 +3,9 @@ import logging
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
 from pydantic_settings import SecretsSettingsSource
 
 from app.config import BASE_DIR, Settings
-from app.database.models import Camera
 from app.operator_settings import (
     EDITABLE, SECRET, WRITE_LOCK, OverrideError, dotenv_fields, environment_fields,
     read_document, replace_document, settings_path, source_fields, validate_values,
@@ -100,15 +98,6 @@ class SettingsService:
             merged = {key: value for key, value in stored.items() if key not in reset_keys}
             merged.update(changes)
             pending = self._effective(merged)
-            ids = pending.ai_camera_ids()
-            if ids:
-                try:
-                    with Session(self.engine) as db:
-                        existing = {row[0] for row in db.query(Camera.id).filter(Camera.id.in_(ids))}
-                except Exception:
-                    raise HTTPException(503, "OPERATOR_SETTINGS_CAMERAS_UNAVAILABLE") from None
-                if ids != existing:
-                    raise HTTPException(422, "OPERATOR_SETTINGS_AI_CAMERAS_NOT_FOUND")
             result = self._snapshot(merged, version, pending)
             try:
                 result["version"] = replace_document(self.path, merged, version, Settings)

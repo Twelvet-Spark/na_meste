@@ -17,6 +17,8 @@ from unittest.mock import patch
 import onnx
 from onnx import TensorProto, helper
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 SOURCE = Path(__file__).resolve().parent.parent / "app" / "ai" / "model_bundle.py"
 spec = importlib.util.spec_from_file_location("model_bundle_under_test", SOURCE)
 subject = importlib.util.module_from_spec(spec)
@@ -31,6 +33,7 @@ AURA_REV = "af6d057c9b0ec4071d4c49c80e3539258798b609"
 BODY_REV = "a5c5cc037c24235cda3b21085b93ad77c9616224"
 BODY_EXPORT_REV = "f8cd150fdf77e8d9e1ed143b7f308c2c609ded50"
 SCENE_REV = "f706ad9c4eb7f219c00d9050e46328518ffb65d2"
+OWLV2_REV = "cfd3195ba4ea9592eec887ded089f4c08eff231d"
 BODY_FILE = ("osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_"
              "b64_fb10_softmax_labsmth_flip_jitter.pth")
 
@@ -68,6 +71,8 @@ def contracts():
              tensor("has_mask_input", [1]), tensor("orig_im_size", [2])],
             [tensor("masks", [1, 4, "height", "width"]),
              tensor("iou_predictions", [1, 4]), tensor("low_res_masks", [1, 4, 256, 256])]),
+        "scene_detector": ([tensor("pixel_values", [1, 3, 960, 960])],
+                           [tensor("logits", [1, 3600, 20]), tensor("boxes", [1, 3600, 4])]),
     }
 
 
@@ -122,6 +127,10 @@ class BundleFixture:
                       f"https://raw.githubusercontent.com/ChaoningZhang/MobileSAM/{SCENE_REV}/weights/mobile_sam.pt",
                       SCENE_REV, SCENE_REV,
                       f"https://github.com/ChaoningZhang/MobileSAM/blob/{SCENE_REV}/LICENSE"),
+            "scene_detector": ("owlv2-rgb960-padsquare-clipnorm-v1", "Apache-2.0",
+                               f"https://huggingface.co/google/owlv2-base-patch16-ensemble/resolve/{OWLV2_REV}/model.safetensors",
+                               OWLV2_REV, OWLV2_REV,
+                               f"https://huggingface.co/google/owlv2-base-patch16-ensemble/blob/{OWLV2_REV}/README.md"),
         }
         for component, (preprocessing, license_id, url, revision, exporter, license_url) in provenance.items():
             files = []
@@ -142,7 +151,7 @@ class BundleFixture:
         self.save()
 
     def file(self, key):
-        component, role = ("scene", key[6:]) if key.startswith("scene_") else (key, "model")
+        component, role = ("scene", key[6:]) if key in ("scene_encoder", "scene_decoder") else (key, "model")
         return next(item for item in self.document["components"][component]["files"]
                     if item["role"] == role)
 
@@ -181,7 +190,7 @@ def expect_error(operation, code="MODEL_CONTRACT_INVALID", component=None):
 def isolated(bundle, component, status):
     assert bundle.component_status == {
         key: status if key == component else "READY"
-        for key in ("person", "face_detection", "face_recognition", "body", "scene")
+        for key in ("person", "face_detection", "face_recognition", "body", "scene", "scene_detector")
     }, bundle.component_status
     expect_error(lambda: bundle.require(component), status, component)
     for key in bundle.component_status:
@@ -225,6 +234,29 @@ def valid_graphs_expose_exact_paths_metadata_and_scene_encoder():
         int(bundle.bundle_id, 16)
         int(bundle.face_model_id, 16)
         expect_error(lambda: bundle.require("scene_decoder"), component="scene_decoder")
+
+@test
+def optional_scene_detector_can_be_absent_without_changing_existing_bundle_identity():
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = BundleFixture(Path(temporary))
+        del fixture.document["components"]["scene_detector"]
+        bundle = fixture.load()
+        assert bundle.component_status["scene_detector"] == "NOT_INSTALLED"
+        assert all(bundle.component_status[key] == "READY" for key in fixture.document["components"])
+        expect_error(lambda: bundle.require("scene_detector"), "MODEL_COMPONENT_MISSING", "scene_detector")
+        identity = subject._identifier(fixture.document, fixture.document["components"])
+        assert bundle.bundle_id == identity
+
+
+@test
+def declared_scene_detector_rejects_wrong_output_shapes():
+    with tempfile.TemporaryDirectory() as temporary:
+        fixture = BundleFixture(Path(temporary))
+        outputs = [tensor("logits", [1, 3600, 19]), tensor("boxes", [1, 3600, 4])]
+        fixture.file("scene_detector")["outputs"] = outputs
+        fixture.replace_graph("scene_detector", outputs=outputs)
+        isolated(fixture.load(), "scene_detector", "MODEL_CONTRACT_INVALID")
+
 
 
 @test

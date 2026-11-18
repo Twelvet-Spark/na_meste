@@ -28,16 +28,17 @@ def document():
     image = io.BytesIO()
     Image.new("RGB", (112, 112), "navy").save(image, "JPEG")
     return {
-        "transfer_version": 2, "exported_at": "2026-11-16T10:00:00+00:00",
-        "attendance_schema_version": 1, "operator_schema_version": 4,
+        "transfer_version": 3, "exported_at": "2026-11-16T10:00:00+00:00",
+        "attendance_schema_version": 2, "operator_schema_version": 5,
         "face_model_id": MODEL_ID, "embedding_encoding": "float32-le-512",
         "cameras": [{"id": 7, "name": "Магазин", "nvr_host": "127.0.0.1", "rtsp_port": 554,
                      "username": "viewer", "password": "sentinel-device-password", "channel": 2,
                      "stream_type": "sub", "enabled": True, "created_at": "2026-01-01T00:00:00Z",
                      "updated_at": "2026-01-02T00:00:00Z"}],
         "archives": [{"camera_id": 7, "http_scheme": "http", "http_port": 80, "utc_offset_minutes": 180}],
-        "calibrations": [{"camera_id": 7, "role": "ENTRY", "line_start": [0.2, 0.3],
+        "calibrations": [{"camera_id": 7, "role": "BOTH", "line_start": [0.2, 0.3],
                           "line_end": [0.8, 0.3], "inside_point": [0.5, 0.9],
+                          "door_kind": "DOOR", "door_top": [[0.2, 0.1], [0.8, 0.1]],
                           "reference_width": 640, "reference_height": 480}],
         "workplaces": [{"id": 9, "name": "Москва", "active": False}],
         "employees": [{"id": 4, "name": "Legacy Имя", "first_name": None, "last_name": None,
@@ -49,13 +50,32 @@ def document():
                    "face_model_id": MODEL_ID, "alignment_id": ALIGNMENT_ID}],
         "assignments": [{"employee_id": 4, "workplace_id": 9}],
         "scenes": [{"camera_id": 7, "reference_width": 1920, "reference_height": 1080,
-                    "geometry": {"version": 1, "floor": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
-                                 "objects": [], "metric": None}}],
+                    "geometry": {"version": 2, "floor": [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+                                 "objects": [],
+                                 "doors": [{"id": "00000000-0000-4000-8000-0000000000d1", "label": "Вход",
+                                            "kind": "DOOR",
+                                            "quad": [[0.4, 0.8], [0.6, 0.8], [0.6, 0.2], [0.4, 0.2]]}],
+                                 "metric": None}}],
+        "profiles": [{"camera_id": 7, "workplace_id": 9, "zone": "ENTRANCE", "ai_enabled": True, "ai_fps": 2.5}],
     }
 
 
-def legacy_document():
+def v2_document():
+    """The previous contract: one-direction gates and scenes without doors."""
     data = document()
+    data.update(transfer_version=2, attendance_schema_version=1, operator_schema_version=4)
+    del data["profiles"]
+    calibration = data["calibrations"][0]
+    calibration.update(role="ENTRY")
+    del calibration["door_kind"], calibration["door_top"]
+    geometry = data["scenes"][0]["geometry"]
+    geometry.update(version=1)
+    del geometry["doors"]
+    return data
+
+
+def legacy_document():
+    data = v2_document()
     data.update(transfer_version=1, operator_schema_version=3, embedding_model="buffalo_l")
     del data["face_model_id"]
     del data["scenes"]
@@ -95,7 +115,8 @@ def roundtrip_preserves_setup_and_hides_credentials():
     assert result.cameras[0].password == "sentinel-device-password"
     assert result.workplaces[0].active is False
     assert result.employees[0].first_name is None
-    assert result.counts().model_dump() == {"cameras": 1, "workplaces": 1, "employees": 1, "faces": 1, "assignments": 1, "scenes": 1}
+    assert result.counts().model_dump() == {"cameras": 1, "workplaces": 1, "employees": 1, "faces": 1,
+                                            "assignments": 1, "scenes": 1, "profiles": 1}
 
 
 @test
@@ -113,7 +134,7 @@ def password_and_corruption_are_authenticated():
 
 @test
 def schema_model_and_unknown_fields_fail_closed():
-    for key, value in (("transfer_version", 3), ("operator_schema_version", 999),
+    for key, value in (("transfer_version", 4), ("operator_schema_version", 999),
                        ("attendance_schema_version", 999), ("face_model_id", "2" * 64),
                        ("embedding_encoding", "pickle"), ("videos", [])):
         data = document()
@@ -239,7 +260,7 @@ def provenance_is_paired_and_every_populated_sample_must_match():
 @test
 def scenes_accept_only_bounded_normalized_geometry_without_runtime_state():
     mutations = [
-        lambda g: g.update(version=2),
+        lambda g: g.update(version=1),
         lambda g: g.update(version=True),
         lambda g: g.update(snapshot_id="secret"),
         lambda g: g.update(floor=[[0., 0.], [1., 0.]]),
@@ -276,6 +297,52 @@ def scenes_accept_only_bounded_normalized_geometry_without_runtime_state():
     data = document()
     data["scenes"].append(copy.deepcopy(data["scenes"][0]))
     refused(lambda: parse(data), "TRANSFER_INVALID")
+
+
+@test
+def v2_documents_keep_their_contract_and_have_no_profiles():
+    data = v2_document()
+    restored = parse(data)
+    assert restored.transfer_version == 2 and restored.counts().profiles == 0
+    assert restored.scenes[0].geometry.version == 1
+    data["scenes"][0]["geometry"]["version"] = 2
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = v2_document()
+    data["calibrations"][0]["role"] = "BOTH"
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = v2_document()
+    data["profiles"] = []
+    refused(lambda: parse(data), "TRANSFER_INVALID")
+
+
+@test
+def doors_profiles_and_gate_frames_are_validated():
+    mutations = [
+        lambda d: d["calibrations"][0].update(door_top=[[0.2, 0.5], [0.8, 0.1]]),
+        lambda d: d["calibrations"][0].update(door_top=[[0.2, 0.1]]),
+        lambda d: d["calibrations"][0].update(door_kind="GATE"),
+        lambda d: d["calibrations"][0].update(door_kind=None),
+        lambda d: d["calibrations"][0].update(role="NEITHER"),
+        lambda d: d["scenes"][0]["geometry"]["doors"][0].update(quad=[[0.4, 0.8], [0.6, 0.8], [0.6, 0.9], [0.4, 0.2]]),
+        lambda d: d["scenes"][0]["geometry"]["doors"][0].update(kind="GATE"),
+        lambda d: d["scenes"][0]["geometry"]["doors"].extend(
+            [dict(d["scenes"][0]["geometry"]["doors"][0], id=f"00000000-0000-4000-8000-{i:012d}") for i in range(8)]),
+        lambda d: d["scenes"][0]["geometry"].pop("doors"),
+        lambda d: d["profiles"][0].update(workplace_id=999),
+        lambda d: d["profiles"][0].update(zone="OUTSIDE"),
+        lambda d: d["profiles"][0].update(ai_fps=30.5),
+        lambda d: d["profiles"][0].update(ai_fps=0),
+        lambda d: d["profiles"][0].update(camera_id=999),
+        lambda d: d["profiles"].append(copy.deepcopy(d["profiles"][0])),
+        lambda d: d.pop("profiles"),
+    ]
+    for mutation in mutations:
+        data = document()
+        mutation(data)
+        refused(lambda: parse(data), "TRANSFER_INVALID")
+    data = document()
+    data["profiles"][0].update(workplace_id=None, ai_fps=None)
+    assert parse(data).profiles[0].ai_fps is None
 
 
 if __name__ == "__main__":

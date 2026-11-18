@@ -12,6 +12,7 @@ from datetime import datetime
 
 import numpy as np
 
+from app.attendance_roles import ROLE_DIRECTIONS
 from app.ai.face_quality import quality_reasons
 from app.ai.recognition_service import FaceEvidence, FrameOutcome
 from app.config import settings
@@ -39,8 +40,8 @@ class DoorwayCalibration:
     _normal: tuple[float, float] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        if self.role not in ("ENTRY", "EXIT"):
-            raise ValueError("Role must be ENTRY or EXIT")
+        if self.role not in ROLE_DIRECTIONS:
+            raise ValueError("Role must be ENTRY, EXIT or BOTH")
         if (self.reference_width <= 0 or self.reference_height <= 0
                 or self.revision < 0 or self.source_revision < 1):
             raise ValueError("Invalid reference dimensions or revisions")
@@ -342,7 +343,7 @@ class DoorwayDetector:
             if side and track.side_hits >= 2:
                 if track.armed_side and side != track.armed_side and track.bracket is not None:
                     direction = "ENTRY" if side > 0 else "EXIT"
-                    if direction == calibration.role:
+                    if direction in ROLE_DIRECTIONS[calibration.role]:
                         track.ordinal += 1
                         bracket = track.bracket
                         bracket.after_jpeg, bracket.after_crop = _context(point)

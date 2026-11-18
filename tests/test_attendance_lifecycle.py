@@ -86,11 +86,13 @@ class Clock:
 def health_for(service, clock):
     health = AttendanceHealth(now=clock.utcnow, monotonic=clock.monotonic)
     health.set_providers(CUDA_PROVIDERS)
-    for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
-        health.configure_role(role, camera_id=camera_id, source_revision=2,
-                              enabled=True, online=True, included=True)
+    health.configure_cameras([(1, "ENTRY", 2, True, True, True), (2, "EXIT", 2, True, True, True)])
     service.health = health
     return health
+
+
+def camera_row(health, camera_id):
+    return next(row for row in health.snapshot()["cameras"] if row["camera_id"] == camera_id)
 
 
 def packet(clock, camera_id=1, seq=1, *, age=0., stream=None):
@@ -103,8 +105,8 @@ def process_metrics(health, clock, seq, *, age=.02, completion=.05):
     # The injected clock is observation/completion time, never an instant before
     # a supposedly successful frame finished. Preserve receipt→start and
     # receipt→completion ages while backdating that frame's receipt and start.
-    for role, camera_id in (("ENTRY", 1), ("EXIT", 2)):
-        health.record_frame(role, packet(clock, camera_id, seq, age=age + completion),
+    for camera_id in (1, 2):
+        health.record_frame(camera_id, packet(clock, camera_id, seq, age=age + completion),
                             tracking_generation=f"generation-{camera_id}",
                             started_mono=clock.mono - completion,
                             completed_mono=clock.mono)
@@ -292,14 +294,14 @@ def test_metrics_use_trailing_window_not_warmup_extrapolation_and_include_comple
         clock = Clock()
         health = health_for(service, clock)
         process_metrics(health, clock, 1, age=.2, completion=.4)
-        entry = health.snapshot()["roles"]["ENTRY"]
+        entry = camera_row(health, 1)
         assert entry["camera_id"] == 1 and entry["stream_id"] == "stream-1"
         assert entry["source_revision"] == 2 and entry["tracking_generation"] == "generation-1"
         assert entry["processed_fps"] == .1
         assert abs(entry["processing_age_p95_seconds"] - .2) < 1e-9
         assert abs(entry["completion_age_p95_seconds"] - .6) < 1e-9
         clock.advance(10.1)
-        assert health.snapshot()["roles"]["ENTRY"]["processed_fps"] == 0
+        assert camera_row(health, 1)["processed_fps"] == 0
         assert not health.snapshot()["technical_ready"]
 
 
@@ -311,7 +313,7 @@ def test_performance_fault_requires_ten_healthy_seconds_to_recover():
         warm(health, clock)
         assert health.snapshot()["technical_ready"]
         warm(health, clock, seconds=12, completion=1.1)
-        assert "PERFORMANCE_DEGRADED" in health.snapshot()["roles"]["ENTRY"]["reasons"]
+        assert "PERFORMANCE_DEGRADED" in camera_row(health, 1)["reasons"]
         assert not health.snapshot()["technical_ready"]
         # P95 samples have a trailing-60-second lifetime; an old slow sample
         # cannot remain forever, nor can one fast frame clear sustained failure.
@@ -333,8 +335,7 @@ def test_missing_model_or_excluded_role_is_explicit_not_automatic_readiness():
         assert snapshot["providers"]["live_face_recognition"] == []
         assert not snapshot["technical_ready"] and "AI_UNAVAILABLE" in snapshot["reasons"]
         health.set_providers(CUDA_PROVIDERS)
-        health.configure_role("EXIT", camera_id=2, source_revision=2,
-                              enabled=True, online=True, included=False)
+        health.configure_cameras([(1, "ENTRY", 2, True, True, True), (2, "EXIT", 2, True, True, False)])
         assert not health.snapshot()["technical_ready"]
 
 
@@ -417,7 +418,7 @@ def test_reconnect_resets_warmed_technical_streak_even_after_fault_persistence()
         assert health.snapshot()["technically_healthy_seconds"] >= 10
         assert health.pending_faults() == ()
         clock.advance(.1)
-        health.record_frame("ENTRY", packet(clock, age=.07, stream="reconnected"),
+        health.record_frame(1, packet(clock, age=.07, stream="reconnected"),
                             tracking_generation="new-generation",
                             started_mono=clock.mono - .05, completed_mono=clock.mono)
         reset_faults = [item for item in health.pending_faults() if "STREAM_RESET" in item.reason_codes]
@@ -434,8 +435,8 @@ def test_reconnect_resets_warmed_technical_streak_even_after_fault_persistence()
                        for row in db.query(AttendanceCoverageGap))
         for seq in range(2, 104):
             clock.advance(.1)
-            for role, camera_id, stream in (("ENTRY", 1, "reconnected"), ("EXIT", 2, "stream-2")):
-                health.record_frame(role, packet(clock, camera_id, seq, age=.07, stream=stream),
+            for camera_id, stream in ((1, "reconnected"), (2, "stream-2")):
+                health.record_frame(camera_id, packet(clock, camera_id, seq, age=.07, stream=stream),
                                     tracking_generation="new-generation" if camera_id == 1 else "generation-2",
                                     started_mono=clock.mono - .05, completed_mono=clock.mono)
             health.snapshot()
@@ -502,7 +503,7 @@ def test_threshold_fingerprint_change_revokes_but_gallery_and_same_source_reconn
             assert commission_id is not None
         with immediate_session(engine) as db:
             db.get(AttendanceRuntime, 1).gallery_revision += 1
-        health.record_frame("ENTRY", packet(clock, stream="reconnected"),
+        health.record_frame(1, packet(clock, stream="reconnected"),
                             tracking_generation="new-generation", started_mono=clock.mono,
                             completed_mono=clock.mono + .05)
         monitor.tick()
