@@ -1545,9 +1545,9 @@ def instrument_pipeline(service, state, journal, reid, accounting):
     service.process_batch = measured_batch
     update = state.update
     def published(camera_id, detections, *, packet=None, generation=None, configuration=None,
-                  identities=None, person_detections=()):
+                  identities=None, person_detections=(), learning_revision=None):
         update(camera_id, detections, packet=packet, generation=generation, configuration=configuration,
-               identities=identities, person_detections=person_detections)
+               identities=identities, person_detections=person_detections, learning_revision=learning_revision)
         if packet is not None:
             accounting.published(camera_id, packet, generation, time.monotonic())
     state.update = published

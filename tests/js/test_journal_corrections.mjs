@@ -23,13 +23,19 @@ get('identity-mode').value = 'UNKNOWN';
 get('sample-source').value = 'ALIGNED_FACE';
 const attempts = [];
 let rejectIdentity = true, sequence = 0, photoError = null, sampleItems = [], historyReads = 0;
+const learningRequests = [], learningEvents = [];
+let learningError = null, learningResponse = null;
 let deferEmployees = false;
 const employeeRequests = [];
 const context = {
   console, Event: class {}, CustomEvent: class {},
   Option: class { constructor(text, value) { this.textContent = text; this.value = value; } },
   document: { getElementById: get, createElement: (name) => new Node(name) },
-  window: { addEventListener() {}, CameraCrop: { nativeCrop: () => null }, OperatorUI: {
+  window: { addEventListener() {}, CameraCrop: { nativeCrop: () => null }, JournalLearning: {
+    update() {}, sync() {}, invalidate() {},
+    onMutationResult(result, frozen) { learningEvents.push({ result, frozen }); },
+    onMutationError(error, meta) { learningEvents.push({ error, uncertain: meta.uncertain }); },
+  }, OperatorUI: {
     newRequestId: () => `request-${++sequence}`,
     message: (node, text) => { node.textContent = text; },
     api: async (url, options) => {
@@ -50,7 +56,13 @@ const context = {
       if (url.endsWith('/identity')) {
         attempts.push(options.body);
         if (rejectIdentity) throw Object.assign(new Error('Unavailable'), { status: 503 });
-        return { employee_id: null, employee_name: null, identity_revision: 1, identity_source: 'OPERATOR', identity_state: 'OPERATOR_UNKNOWN' };
+        return { employee_id: null, employee_name: null, identity_revision: 1, identity_source: 'OPERATOR',
+          identity_state: 'OPERATOR_UNKNOWN', revoked_feedback_ids: ['old-crop'], removed_face_ids: [3] };
+      }
+      if (url.endsWith('/learning/feedback') || url.endsWith('/revoke')) {
+        learningRequests.push({ url, body: options.body });
+        if (learningError) throw Object.assign(new Error('Learning failed'), learningError);
+        return learningResponse;
       }
       return { items: [] };
     },
@@ -93,6 +105,8 @@ await get('identity-form').onsubmit({ preventDefault() {} });
 assert.equal(attempts.length, 2);
 assert.equal(attempts[0], attempts[1], 'Retry must retain the complete original payload and request ID');
 assert.equal(JSON.parse(attempts[1]).mode, 'UNKNOWN');
+assert.match(get('identity-status').textContent, /Связанное обучение отменено/);
+assert.doesNotMatch(get('identity-status').textContent, /Фотографии и часы не изменены/);
 assert.equal(controller.locked(), false);
 console.log('Journal millisecond inputs, refresh ownership, independent expiry, and frozen retry checks passed.');
 
@@ -155,3 +169,40 @@ await first;
 check('Stale employee response is ignored', () => assert.match(get('sample-employee-status').textContent, /New selection/));
 assert.deepEqual(failures, []);
 console.log('Photo availability, definite failures, stale selection, input isolation, and removal audit checks passed.');
+
+controller.setLearningAnalyzing(true);
+assert.equal(controller.learningState().analyzing, true);
+assert.equal(controller.locked(), false, 'Read-only analysis must not lock identity, time, or navigation');
+controller.setLearningAnalyzing(false);
+const learning = { url: '/api/global-persons/visits/visit/learning/feedback',
+  options: { body: new Blob(['immutable original crop']) } };
+learningError = { status: 503, detail: { code: 'BODY_MODEL_UNAVAILABLE' } };
+await controller.mutateLearning(learning);
+assert.equal(controller.learningState().pending, false);
+assert.equal(controller.locked(), false);
+assert.equal(learningEvents.at(-1).uncertain, false);
+learningError = { status: 503, detail: { code: 'ENROLLMENT_BUSY' } };
+await controller.mutateLearning(learning);
+assert.equal(controller.learningState().pending, true);
+assert.equal(controller.locked(), true);
+learningError = null;
+learningResponse = { identity: null, historical_hours_changed: false };
+await controller.mutateLearning({ url: learning.url, options: { body: new Blob(['different selected file']) } });
+assert.equal(learningRequests.at(-1).body, learning.options.body);
+assert.equal(learningEvents.at(-1).frozen.url, learning.url);
+assert.equal(controller.locked(), false);
+learningError = { status: 409, detail: { code: 'LEARNING_CONFLICT' } };
+await controller.mutateLearning(learning);
+assert.equal(controller.learningState().pending, false);
+assert.equal(learningEvents.at(-1).uncertain, false);
+learningError = null;
+const originalRevision = visit.identity_revision;
+learningResponse = { identity: { visit_id: 'different-visit', identity_revision: 88 } };
+const revoke = { url: '/api/recognition-learning/frozen-receipt/revoke', options: { body: '{}' } };
+await controller.mutateLearning(revoke);
+assert.equal(learningRequests.at(-1).url, revoke.url);
+assert.equal(visit.identity_revision, originalRevision, 'Undo may not project another visit onto the open one');
+learningResponse = { identity: { visit_id: 'visit', identity_revision: 89 } };
+await controller.mutateLearning(revoke);
+assert.equal(visit.identity_revision, 89);
+console.log('Learning read/isolation locks, definitive errors, frozen upload retry and undo projection passed.');

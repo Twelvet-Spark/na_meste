@@ -31,6 +31,7 @@ from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
 from app.api.workplaces import router as workplaces_router
 from app.api.global_persons import router as global_persons_router
+from app.api.recognition_learning import router as recognition_learning_router
 from app.api.recordings import router as recordings_router
 from app.api.settings import router as settings_router
 from app.api.debug import router as debug_router
@@ -304,6 +305,7 @@ app.include_router(cameras_router)
 app.include_router(scenes_router)
 app.include_router(employees_router)
 app.include_router(workplaces_router)
+app.include_router(recognition_learning_router)
 app.include_router(global_persons_router)
 app.include_router(attendance_router)
 app.include_router(recordings_router)

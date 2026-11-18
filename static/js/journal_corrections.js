@@ -5,7 +5,8 @@
   const root = $('visit-detail');
   if (!root) return;
   const endpoint = `/api/global-persons/visits/${encodeURIComponent(root.dataset.visitId)}`;
-  const states = Object.fromEntries(['identity', 'sample', 'time'].map((name) => [name, { busy: false, pending: null }]));
+  const correctionNames = ['identity', 'sample', 'time'];
+  const states = Object.fromEntries([...correctionNames, 'learning'].map((name) => [name, { busy: false, pending: null }]));
   const errors = {
     FACE_MODEL_UNAVAILABLE: 'Модель лиц недоступна. Добавление фото отключено; исправление личности и удаление образцов доступны. Проверьте диагностику и обновите наблюдение после восстановления модели.',
     ENROLLMENT_UNAVAILABLE: 'Подготовка фото недоступна. Исправление личности и удаление образцов доступны. Проверьте диагностику и обновите наблюдение.',
@@ -35,9 +36,12 @@
   let visit = null, digests = {}, employees = [], employee = null, employeeVersion = 0, employeeLoading = false;
   let selection = [0, 0, 1, 1], drag = null, uploadFile = null, uploadURL = null, uploadVersion = 0;
   let preview = null, previewBusy = false, previewVersion = 0, offset = null, historyVersion = 0, refreshBusy = false;
+  let learningAnalyzing = false;
   const bounds = ['sample-x1', 'sample-y1', 'sample-x2', 'sample-y2'].map($);
   const locked = () => refreshBusy || Object.values(states).some((state) => state.busy || state.pending) || previewBusy;
-  const blocked = (name) => refreshBusy || states[name].busy || Boolean(states[name].pending);
+  const occupied = (name) => states[name].busy || Boolean(states[name].pending);
+  const learningBlocked = () => refreshBusy || previewBusy || correctionNames.some(occupied);
+  const blocked = (name) => refreshBusy || occupied(name) || (name !== 'learning' && occupied('learning'));
   const message = (name, text, error = false) => UI.message($(name + '-status'), text, error ? 'err' : '');
   const stamp = (value) => value ? value.replace('T', ' ') : '—';
   const errorText = (error) => errors[error.detail?.code] || error.message;
@@ -62,19 +66,19 @@
     }
   }
   function sync() {
-    for (const name of Object.keys(states)) {
+    for (const name of correctionNames) {
       $(name + '-fields').disabled = blocked(name) || !visit;
       $(name + '-form').setAttribute('aria-busy', String(states[name].busy));
       for (const button of $(name + '-history').querySelectorAll('button')) button.disabled = blocked(name) || !visit;
     }
     const identityPending = states.identity.pending;
-    $('identity-submit').disabled = refreshBusy || states.identity.busy || !visit || (!identityPending && $('identity-mode').value === 'EMPLOYEE' && !$('identity-employee').value);
+    $('identity-submit').disabled = refreshBusy || occupied('learning') || states.identity.busy || !visit || (!identityPending && $('identity-mode').value === 'EMPLOYEE' && !$('identity-employee').value);
     $('identity-submit').textContent = identityPending ? 'Повторить тот же запрос' : 'Сохранить личность';
     $('identity-employee').disabled = $('identity-mode').value !== 'EMPLOYEE';
     $('identity-search').disabled = $('identity-mode').value !== 'EMPLOYEE';
     const chosen = employees.find((row) => String(row.id) === $('identity-employee').value);
     $('identity-employee-status').textContent = chosen && !chosen.active ? 'Сотрудник неактивен. Историческое исправление разрешено; оно не включает сотрудника.' : '';
-    $('sample-submit').disabled = refreshBusy || states.sample.busy || !visit || (!states.sample.pending && (!visit.enrollment_available || employeeLoading || !employee || employee.faces_count >= 15 || !sourceReady() || !$('sample-confirm').checked));
+    $('sample-submit').disabled = refreshBusy || occupied('learning') || states.sample.busy || !visit || (!states.sample.pending && (!visit.enrollment_available || employeeLoading || !employee || employee.faces_count >= 15 || !sourceReady() || !$('sample-confirm').checked));
     $('sample-submit').textContent = states.sample.pending ? 'Повторить тот же запрос' : 'Добавить образец';
     $('sample-reconcile').disabled = blocked('sample') || employeeLoading;
     $('sample-employee').disabled = employeeLoading;
@@ -83,25 +87,31 @@
     $('time-fields').disabled = blocked('time') || previewBusy || !visit;
     $('time-preview').disabled = blocked('time') || previewBusy || !visit?.employee_id;
     $('time-confirm').disabled = blocked('time');
-    $('time-apply').disabled = refreshBusy || states.time.busy || previewBusy || (!states.time.pending && (!preview || !$('time-confirm').checked));
+    $('time-apply').disabled = refreshBusy || occupied('learning') || states.time.busy || previewBusy || (!states.time.pending && (!preview || !$('time-confirm').checked));
     $('time-apply').textContent = states.time.pending ? 'Повторить тот же запрос' : 'Применить изменение часов';
     $('time-owner').textContent = visit?.employee_id ? `Сотрудник: ${visit.employee_name}. Версия личности: ${visit.identity_revision}.` : 'Сначала укажите сотрудника в разделе «Кто на изображении».';
     $('time-retry').hidden = !states.time.pending;
-    $('time-retry').disabled = states.time.busy;
+    $('time-retry').disabled = occupied('learning') || states.time.busy;
     root.dispatchEvent(new Event('journal-lock'));
+    window.JournalLearning?.sync();
   }
   async function mutate(name, request) {
     const state = states[name];
-    if (state.busy || refreshBusy) return;
-    if (!state.pending) state.pending = Object.freeze(request);
+    if (state.busy || refreshBusy || (name === 'learning'
+      ? learningBlocked() || (!state.pending && learningAnalyzing)
+      : occupied('learning'))) return;
+    if (!state.pending && request) state.pending = Object.freeze({ ...request, options: Object.freeze({ ...request.options }) });
     const frozen = state.pending;
     if (!frozen) return;
     state.busy = true; sync(); message(name, 'Сохраняем… Не закрывайте страницу до подтверждения.');
     let result;
     try {
-      result = await UI.api(endpoint + frozen.path, { method: 'POST', ...frozen.options });
+      result = await UI.api(frozen.url, { method: 'POST', ...frozen.options });
     } catch (error) {
-      const unavailable = name === 'sample' && error.status === 503 && ['FACE_MODEL_UNAVAILABLE', 'ENROLLMENT_UNAVAILABLE'].includes(error.detail?.code);
+      const code = error.detail?.code;
+      const unavailable = error.status === 503 && (
+        (name === 'sample' && ['FACE_MODEL_UNAVAILABLE', 'ENROLLMENT_UNAVAILABLE'].includes(code))
+        || (name === 'learning' && ['BODY_MODEL_UNAVAILABLE', 'ENROLLMENT_UNAVAILABLE'].includes(code)));
       const uncertain = !unavailable && (!error.status || error.status < 400 || error.status === 408 || error.status >= 500);
       if (uncertain) message(name, errorText(error) + ' Результат не подтверждён. Повторите тот же запрос: сотрудник, данные и номер запроса зафиксированы. Не обновляйте страницу.', true);
       else {
@@ -122,24 +132,42 @@
         loadHistory();
         if (error.status === 409) loadEmployee();
       }
+      if (name === 'learning') window.JournalLearning?.onMutationError(error, { uncertain });
       sync(); return;
     }
     state.pending = null; state.busy = false;
     if (name === 'identity') {
       Object.assign(visit, result); root.dispatchEvent(new CustomEvent('journal-identity', { detail: result }));
-      invalidatePreview(); message(name, 'Личность в журнале сохранена. Фотографии и часы не изменены.');
+      invalidatePreview();
+      window.JournalLearning?.invalidate();
+      message(name, result.revoked_feedback_ids?.length
+        ? 'Личность в журнале сохранена. Связанное обучение отменено. Прошлые часы не изменены.'
+        : 'Личность в журнале сохранена. Фотографии и часы не изменены.');
     } else if (name === 'sample') {
       $('sample-confirm').checked = false;
       employee = null;
-      message(name, frozen.path.endsWith('/remove') ? 'Образец удалён из галереи. Личность в журнале и часы не изменены.' : 'Образец принят в галерею для следующих узнаваний. Прежние фотографии сохранены; точность узнавания не гарантируется.');
+      message(name, frozen.url.endsWith('/remove') ? 'Образец удалён из галереи. Личность в журнале и часы не изменены.' : 'Образец принят в галерею для следующих узнаваний. Прежние фотографии сохранены; точность узнавания не гарантируется.');
       loadEmployee();
+      window.JournalLearning?.invalidate();
+    } else if (name === 'learning') {
+      if (visit) {
+        for (const key of ['learning_revision', 'gallery_revision']) {
+          if (Number.isSafeInteger(result[key])) visit[key] = Math.max(visit[key] ?? 0, result[key]);
+        }
+        if (result.identity?.visit_id === root.dataset.visitId) {
+          Object.assign(visit, result.identity);
+          root.dispatchEvent(new CustomEvent('journal-identity', { detail: result.identity }));
+          invalidatePreview();
+        }
+      }
+      window.JournalLearning?.onMutationResult(result, frozen);
     } else {
-      invalidatePreview(); message(name, frozen.path.endsWith('/undo') ? 'Связанные исправления часов отменены. Другие записи сохранены.' : 'Показанное исправление часов применено. Проверьте итоговый отчёт.');
+      invalidatePreview(); message(name, frozen.url.endsWith('/undo') ? 'Связанные исправления часов отменены. Другие записи сохранены.' : 'Показанное исправление часов применено. Проверьте итоговый отчёт.');
     }
     sync(); loadHistory();
   }
   function jsonRequest(path, payload) {
-    return { path, options: { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) } };
+    return { url: endpoint + path, options: { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) } };
   }
   function optionsFor(name) {
     const select = $(name + '-employee'), chosen = select.value;
@@ -297,7 +325,7 @@
     if (source === 'PHOTO_CROP') Object.assign(payload, { crop: [...selection], photo_sha256: digests.photo });
     const body = new FormData(); body.append('metadata', JSON.stringify(payload));
     if (source === 'UPLOAD') body.append('file', uploadFile.blob, uploadFile.name);
-    mutate('sample', { path: '/employee-photo', options: { body } });
+    mutate('sample', { url: endpoint + '/employee-photo', options: { body } });
   };
   $('time-form').onsubmit = async (event) => {
     event.preventDefault(); if (blocked('time') || previewBusy || !visit?.employee_id) return;
@@ -360,7 +388,11 @@
   $('time-retry').onclick = () => mutate('time');
   window.JournalCorrections = {
     locked,
-    samplePending: () => blocked('sample'),
+    samplePending: () => refreshBusy || occupied('sample'),
+    mutateLearning: (request) => mutate('learning', request),
+    learningState: () => ({ busy: states.learning.busy, pending: Boolean(states.learning.pending),
+      loading: learningBlocked(), analyzing: learningAnalyzing }),
+    setLearningAnalyzing(value) { learningAnalyzing = Boolean(value); sync(); },
     setLoading(value) { refreshBusy = value; sync(); },
     update(value, imageDigests, { evidenceOnly = false } = {}) {
       visit = value; digests = { ...imageDigests };
@@ -378,6 +410,7 @@
         $('time-zone').textContent = `Время организации: UTC${offset === 'Z' ? '+00:00' : offset}, не часовой пояс браузера. Интервал не расширяется автоматически.`;
       }
       if (!evidenceOnly) invalidatePreview();
+      window.JournalLearning?.update(visit, digests, { evidenceOnly });
       sync(); loadHistory();
     },
   };

@@ -14,7 +14,8 @@ class PhotoUploadRoute(APIRoute):
         handler = super().get_route_handler()
 
         async def bounded(request):
-            single = request.method == "POST" and self.path.endswith("/employee-photo")
+            single = request.method == "POST" and self.path.endswith(
+                ("/employee-photo", "/learning/analyze", "/learning/feedback"))
             upload = single or (request.method == "POST" and self.path == "/api/employees") or (
                 request.method == "PUT" and self.path.endswith("/faces"))
             if not upload:

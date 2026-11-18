@@ -339,6 +339,10 @@ class RecognitionLearningService:
     def model_available(self) -> bool:
         return not self._closed and self._models()[0] is not None
 
+    def model_ids(self) -> tuple[str | None, str | None]:
+        """Exact usable native (body, face) model IDs now; None for an unavailable modality."""
+        return (None, None) if self._closed else self._models()
+
     def close(self) -> None:
         """Refuse new native work and drain the one owned executor."""
         with self._lifecycle:
@@ -718,12 +722,13 @@ class RecognitionLearningService:
                 RecognitionExample.model_id == body_model)}
             duplicate = next((value for value in same if value in current), None)
             if duplicate is not None:
-                raise _error(409, "LEARNING_DUPLICATE", feedback_id=duplicate)
-        conflicts = [row.id for row in rows if (
+                raise _error(409, "LEARNING_DUPLICATE", feedback_id=duplicate, employee_id=payload.employee_id)
+        conflicts = [row for row in rows if (
             (row.employee_id == payload.employee_id and row.action != payload.action)
             or (payload.action == "ACCEPT" and row.action == "ACCEPT" and row.employee_id != payload.employee_id))]
         if conflicts:
-            raise _error(409, "LEARNING_CONFLICT", feedback_ids=conflicts)
+            raise _error(409, "LEARNING_CONFLICT", feedback_ids=[row.id for row in conflicts],
+                         feedback_owners={row.id: row.employee_id for row in conflicts})
 
     @staticmethod
     def _active_examples(db, employee_id: int, modality: str, polarity: str) -> int:
@@ -830,7 +835,7 @@ class RecognitionLearningService:
         return body, self.face_model_id if _is_sha(self.face_model_id) else None
 
     def history(self, *, visit_id: str | None = None, employee_id: int | None = None,
-                cursor: str | None = None, limit: int = 50) -> dict:
+                cursor: str | None = None, limit: int = 50, feedback_id: str | None = None) -> dict:
         """Newest-first feedback of one visit or one employee; no image or vector bytes are read."""
         if (visit_id is None) == (employee_id is None):
             raise _error(422, "LEARNING_HISTORY_SCOPE")
@@ -840,13 +845,16 @@ class RecognitionLearningService:
             visit_id = _uuid(visit_id, "VISIT_NOT_FOUND")
         elif type(employee_id) is not int or not 0 < employee_id <= SQLITE_MAX:
             raise _error(422, "INVALID_EMPLOYEE_ID")
+        if feedback_id is not None:
+            feedback_id = _uuid(feedback_id, "LEARNING_FEEDBACK_NOT_FOUND")
         position = _decode_cursor(cursor) if cursor is not None else None
         try:
-            return read_snapshot(self.engine, lambda db: self._history(db, visit_id, employee_id, position, limit))
+            return read_snapshot(self.engine, lambda db: self._history(
+                db, visit_id, employee_id, position, limit, feedback_id))
         except SQLAlchemyError as exc:
             raise _error(503, "PERSISTENCE_ERROR") from exc
 
-    def _history(self, db, visit_id, employee_id, position, limit) -> dict:
+    def _history(self, db, visit_id, employee_id, position, limit, feedback_id) -> dict:
         feedback = RecognitionFeedback
         if visit_id is not None:
             if db.query(HumanVisit.id).filter(HumanVisit.id == visit_id).first() is None:
@@ -864,7 +872,9 @@ class RecognitionLearningService:
             feedback.image_jpeg.is_not(None).label("has_image"), Employee.name.label("employee_name"),
             Employee.active.label("employee_active"),
         ).join(Employee, Employee.id == feedback.employee_id).filter(scope)
-        if position is not None:
+        if feedback_id is not None:
+            query = query.filter(feedback.id == feedback_id)
+        elif position is not None:
             created, identifier = position
             query = query.filter(or_(feedback.created_at < created,
                                      and_(feedback.created_at == created, feedback.id < identifier)))

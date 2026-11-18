@@ -19,7 +19,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api.operator_security import require_operator_request
 from app.api.photo_upload import MAX_PHOTO_BYTES, PhotoUploadRoute
 from app.database.database import get_db
-from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision
+from app.database.models import (
+    AttendanceRuntime, Camera, Employee, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision,
+    RecognitionLearningRuntime)
+from app.services.recognition_learning_service import snapshot_captured_at
 from app.services.visit_identity_service import IdentityInput, RestoreIdentityInput, VisitIdentityService
 from app.services.visit_sample_service import VisitPhotoInput, RemoveVisitSampleInput
 from app.services.visit_time_service import VisitTimeService, VisitTimeInput, VisitTimeApplyInput, VisitTimeUndoInput
@@ -211,6 +214,19 @@ def api_get_visit(visit_id: UUID, request: Request, db: Session = Depends(get_db
     row = _query(db).filter(HumanVisit.id == str(visit_id)).one()
     result = _metadata(row, utcnow())
     service = getattr(request.app.state, "visit_sample_service", None)
+    learning = getattr(request.app.state, "recognition_learning_service", None)
+    body_model, face_model = learning.model_ids() if learning is not None else (None, None)
+    learning_revision = db.query(RecognitionLearningRuntime.revision).filter(
+        RecognitionLearningRuntime.id == 1).scalar()
+    gallery_revision = db.query(AttendanceRuntime.gallery_revision).filter(AttendanceRuntime.id == 1).scalar()
+    if learning is None:
+        learning_reason = "LEARNING_SERVICE_UNAVAILABLE"
+    elif learning_revision is None:
+        learning_reason = "LEARNING_RUNTIME_MISSING"
+    elif body_model is None:
+        learning_reason = "BODY_MODEL_UNAVAILABLE"
+    else:
+        learning_reason = None
     eligible, reason = service.eligibility(visit) if service is not None else (False, "FACE_MODEL_UNAVAILABLE")
     result.update(face_sha256=(hashlib.sha256(visit.face_thumbnail).hexdigest()
                                if result["face_status"] == "AVAILABLE" and visit.face_thumbnail else None),
@@ -219,6 +235,12 @@ def api_get_visit(visit_id: UUID, request: Request, db: Session = Depends(get_db
                   enrollment_available=service is not None and service.model_available())
     result["photo_sha256"] = (hashlib.sha256(visit.snapshot).hexdigest()
                               if result["photo_status"] == "AVAILABLE" and visit.snapshot else None)
+    result.update(
+        learning_available=learning_reason is None, learning_unavailable_reason=learning_reason,
+        learning_revision=learning_revision, gallery_revision=gallery_revision,
+        body_model_id=body_model, face_model_id=face_model,
+        photo_captured_at=_iso(snapshot_captured_at(db, visit.id, result["photo_sha256"]))
+        if result["photo_sha256"] else None)
     result["time_bounds"] = {"started_at": attendance_iso(milliseconds(visit.started_at)),
                              "ended_at": attendance_iso(milliseconds(visit.last_seen_at))}
     return result

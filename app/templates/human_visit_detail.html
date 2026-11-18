@@ -52,9 +52,72 @@
       <button class="btn" id="employees-retry" type="button" hidden>Повторить загрузку сотрудников</button>
       <details><summary>История личности и восстановление</summary><ol id="identity-history" class="attendance-audit"></ol></details>
     </section>
+    <section class="panel camera-sample learning-panel" aria-labelledby="learning-title" id="learning-panel">
+      <div class="panel-head"><h2 id="learning-title">Обучить по человеку</h2></div>
+      <p>Выберите одного человека на снимке, посмотрите сотрудников с похожей внешностью и подтвердите или отклоните сходство. Лицо не обязательно. Решение влияет только на следующие наблюдения; прошлые часы не меняются.</p>
+      <p class="field-help muted">Добавляйте несколько настоящих ракурсов сотрудника, особенно сверху, сзади и сбоку. Не загружайте один и тот же фрагмент повторно и не ждите, что сгенерированный портрет раскроет скрытые детали. Сходство — подсказка, а не вероятность личности.</p>
+      <p id="learning-unavailable" class="form-status" role="status" data-tone="error" hidden></p>
+      <fieldset id="learning-fields" class="plain-fieldset">
+        <legend class="sr-only">Обучение по выбранному человеку</legend>
+        <label class="field">Источник<select id="learning-source"><option value="PHOTO_CROP">Сохранённый снимок человека</option><option value="UPLOAD">Загрузить фотографию</option></select></label>
+        <p id="learning-evidence-note" class="field-help"></p>
+        <div id="learning-upload" hidden>
+          <label class="field">JPEG или PNG, до 15 МиБ<input id="learning-file" type="file" accept="image/jpeg,image/png"></label>
+          <label class="field">Когда сделан снимок (неизвестно — только подсказки)<input id="learning-captured-at" type="datetime-local" step="0.001"></label>
+          <p id="learning-captured-help" class="field-help"></p>
+        </div>
+        <p id="learning-captured-saved" class="field-help"></p>
+        <div>
+          <p>Выделите ровно одного человека мышью или задайте границы от 0 до 1. По умолчанию выбран весь снимок. Размер проверяется в исходных пикселях, без увеличения.</p>
+          <div class="sample-stage" id="learning-stage">
+            <img id="learning-image" alt="Снимок для выбора одного человека" draggable="false">
+            <svg viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true"><rect id="learning-selection" hidden></rect></svg>
+          </div>
+          <div class="sample-bounds">
+            <label class="field">Слева<input id="learning-x1" type="number" min="0" max="1" step="any" value="0"></label>
+            <label class="field">Сверху<input id="learning-y1" type="number" min="0" max="1" step="any" value="0"></label>
+            <label class="field">Справа<input id="learning-x2" type="number" min="0" max="1" step="any" value="1"></label>
+            <label class="field">Снизу<input id="learning-y2" type="number" min="0" max="1" step="any" value="1"></label>
+          </div>
+          <div class="sample-result"><canvas id="learning-preview" hidden></canvas><p id="learning-crop-info"></p></div>
+          <p id="learning-eligibility" class="field-help"></p>
+        </div>
+        <div class="form-actions"><button class="btn" type="button" id="learning-analyze" disabled>Предложить сотрудников</button></div>
+      </fieldset>
+      <p id="learning-analysis-status" class="form-status" role="status" aria-live="polite"></p>
+      <div id="learning-candidates" class="learning-candidates"></div>
+      <fieldset id="learning-decision" class="plain-fieldset">
+        <legend class="sr-only">Решение оператора по обучению</legend>
+        <h3>Выбрать сотрудника вручную</h3>
+        <label class="field">Поиск сотрудника<input type="search" id="learning-search" placeholder="Имя или фамилия"></label>
+        <label class="field">Сотрудник<select id="learning-employee"><option value="">Выберите сотрудника вручную</option></select></label>
+        <p id="learning-employee-status" class="field-help muted"></p>
+        <button class="btn" id="learning-employees-retry" type="button" hidden>Повторить загрузку сотрудников</button>
+        <label class="field">Оператор<input id="learning-actor" maxlength="100" autocomplete="name"></label>
+        <label class="field">Причина решения или удаления<textarea id="learning-reason" maxlength="1000" rows="2"></textarea></label>
+        <label class="setup-check"><input type="checkbox" id="learning-person-confirm"> В выделенной области один человек</label>
+        <div class="form-actions">
+          <button class="btn primary" type="button" id="learning-manual-accept" disabled>Подтвердить и обучить</button>
+          <button class="btn" type="button" id="learning-manual-reject" disabled>Это не выбранный сотрудник</button>
+        </div>
+      </fieldset>
+      <p id="learning-status" class="form-status" role="status" aria-live="polite"></p>
+      <ul id="learning-links" class="attendance-audit"></ul>
+      <button class="btn" id="learning-retry" type="button" hidden>Повторить тот же запрос обучения</button>
+      <p id="learning-counts" class="field-help"></p>
+      <details open><summary>Образцы выбранного сотрудника и удаление обучения</summary>
+        <ol id="learning-employee-examples" class="attendance-audit learning-feedback"></ol>
+        <button class="btn" type="button" id="learning-employee-more" hidden>Показать ещё</button>
+      </details>
+      <details><summary>История обучения по этому наблюдению</summary>
+        <p id="learning-history-counts" class="field-help"></p>
+        <ol id="learning-history" class="attendance-audit learning-feedback"></ol>
+        <button class="btn" type="button" id="learning-history-more" hidden>Показать ещё</button>
+      </details>
+    </section>
     <section class="panel camera-sample" aria-labelledby="sample-title" id="sample-panel">
-      <div class="panel-head"><h2 id="sample-title">Фото для следующих узнаваний</h2></div>
-      <p>Добавьте один проверенный образец, не заменяя прежние. Нужны одно чёткое лицо от 80 исходных пикселей и доступная модель. Подпись в журнале и прошлые часы не изменятся.</p>
+      <div class="panel-head"><h2 id="sample-title">Образец лица</h2></div>
+      <p>Это строгая форма только для лица: нужны одно чёткое лицо от 80 исходных пикселей и доступная модель. Если лица нет или оно мелкое, используйте раздел «Обучить по человеку» выше. Подпись в журнале и прошлые часы не изменятся.</p>
       <p id="sample-eligibility" class="form-status" role="status"></p>
       <form id="sample-form" autocomplete="off">
         <fieldset id="sample-fields" class="plain-fieldset">
@@ -136,5 +199,6 @@
 {% block scripts %}
 <script src="/static/js/image_crop.js"></script>
 <script src="/static/js/journal_corrections.js"></script>
+<script src="/static/js/journal_learning.js"></script>
 <script src="/static/js/human_visit_detail.js"></script>
 {% endblock %}

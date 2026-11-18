@@ -1024,6 +1024,18 @@ main > .panel + .panel { margin-top: 20px; }
   .camera-sample .form-actions { flex-wrap: wrap; }
 }
 
+/* Reserve the same media space while a journal image is loading or expired. */
+.visit-thumbnail { min-inline-size: 10rem; }
+.visit-thumbnail-frame {
+  inline-size: 96px; block-size: 120px; display: grid; place-items: center;
+  background: var(--md-surface); border: 1px solid var(--md-outline-variant); border-radius: 4px;
+}
+.visit-thumbnail-frame a, .visit-thumbnail-frame img {
+  display: block; inline-size: 96px; block-size: 120px; object-fit: contain;
+}
+.visit-thumbnail-status { margin-block-start: 6px; line-height: 1.35; }
+.visit-thumbnail-retry { display: block; margin-block-start: 6px; white-space: normal; }
+
 /* Journal decisions, recognition samples and accounting remain separate actions. */
 #visit-detail [hidden] { display: none !important; }
 #visit-detail .panel > p { max-width: 75ch; }
@@ -1041,6 +1053,20 @@ main > .panel + .panel { margin-top: 20px; }
 .journal-time-bounds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 #visit-detail table { font-variant-numeric: tabular-nums; }
 #time-result th, #time-result td { white-space: nowrap; overflow-wrap: normal; }
+.learning-panel [hidden] { display: none !important; }
+.learning-panel h3 { margin: 16px 0 8px; font-size: 16px; }
+.learning-candidates { display: grid; gap: 16px; margin-block: 16px; }
+.learning-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 16px; list-style: none; margin: 0; padding: 0; }
+.learning-card { padding: 16px; border: 1px solid var(--md-outline-variant); border-radius: 12px; background: var(--md-surface-container); min-width: 0; }
+.learning-card p { margin: 0 0 8px; overflow-wrap: anywhere; }
+.learning-card .learning-name { font-weight: 600; }
+.learning-card .form-actions { display: grid; gap: 8px; margin-top: 12px; }
+.learning-card a { display: inline-block; margin-bottom: 8px; }
+.learning-feedback > li { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 4px 16px; align-items: start; }
+.learning-feedback > li > :not(.learning-thumb) { grid-column: 2; margin: 0; }
+.learning-thumb { grid-column: 1; grid-row: 1 / span 6; min-height: 120px; }
+.learning-thumb img { display: block; width: 96px; height: 120px; object-fit: contain; border: 1px solid var(--md-outline-variant); background: var(--md-surface-container-low); }
+.learning-thumb p { font-size: 13px; margin: 0; }
 @media (max-width: 650px) {
   .journal-time-bounds { grid-template-columns: 1fr; }
 }
