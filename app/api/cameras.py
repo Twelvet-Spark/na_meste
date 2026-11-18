@@ -29,7 +29,7 @@ from fastapi.routing import APIRoute
 
 from app.config import settings
 from app.database.database import get_db, publication_guard
-from app.database.models import AttendanceCamera, AttendanceRuntime
+from app.database.models import AttendanceCamera, AttendanceRuntime, CameraProfile
 from app.rtsp.manager import ReaderManager
 from app.rtsp.jpeg_cache import JPEG_QUALITY
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
@@ -428,6 +428,14 @@ def api_camera_detections(
                 or data.get("calibration_revision") != configuration.revision
                 or data.get("gallery_revision") != runtime.gallery_revision)):
             data = None
+        if data is not None:
+            profile = db.get(CameraProfile, camera_id)
+            fps = profile.ai_fps if profile is not None and profile.ai_fps is not None else settings.ai_fps
+            max_age_ms = max(2000., 3000. / fps)
+            if data["age_ms"] >= max_age_ms:
+                data = None
+            else:
+                data["max_age_ms"] = max_age_ms
     if data is None:
         return {
             "camera_id": camera_id,

@@ -2,9 +2,13 @@
 (() => {
   'use strict';
   const score = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+  const trackState = (track) => track.employee_id != null ? 'recognized' : track.state === 'unknown' ? 'unknown' : 'detecting';
+  const identityLabel = (track) => track.employee_id != null
+    ? (track.employee_name || `Сотрудник #${track.employee_id}`)
+    : trackState(track) === 'unknown' ? 'Неизвестный' : 'Распознавание…';
   function label(track) {
     const known = track.employee_id != null;
-    const parts = [known ? (track.employee_name || `Сотрудник #${track.employee_id}`) : 'Неизвестный'];
+    const parts = [identityLabel(track)];
     if (known) parts.push(track.identity_source === 'REID' ? 'по внешности' : 'по лицу');
     if (score(track.person_score)) parts.push(`человек ${Math.round(track.person_score * 100)}%`);
     if (known && track.identity_source !== 'REID' && score(track.face_similarity)) parts.push(`сходство лица ${track.face_similarity.toFixed(2)}`);
@@ -17,8 +21,28 @@
     const w = nativeWidth * scale, h = nativeHeight * scale;
     return { left: (width - w) / 2, top: (height - h) / 2, width: w, height: h };
   }
-  function isFresh(data, now = Date.now()) {
-    return Number.isFinite(data?.updated_at) && now / 1000 - data.updated_at >= -1 && now / 1000 - data.updated_at <= 2;
+  function remainingMs(data) {
+    return Number.isFinite(data?.age_ms) && data.age_ms >= 0 && Number.isFinite(data?.max_age_ms)
+      ? Math.max(0, data.max_age_ms - data.age_ms) : 0;
+  }
+  function isFresh(data) { return remainingMs(data) > 0; }
+  async function fetchDetections(cameraId, signal) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timeout = setTimeout(abort, 2500);
+    const started = performance.now();
+    try {
+      const response = await fetch(`/api/cameras/${cameraId}/detections`, { signal: controller.signal });
+      if (!response.ok) throw new Error('Результаты распознавания недоступны');
+      const data = await response.json();
+      if (Number.isFinite(data.age_ms)) data.age_ms += performance.now() - started;
+      return data;
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+    }
   }
   function render(container, tracks, { image = null, links = false, metrics = false, compact = false } = {}) {
     container.replaceChildren();
@@ -32,14 +56,14 @@
       const [x1, y1, x2, y2] = track.bbox.map((n) => Math.max(0, Math.min(1, n)));
       if (x2 <= x1 || y2 <= y1) continue;
       const box = document.createElement('div');
-      box.className = `bbox ${track.employee_id != null ? 'recognized' : 'unknown'}`;
+      box.className = `bbox ${trackState(track)}`;
       Object.assign(box.style, { left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` });
       const acknowledged = links && typeof track.visit_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(track.visit_id);
       const text = document.createElement(acknowledged ? 'a' : 'span');
       text.className = 'bbox-label';
       if (compact) {
         text.title = label(track);
-        const lines = [track.employee_id != null ? (track.employee_name || `#${track.employee_id}`) : 'Неизвестный'];
+        const lines = [identityLabel(track)];
         if (score(track.person_score)) lines.push(`чел. ${Math.round(track.person_score * 100)}%`);
         if (track.employee_id != null) {
           if (track.identity_source === 'REID') lines.push('по внешности');
@@ -68,5 +92,5 @@
       container.append(box);
     }
   }
-  window.CameraOverlay = Object.freeze({ label, fitRect, isFresh, render });
+  window.CameraOverlay = Object.freeze({ label, fitRect, isFresh, remainingMs, fetchDetections, render });
 })();

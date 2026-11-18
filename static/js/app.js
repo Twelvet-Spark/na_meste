@@ -203,6 +203,7 @@
   }
   function disposePreview(card) {
     card.previewAbort?.abort();
+    clearTimeout(card.boxesExpiry);
     card.boxes.replaceChildren();
     if (card.imageUrl) URL.revokeObjectURL(card.imageUrl);
     card.imageUrl = null;
@@ -212,24 +213,33 @@
     if (card.previewAbort || previewRequests >= 4) return;
     const controller = new AbortController();
     card.previewAbort = controller; card.previewAt = Date.now(); previewRequests++;
+    const timeout = setTimeout(() => { controller.abort(); card.boxes.replaceChildren(); }, 2500);
     let nextUrl = null;
     try {
-      const [response, detections] = await Promise.all([
-        fetch(`/api/cameras/${card.camera.id}/snapshot?size=thumbnail&t=${card.previewAt}`, { signal: controller.signal }),
-        ui.api(`/api/cameras/${card.camera.id}/detections`, { signal: controller.signal }),
+      const snapshot = (async () => {
+        const response = await fetch(`/api/cameras/${card.camera.id}/snapshot?size=thumbnail&t=${card.previewAt}`, { signal: controller.signal });
+        if (!response.ok) throw new Error('Нет свежего видео');
+        const blob = await response.blob();
+        if (controller.signal.aborted || !previewVisible(card)) return;
+        nextUrl = URL.createObjectURL(blob);
+        card.image.src = nextUrl;
+        await card.image.decode();
+        if (controller.signal.aborted || !previewVisible(card) || !card.camera.enabled || card.camera.status !== 'ONLINE') return;
+        if (card.imageUrl) URL.revokeObjectURL(card.imageUrl);
+        card.imageUrl = nextUrl; nextUrl = null;
+        card.image.hidden = false; card.unavailable.hidden = true;
+      })();
+      const [imageResult, detectionResult] = await Promise.allSettled([
+        snapshot, window.CameraOverlay.fetchDetections(card.camera.id, controller.signal),
       ]);
-      if (!response.ok) throw new Error('Нет свежего видео');
-      const blob = await response.blob();
+      if (imageResult.status === 'rejected') throw imageResult.reason;
       if (controller.signal.aborted || !previewVisible(card)) return;
-      nextUrl = URL.createObjectURL(blob);
-      card.image.src = nextUrl;
-      await card.image.decode();
-      if (controller.signal.aborted || !previewVisible(card) || !card.camera.enabled || card.camera.status !== 'ONLINE') return;
-      if (card.imageUrl) URL.revokeObjectURL(card.imageUrl);
-      card.imageUrl = nextUrl; nextUrl = null;
+      const detections = detectionResult.status === 'fulfilled' ? detectionResult.value : null;
+      clearTimeout(card.boxesExpiry);
       if (window.CameraOverlay.isFresh(detections)
           && detections.source_revision === card.camera.attendance.source_revision) {
         window.CameraOverlay.render(card.boxes, detections.tracks, { image: card.image, compact: true });
+        card.boxesExpiry = setTimeout(() => card.boxes.replaceChildren(), window.CameraOverlay.remainingMs(detections));
       } else card.boxes.replaceChildren();
     } catch (error) {
       card.boxes.replaceChildren();
@@ -238,6 +248,7 @@
         card.unavailable.textContent = 'Нет свежего видео';
       }
     } finally {
+      clearTimeout(timeout);
       if (nextUrl) URL.revokeObjectURL(nextUrl);
       card.previewAbort = null; previewRequests--;
     }

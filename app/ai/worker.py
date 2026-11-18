@@ -44,6 +44,7 @@ class DetectionState:
     def __init__(self):
         self._lock = threading.Lock()
         self._data: dict[int, dict] = {}
+        self._published_at: dict[int, float] = {}
 
     def update(self, camera_id: int, detections, *, packet=None, generation=None, configuration=None,
                identities: dict[int, tuple[int, str, str | None]] | None = None) -> None:
@@ -68,6 +69,7 @@ class DetectionState:
                 "visit_id": d.visit_id,
             })
         with self._lock:
+            self._published_at[camera_id] = time.monotonic()
             self._data[camera_id] = {
                 "camera_id": camera_id,
                 "updated_at": time.time(),
@@ -90,7 +92,10 @@ class DetectionState:
 
     def camera(self, camera_id: int) -> Optional[dict]:
         with self._lock:
-            return self._data.get(camera_id)
+            data = self._data.get(camera_id)
+            if data is None:
+                return None
+            return {**data, "age_ms": max(0., (time.monotonic() - self._published_at[camera_id]) * 1000.)}
 
     def counts(self, camera_id: int) -> tuple[int, int, int]:
         with self._lock:
@@ -117,6 +122,7 @@ class DetectionState:
     def drop_camera(self, camera_id: int) -> None:
         with self._lock:
             self._data.pop(camera_id, None)
+            self._published_at.pop(camera_id, None)
 
 
 @dataclass(frozen=True, slots=True)

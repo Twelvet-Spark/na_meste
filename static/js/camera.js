@@ -142,7 +142,7 @@ $('camera-profile-form').addEventListener('submit', async event => {
   if (result) { profileDirty = false; renderControls(); }
 });
 
-let boxesLoading = false;
+let boxesLoading = false, boxesExpiry;
 async function refreshBoxes() {
   // Metadata still drives source-staleness guards while the mapping tab hides the stream.
   if (document.hidden) { boxesEl.replaceChildren(); return; }
@@ -150,14 +150,14 @@ async function refreshBoxes() {
   boxesLoading = true;
   let data;
   try {
-    const res = await fetch(`/api/cameras/${cameraId}/detections`);
-    if (!res.ok) throw new Error();
-    data = await res.json();
+    data = await window.CameraOverlay.fetchDetections(cameraId);
   } catch (_) { boxesEl.replaceChildren(); return; }
   finally { boxesLoading = false; }
   boxesEl.replaceChildren();
+  clearTimeout(boxesExpiry);
   if (!document.hidden && cameraTabs.current() === 'overview' && window.CameraOverlay.isFresh(data)) {
     window.CameraOverlay.render(boxesEl, data.tracks, { image: $('stream'), links: true, metrics: true });
+    boxesExpiry = setTimeout(() => boxesEl.replaceChildren(), window.CameraOverlay.remainingMs(data));
   }
   window.dispatchEvent(new CustomEvent('camera-detections', {detail: data}));
 }
