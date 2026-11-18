@@ -1023,3 +1023,24 @@ main > .panel + .panel { margin-top: 20px; }
   .sample-bounds { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .camera-sample .form-actions { flex-wrap: wrap; }
 }
+
+/* Journal decisions, recognition samples and accounting remain separate actions. */
+#visit-detail [hidden] { display: none !important; }
+#visit-detail .panel > p { max-width: 75ch; }
+#visit-detail .plain-fieldset { display: grid; gap: 16px; min-width: 0; }
+#visit-detail .field input, #visit-detail .field select, #visit-detail .field textarea { min-width: 0; width: 100%; }
+#visit-detail .btn { max-width: 100%; white-space: normal; }
+#visit-detail .form-actions { flex-wrap: wrap; }
+#visit-detail .setup-check { white-space: normal; line-height: 1.5; align-items: start; }
+#visit-detail details { margin-block: 20px; }
+#visit-detail summary { cursor: pointer; padding-block: 12px; }
+#visit-detail .attendance-audit p { overflow-wrap: anywhere; }
+#visit-detail .sample-stage { width: fit-content; max-width: 100%; }
+#visit-detail .sample-stage img { width: auto; max-width: 100%; max-height: 600px; }
+#visit-detail .journal-upload-preview { max-width: 100%; max-height: 320px; width: auto; height: auto; margin-block: 16px; }
+.journal-time-bounds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+#visit-detail table { font-variant-numeric: tabular-nums; }
+#time-result th, #time-result td { white-space: nowrap; overflow-wrap: normal; }
+@media (max-width: 650px) {
+  .journal-time-bounds { grid-template-columns: 1fr; }
+}

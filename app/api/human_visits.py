@@ -9,7 +9,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
+from pydantic import Field, StrictInt, StrictStr, ValidationError
 from sqlalchemy import and_, or_, case, func, select
 from sqlalchemy.orm import Session, aliased
 from starlette.concurrency import run_in_threadpool
@@ -23,7 +23,7 @@ from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent, H
 from app.services.visit_identity_service import IdentityInput, RestoreIdentityInput, VisitIdentityService
 from app.services.visit_sample_service import VisitPhotoInput, RemoveVisitSampleInput
 from app.services.visit_time_service import VisitTimeService, VisitTimeInput, VisitTimeApplyInput, VisitTimeUndoInput
-from app.attendance_types import milliseconds
+from app.attendance_types import HumanInput, milliseconds
 from app.time_utils import attendance_iso, utcnow
 
 router = APIRouter(prefix="/visits", tags=["human-visits"], route_class=PhotoUploadRoute)
@@ -60,11 +60,9 @@ _EFFECTIVE_STATE = case(
 )
 
 
-class EmployeeSample(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class EmployeeSample(HumanInput):
     employee_id: Annotated[StrictInt, Field(gt=0)]
     expected_revision: Annotated[StrictInt, Field(ge=0)]
-    request_id: UUID
     face_sha256: Annotated[StrictStr, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -269,7 +267,8 @@ async def api_append_employee_sample(visit_id: UUID, payload: EmployeeSample, re
         raise HTTPException(503, {"code": "FACE_MODEL_UNAVAILABLE"})
     return await run_in_threadpool(service.append, str(visit_id), employee_id=payload.employee_id,
                                    expected_revision=payload.expected_revision,
-                                   request_id=payload.request_id, face_sha256=payload.face_sha256)
+                                   request_id=payload.request_id, face_sha256=payload.face_sha256,
+                                   actor=payload.actor, reason=payload.reason)
 
 
 @router.post("/{visit_id}/identity", dependencies=[Depends(require_operator_request)])

@@ -75,7 +75,7 @@ def fixture():
                                            'sha256':hashlib.sha256(thumbnail).hexdigest()}))
             revision = db.get(Employee, 1).revision
         payload = dict(employee_id=1, expected_revision=revision, request_id=uuid4(),
-                       face_sha256=hashlib.sha256(thumbnail).hexdigest())
+                       face_sha256=hashlib.sha256(thumbnail).hexdigest(), actor="Проверяющий", reason="Лицо проверено")
         yield engine, service, face, clock, visit_id, payload
 
 
@@ -109,6 +109,7 @@ def test_append_preserves_existing_samples_and_stamps_only_new_target_space():
             db.add(FaceModelMetadata(face_id=old_id, model_id='b'*64, alignment_id=ALIGNMENT_ID))
         before = state(engine)
         result = service.append(visit_id, **payload)
+        assert result["actor"] == payload["actor"] and result["reason"] == payload["reason"]
         with Session(engine) as db:
             old = db.get(EmployeeFace, old_id)
             assert old.thumbnail == original and old.embedding == vector(11).tobytes()
@@ -142,6 +143,7 @@ def test_request_uuid_payload_change_conflicts_before_any_repreparation():
         service.append(visit_id, **payload)
         changed = dict(payload, employee_id=2)
         fails(409, None, lambda: service.append(visit_id, **changed))
+        fails(409, None, lambda: service.append(visit_id, **dict(payload, reason="Другая причина")))
         assert face.calls == 1
 
 

@@ -127,15 +127,16 @@ class VisitSampleService:
         return (True, None) if self._model_available() else (False, "FACE_MODEL_UNAVAILABLE")
 
     @staticmethod
-    def _digest(visit_id, employee_id, expected_revision, face_sha256):
+    def _digest(visit_id, employee_id, expected_revision, face_sha256, actor, reason):
         payload = json.dumps({"visit_id": visit_id, "employee_id": employee_id,
-                              "expected_revision": expected_revision, "face_sha256": face_sha256},
+                              "expected_revision": expected_revision, "face_sha256": face_sha256,
+                              "actor": actor, "reason": reason},
                              sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(_DOMAIN + payload).hexdigest()
 
-    def append(self, visit_id, *, employee_id, expected_revision, request_id, face_sha256):
+    def append(self, visit_id, *, employee_id, expected_revision, request_id, face_sha256, actor, reason):
         visit_id, request_id = str(UUID(str(visit_id))), str(UUID(str(request_id)))
-        digest = self._digest(visit_id, employee_id, expected_revision, face_sha256)
+        digest = self._digest(visit_id, employee_id, expected_revision, face_sha256, actor, reason)
         try:
             # Receipt lookup precedes expiry, employee/model availability and GPU work.
             with Session(self.engine) as reader:
@@ -163,7 +164,7 @@ class VisitSampleService:
                                                self.face_model_id, ALIGNMENT_ID)
             return self._commit_sample(
                 visit_id, employee_id, expected_revision, request_id, digest, prepared, OPERATION,
-                lambda visit: self._checked_face(visit, face_sha256), source="ALIGNED_FACE")
+                lambda visit: self._checked_face(visit, face_sha256), source="ALIGNED_FACE", actor=actor, reason=reason)
         except SQLAlchemyError as exc:
             raise _error(503, "PERSISTENCE_ERROR") from exc
 
