@@ -75,7 +75,7 @@ OPERATOR_V2_TABLES = OPERATOR_V1_TABLES | {"camera_archives"}
 MEDIA_TABLES = {"recording_sessions", "recording_segments", "recording_connections", "recording_gaps"}
 V4_TABLES = {"face_model_metadata", "camera_scenes", "human_visits",
              "human_visit_events", "human_journal_gaps"}
-OPERATOR_TABLES = OPERATOR_V2_TABLES | MEDIA_TABLES | V4_TABLES | {"camera_profiles"}
+OPERATOR_TABLES = OPERATOR_V2_TABLES | MEDIA_TABLES | V4_TABLES | {"camera_profiles", "human_visit_identity_revisions"}
 STAMP = datetime(2026, 11, 11, 4, 5, 6, 123456)
 
 # Genuine committed-v1 fixtures are pinned independently of the implementation
@@ -326,7 +326,7 @@ def assert_operator_current(engine):
     tables = set(inspect(engine).get_table_names())
     assert OPERATOR_TABLES <= tables, f"Missing additive operator tables: {OPERATOR_TABLES - tables}"
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 6)]
+        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 7)]
         assert connection.exec_driver_sql("SELECT schema_version FROM attendance_runtime").scalar_one() == 3
     assert ATTENDANCE_TABLES <= tables, f"Missing attendance tables: {ATTENDANCE_TABLES - tables}"
     assert not DROPPED_TABLES & tables, f"Old history tables survived: {DROPPED_TABLES & tables}"
@@ -760,8 +760,8 @@ def test_v3_upgrade_backs_up_before_v4_and_preserves_existing_ddl():
     with database() as (engine, root):
         committed_v3(engine)
         before = dump(engine)
-        # Everything the work-time upgrade or the v4/v5/v6 operator steps rebuild, drop or add.
-        changed = V4_TABLES | ATTENDANCE_TABLES | ATTENDANCE_V2_TABLES | DROPPED_TABLES | {"camera_profiles"}
+        # Everything the work-time upgrade or later operator steps rebuild, drop or add.
+        changed = V4_TABLES | ATTENDANCE_TABLES | ATTENDANCE_V2_TABLES | DROPPED_TABLES | {"camera_profiles", "human_visit_identity_revisions"}
         old_sql = tuple(row for row in catalog(engine) if row[2] not in changed)
         schema.initialize_attendance_schema(engine)
         assert_operator_current(engine)

@@ -23,7 +23,7 @@ from app.database.database import immediate_session
 from app.database.models import (
     AttendanceRuntime, DoorCrossing, Employee, EmployeeFace, EmployeeWorkplace, GlobalPerson,
     ManualPresenceInterval, OperatorRequest, PresenceExclusion, PresenceSegment,
-    Workplace, HumanVisit, HumanVisitEvent, FaceModelMetadata,
+    Workplace, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision, FaceModelMetadata,
 )
 from app.services.attendance_evidence import encode_evidence
 from app.services.workplace_service import WorkplaceOut, replace_assignments, validate_assignments
@@ -380,6 +380,7 @@ def delete_employee(db: Session, employee: Employee, *, has_pending=None):
                        or writer.query(ManualPresenceInterval.id).filter_by(employee_id=employee_id).first()
                        or writer.query(PresenceExclusion.id).filter_by(employee_id=employee_id).first()
                        or writer.query(HumanVisit.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(HumanVisitIdentityRevision.id).filter_by(employee_id=employee_id).first()
                        or writer.query(HumanVisitEvent.id).filter(
                            HumanVisitEvent.type == "IDENTIFIED",
                            func.json_extract(HumanVisitEvent.payload, "$.employee_id") == employee_id,

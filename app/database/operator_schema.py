@@ -6,7 +6,7 @@ Recording metadata is installed explicitly by version 3, never via create_all.
 from app.operator_settings import legacy_ai_camera_ids
 from app.time_utils import utcnow
 
-VERSION = 6
+VERSION = 7
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -241,9 +241,31 @@ V6_CAMERA_PROFILES_DDL = """CREATE TABLE camera_profiles (
     )"""
 V6_TABLES = {**V5_TABLES, "camera_profiles": V6_CAMERA_PROFILES_DDL}
 V6_INDEXES = V5_INDEXES
-INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES, 6: V6_INDEXES}
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES, 6: V6_TABLES}
-TABLES = frozenset(V6_TABLES)
+V7_TABLES = {
+    **V6_TABLES,
+    "human_visit_identity_revisions": """CREATE TABLE human_visit_identity_revisions (
+        id INTEGER NOT NULL PRIMARY KEY,
+        visit_id VARCHAR(36) NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        mode VARCHAR(8) NOT NULL CHECK (mode IN ('EMPLOYEE','UNKNOWN','AI')),
+        employee_id INTEGER,
+        actor VARCHAR(100) NOT NULL,
+        reason VARCHAR(1000) NOT NULL,
+        created_at DATETIME NOT NULL,
+        request_id VARCHAR(36) NOT NULL UNIQUE,
+        UNIQUE (visit_id, revision),
+        CHECK ((mode = 'EMPLOYEE' AND employee_id IS NOT NULL) OR (mode != 'EMPLOYEE' AND employee_id IS NULL)),
+        FOREIGN KEY(visit_id) REFERENCES human_visits (id) ON DELETE RESTRICT,
+        FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT
+    )""",
+}
+V7_INDEXES = {
+    **V6_INDEXES,
+    "ix_visit_identity_revision": "CREATE INDEX ix_visit_identity_revision ON human_visit_identity_revisions (visit_id, revision)",
+}
+INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES, 6: V6_INDEXES, 7: V7_INDEXES}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES, 6: V6_TABLES, 7: V7_TABLES}
+TABLES = frozenset(V7_TABLES)
 
 
 def _refuse(detail):
@@ -371,3 +393,9 @@ def install(connection, installed=0):
         connection.exec_driver_sql("DROP TABLE camera_profiles_v5")
         connection.exec_driver_sql(V6_INDEXES["ix_camera_profiles_workplace"])
         connection.exec_driver_sql("UPDATE operator_schema SET version=6,updated_at=? WHERE id=1", (now,))
+        installed = 6
+    if installed == 6:
+        connection.exec_driver_sql(V7_TABLES["human_visit_identity_revisions"])
+        connection.exec_driver_sql(V7_INDEXES["ix_visit_identity_revision"])
+        connection.exec_driver_sql("UPDATE operator_schema SET version=7,updated_at=? WHERE id=1",
+                                   (utcnow().isoformat(sep=" "),))

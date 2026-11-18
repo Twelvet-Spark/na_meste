@@ -201,7 +201,7 @@ class SetupTransferService:
 
     def export(self, password: str) -> bytes:
         try:
-            payload = {"transfer_version": 4, "exported_at": datetime.now(timezone.utc).isoformat(),
+            payload = {"transfer_version": 5, "exported_at": datetime.now(timezone.utc).isoformat(),
                        "attendance_schema_version": attendance_schema.SCHEMA_VERSION,
                        "operator_schema_version": operator_schema.VERSION,
                        "face_model_id": self.face_model_id, "embedding_encoding": "float32-le-512"}

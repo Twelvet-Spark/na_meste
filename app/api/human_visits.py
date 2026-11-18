@@ -10,13 +10,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
-from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, case, func, select
+from sqlalchemy.orm import Session, aliased
 from starlette.concurrency import run_in_threadpool
 
 from app.api.operator_security import require_operator_request
 from app.database.database import get_db
-from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent
+from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision
+from app.services.visit_identity_service import IdentityInput, RestoreIdentityInput, VisitIdentityService
 from app.time_utils import utcnow
 
 router = APIRouter(prefix="/visits", tags=["human-visits"])
@@ -36,6 +37,21 @@ _EVENT_FIELDS = frozenset({
     "version", "transition_seq", "reason", "employee_id", "previous_employee_id",
     "global_id", "score", "identity_state",
 })
+
+_IDENTITY_VERSION = select(
+    HumanVisitIdentityRevision.visit_id,
+    func.max(HumanVisitIdentityRevision.revision).label("revision"),
+).group_by(HumanVisitIdentityRevision.visit_id).subquery()
+_IDENTITY = aliased(HumanVisitIdentityRevision)
+_AI_EMPLOYEE = aliased(Employee)
+_EFFECTIVE_EMPLOYEE = case(
+    (_IDENTITY.mode == "EMPLOYEE", _IDENTITY.employee_id),
+    (_IDENTITY.mode == "UNKNOWN", None), else_=HumanVisit.employee_id,
+)
+_EFFECTIVE_STATE = case(
+    (_IDENTITY.mode == "EMPLOYEE", "OPERATOR_CONFIRMED"),
+    (_IDENTITY.mode == "UNKNOWN", "OPERATOR_UNKNOWN"), else_=HumanVisit.identity_state,
+)
 
 
 class EmployeeSample(BaseModel):
@@ -105,6 +121,10 @@ def _metadata(row, now):
         values[key] = _iso(values[key])
     values.update(
         camera_name=row.camera_name, employee_name=row.employee_name,
+        employee_active=row.employee_active,
+        identity_revision=row.identity_revision, identity_source=row.identity_source,
+        ai_employee_id=row.ai_employee_id, ai_employee_name=row.ai_employee_name,
+        ai_identity_state=row.ai_identity_state,
         duration_seconds=max(0., (row.last_seen_at - row.started_at).total_seconds()),
         photo_status=_image_status(row.has_photo, row.image_expires_at, row.images_purged_at, now),
         face_status=_image_status(row.has_face, row.image_expires_at, row.images_purged_at, now),
@@ -114,11 +134,22 @@ def _metadata(row, now):
 
 def _query(db):
     return db.query(
-        *(getattr(HumanVisit, name) for name in _METADATA),
+        *(getattr(HumanVisit, name) for name in _METADATA if name not in ("employee_id", "identity_state")),
+        _EFFECTIVE_EMPLOYEE.label("employee_id"), _EFFECTIVE_STATE.label("identity_state"),
         Camera.name.label("camera_name"), Employee.name.label("employee_name"),
+        Employee.active.label("employee_active"),
+        func.coalesce(_IDENTITY.revision, 0).label("identity_revision"),
+        case((_IDENTITY.mode.in_(("EMPLOYEE", "UNKNOWN")), "OPERATOR"), else_="AI").label("identity_source"),
+        HumanVisit.employee_id.label("ai_employee_id"), _AI_EMPLOYEE.name.label("ai_employee_name"),
+        HumanVisit.identity_state.label("ai_identity_state"),
         HumanVisit.snapshot.isnot(None).label("has_photo"),
         HumanVisit.face_thumbnail.isnot(None).label("has_face"),
-    ).join(Camera, Camera.id == HumanVisit.camera_id).outerjoin(Employee, Employee.id == HumanVisit.employee_id)
+    ).join(Camera, Camera.id == HumanVisit.camera_id).outerjoin(
+        _IDENTITY_VERSION, _IDENTITY_VERSION.c.visit_id == HumanVisit.id,
+    ).outerjoin(_IDENTITY, and_(_IDENTITY.visit_id == HumanVisit.id,
+                               _IDENTITY.revision == _IDENTITY_VERSION.c.revision)).outerjoin(
+        Employee, Employee.id == _EFFECTIVE_EMPLOYEE,
+    ).outerjoin(_AI_EMPLOYEE, _AI_EMPLOYEE.id == HumanVisit.employee_id)
 
 
 def _visit_or_404(db, visit_id):
@@ -153,9 +184,9 @@ def api_list_visits(
     if camera_id is not None:
         query = query.filter(HumanVisit.camera_id == camera_id)
     if employee_id is not None:
-        query = query.filter(HumanVisit.employee_id == employee_id)
+        query = query.filter(_EFFECTIVE_EMPLOYEE == employee_id)
     if unknown_only:
-        query = query.filter(HumanVisit.identity_state == "UNKNOWN", HumanVisit.employee_id.is_(None))
+        query = query.filter(_EFFECTIVE_STATE.in_(("UNKNOWN", "OPERATOR_UNKNOWN")), _EFFECTIVE_EMPLOYEE.is_(None))
     if since is not None:
         query = query.filter(HumanVisit.last_seen_at >= since)
     if until is not None:
@@ -229,3 +260,18 @@ async def api_append_employee_sample(visit_id: UUID, payload: EmployeeSample, re
     return await run_in_threadpool(service.append, str(visit_id), employee_id=payload.employee_id,
                                    expected_revision=payload.expected_revision,
                                    request_id=payload.request_id, face_sha256=payload.face_sha256)
+
+
+@router.post("/{visit_id}/identity", dependencies=[Depends(require_operator_request)])
+def api_set_identity(visit_id: UUID, payload: IdentityInput, db: Session = Depends(get_db)):
+    return VisitIdentityService(db.get_bind()).set_identity(visit_id, payload)
+
+
+@router.post("/{visit_id}/identity/restore", dependencies=[Depends(require_operator_request)])
+def api_restore_identity(visit_id: UUID, payload: RestoreIdentityInput, db: Session = Depends(get_db)):
+    return VisitIdentityService(db.get_bind()).restore(visit_id, payload)
+
+
+@router.get("/{visit_id}/identity/history")
+def api_identity_history(visit_id: UUID, db: Session = Depends(get_db)):
+    return VisitIdentityService(db.get_bind()).history(visit_id)

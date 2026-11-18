@@ -460,6 +460,27 @@ class HumanVisit(Base):
     )
 
 
+class HumanVisitIdentityRevision(Base):
+    __tablename__ = "human_visit_identity_revisions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    visit_id: Mapped[str] = mapped_column(ForeignKey("human_visits.id", ondelete="RESTRICT"))
+    revision: Mapped[int] = mapped_column(Integer)
+    mode: Mapped[str] = mapped_column(String(8))
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    actor: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    request_id: Mapped[str] = mapped_column(String(36), unique=True)
+    __table_args__ = (
+        UniqueConstraint("visit_id", "revision"),
+        CheckConstraint("revision >= 1"),
+        CheckConstraint("mode IN ('EMPLOYEE','UNKNOWN','AI')"),
+        CheckConstraint("(mode = 'EMPLOYEE' AND employee_id IS NOT NULL) OR "
+                        "(mode != 'EMPLOYEE' AND employee_id IS NULL)"),
+        Index("ix_visit_identity_revision", "visit_id", "revision"),
+    )
+
+
 class HumanVisitEvent(Base):
     __tablename__ = "human_visit_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
