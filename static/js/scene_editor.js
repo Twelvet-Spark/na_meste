@@ -9,26 +9,25 @@
   const attendance = `/api/attendance/cameras/${cameraId}`;
   const canvas = $('calibration-canvas'), ctx = canvas.getContext('2d');
   const clone = value => JSON.parse(JSON.stringify(value));
-  const emptyGeometry = () => ({version: 1, floor: null, objects: [], metric: null});
-  const emptyGate = () => ({points: [null, null, null], role: '', enabled: false});
+  const emptyGeometry = () => ({version: 2, floor: null, objects: [], doors: [], metric: null});
+  const emptyGate = () => ({threshold: [null, null], top: [null, null], inside: null, side: 1, kind: 'DOOR', role: 'BOTH', enabled: false});
   const state = {
-    saved: null, config: null, runtime: null, geometry: emptyGeometry(), gate: emptyGate(),
+    saved: null, config: null, runtime: null, camera: null, geometry: emptyGeometry(), gate: emptyGate(),
     snapshot: null, image: null, pixels: null, validSnapshot: false, review: false,
-    busy: false, tool: 'select', selection: '', vertex: -1, drawing: false,
+    busy: false, mode: 'scene', tool: 'select', selection: '', vertex: -1, drawing: false,
     undo: [], redo: [], zoom: 1, pan: [0, 0], space: false, gesture: null,
-    layers: {floor: true, objects: true, gate: true, metric: true, suggestions: true},
+    layers: {floor: true, objects: true, doors: true, gate: true, metric: true, suggestions: true},
     prompts: {positive_points: [], negative_points: [], box: null},
-    candidates: [], job: null, jobEpoch: 0, jobTimer: null, ttlTimer: null,
+    candidates: [], analysisItems: [], job: null, jobEpoch: 0, jobTimer: null, ttlTimer: null,
     previewTimer: null, metric: null, cameraStatus: 'OFFLINE', sceneCurrent: false,
-    sourceEpoch: 0, previewKey: '', liveSource: null, liveStream: null,
-    completedJob: null,
+    sourceEpoch: 0, previewKey: '', liveSource: null, liveStream: null, completedJob: null,
   };
-  const gateNames = ['start', 'end', 'inside'];
   const hints = {
-    select: 'Выберите вершину и перетащите её. Двойной щелчок по ребру вставляет вершину.',
+    select: 'Выберите вершину и перетащите её. У обычного контура двойной щелчок по ребру вставляет вершину.',
     floor: 'Отметьте видимый пол по контуру, затем завершите. Не дорисовывайте скрытую геометрию по догадке.',
     object: 'Введите название объекта и отметьте его силуэт. Новый объект создаётся отдельной кнопкой.',
-    gate: 'Отметьте начало линии, конец линии, затем точку внутри помещения.',
+    door: 'Два щелчка задают порог. Верх появится автоматически; затем подгоните четыре угла под проём.',
+    gate: 'Два щелчка задают порог учёта. Подгоните четыре угла и проверьте, где внутри и снаружи.',
     metric: 'Четыре угла: (0,0), (ширина,0), (ширина,глубина), (0,глубина). Затем введите измерения.',
     ai: 'Выберите положительные/отрицательные точки или протяните рамку, затем запросите контур.',
   };
@@ -70,6 +69,12 @@
     }
     return Math.abs(area) < 1e-12 ? 'Контур не имеет площади.' : '';
   }
+  function doorError(quad, minimum = .02) {
+    if (!Array.isArray(quad) || quad.length !== 4 || !quad.every(point)) return 'У прохода должны быть четыре угла в пределах кадра.';
+    if (Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]) < minimum - 1e-12) return `Разнесите концы порога минимум на ${String(minimum).replace('.', ',')}.`;
+    if (quad[3][1] >= quad[0][1] || quad[2][1] >= quad[1][1]) return 'Верх каждой стойки должен быть строго выше её основания.';
+    return '';
+  }
   function project(matrix, p) {
     const z = matrix[2][0] * p[0] + matrix[2][1] * p[1] + matrix[2][2];
     if (!Number.isFinite(z) || Math.abs(z) < 1e-12) return null;
@@ -96,8 +101,8 @@
     const h = rows.map(row => row[8]).concat(1), scale = Math.max(...h.map(Math.abs));
     return [h.slice(0, 3), h.slice(3, 6), h.slice(6, 9)].map(row => row.map(x => x / scale));
   }
-  function compileMetric() {
-    const m = state.geometry.metric, floor = state.geometry.floor;
+  function compileMetric(geometry = state.geometry) {
+    const m = geometry.metric, floor = geometry.floor;
     if (!m) return null;
     if (polygonError(floor)) throw new Error('Сначала завершите простой контур пола.');
     if (m.corners.length !== 4 || polygonError(m.corners)) throw new Error('Отметьте четыре разных угла прямоугольника по порядку.');
@@ -116,63 +121,104 @@
     }
     return {forward, inverse, width: m.width_m, depth: m.depth_m};
   }
-  function geometryError() {
-    const g = state.geometry;
-    if (g.floor !== null && polygonError(g.floor)) return `Пол: ${polygonError(g.floor)}`;
-    for (const o of g.objects) {
-      if (!o.label.trim() || o.label.length > 80) return 'Каждому объекту нужно название от 1 до 80 символов.';
-      if (polygonError(o.polygon)) return `${o.label}: ${polygonError(o.polygon)}`;
+  function geometryError(g = state.geometry) {
+    if (g.version !== 2 || !Array.isArray(g.objects) || !Array.isArray(g.doors)) return 'Нужна геометрия сцены версии 2.';
+    if (g.objects.length > 32 || g.doors.length > 8) return 'Допускается не больше 32 объектов и 8 проходов.';
+    const ids = new Set();
+    for (const item of [...g.objects, ...g.doors]) {
+      if (typeof item.id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.id) || ids.has(item.id.toLowerCase())) return 'Идентификаторы объектов и проходов должны быть уникальными UUID.';
+      ids.add(item.id.toLowerCase());
+      if (typeof item.label !== 'string' || !item.label.trim() || item.label.length > 80) return 'Каждому объекту и проходу нужно название от 1 до 80 символов.';
     }
-    try { compileMetric(); } catch (e) { return e.message; }
+    if (g.floor !== null && polygonError(g.floor)) return `Пол: ${polygonError(g.floor)}`;
+    for (const o of g.objects) if (polygonError(o.polygon)) return `${o.label}: ${polygonError(o.polygon)}`;
+    for (const d of g.doors) {
+      if (!['DOOR', 'PASSAGE'].includes(d.kind)) return 'Выберите тип: дверь или проход.';
+      if (doorError(d.quad)) return `${d.label}: ${doorError(d.quad)}`;
+    }
+    try { compileMetric(g); } catch (e) { return e.message; }
     return '';
   }
-  function gateError() {
-    const [a, b, inside] = state.gate.points;
-    if (![a, b, inside].every(point)) return 'Введите три точки входа в пределах кадра.';
-    const length = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    if (length < .05 - 1e-12) return 'Разнесите концы линии минимум на 0,05.';
-    if (Math.abs(cross(a, b, inside)) / length < .05 - 1e-12) return 'Внутренняя точка должна быть минимум в 0,05 от линии.';
-    if (!state.gate.role) return 'Выберите назначение камеры.';
-    if (state.config?.role && state.gate.role !== state.config.role) return 'Назначенную роль нельзя заменить здесь: используйте настройку учёта.';
+  const gateQuad = gate => [gate.threshold[0], gate.threshold[1], gate.top[1], gate.top[0]];
+  function gateError(g = state.gate, config = state.config) {
+    const error = doorError(gateQuad(g), .05);
+    if (error) return error;
+    if (!point(g.inside)) return 'Проход у края кадра: внутренняя сторона не помещается — сдвиньте порог';
+    const [a, b] = g.threshold, length = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (Math.abs(cross(a, b, g.inside)) / length < .05 - 1e-12) return 'Внутренняя точка должна быть минимум в 0,05 от порога.';
+    if (!['DOOR', 'PASSAGE'].includes(g.kind)) return 'Выберите тип прохода.';
+    if (!['ENTRY', 'EXIT', 'BOTH'].includes(g.role)) return config?.role ? 'Назначенную роль нельзя стереть.' : 'Выберите, что считать.';
     return '';
   }
-  function gateFrom(config) { return {points: [config.line_start, config.line_end, config.inside_point].map(p => p ? [...p] : null), role: config.role || '', enabled: Boolean(config.enabled)}; }
+  function gateFrom(config) {
+    const threshold = [config.line_start, config.line_end].map(p => p ? [...p] : null);
+    const top = config.door_top ? clone(config.door_top) : [null, null];
+    const inside = config.inside_point ? [...config.inside_point] : null;
+    const side = threshold.every(point) && point(inside) ? (cross(...threshold, inside) < 0 ? -1 : 1) : 1;
+    return {threshold, top, inside, side, kind: config.door_kind || 'DOOR', role: config.role || 'BOTH', enabled: Boolean(config.enabled)};
+  }
   const sceneDirty = () => JSON.stringify(state.geometry) !== JSON.stringify(state.saved?.geometry || emptyGeometry());
   const gateDirty = () => JSON.stringify(state.gate) !== JSON.stringify(state.config ? gateFrom(state.config) : emptyGate());
   const editable = () => Boolean(state.image && state.snapshot && !state.busy);
   const saveable = () => editable() && state.validSnapshot && !state.review;
+  const selectedDoor = () => state.geometry.doors.find(d => d.id === state.selection);
+  const fixedShape = id => id === 'gate' || state.geometry.doors.some(d => d.id === id);
   function checkpoint() {
-    state.undo.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection});
+    if (state.job) cancelJob();
+    state.undo.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection, analysisItems: clone(state.analysisItems)});
     if (state.undo.length > 60) state.undo.shift();
     state.redo.length = 0;
   }
   function history(undo) {
     if (!editable()) return;
+    cancelJob();
     const from = undo ? state.undo : state.redo, to = undo ? state.redo : state.undo;
     if (!from.length) return;
-    to.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection});
+    to.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection, analysisItems: clone(state.analysisItems)});
     Object.assign(state, from.pop()); state.vertex = -1; state.drawing = false; sync();
   }
   function selectedPoints() {
     if (state.selection === 'floor') return state.geometry.floor;
-    if (state.selection === 'gate') return state.gate.points;
+    if (state.selection === 'gate') return gateQuad(state.gate);
     if (state.selection === 'metric') return state.geometry.metric?.corners;
-    return state.geometry.objects.find(o => o.id === state.selection)?.polygon;
+    return selectedDoor()?.quad || state.geometry.objects.find(o => o.id === state.selection)?.polygon;
+  }
+  function moveVertex(index, value) {
+    const points = selectedPoints();
+    if (!points || !point(value)) return false;
+    if (fixedShape(state.selection)) {
+      const bottom = index === 2 ? 1 : 0, top = index === 0 ? 3 : 2;
+      if ((index >= 2 && point(points[bottom]) && value[1] >= points[bottom][1])
+          || (index < 2 && point(points[top]) && value[1] <= points[top][1])) {
+        message('Верх стойки должен быть строго выше основания.', 'err'); return false;
+      }
+    }
+    if (state.selection === 'gate') {
+      if (index < 2) state.gate.threshold[index] = value;
+      else state.gate.top[index === 3 ? 0 : 1] = value;
+      state.gate.inside = state.gate.threshold.every(point)
+        ? window.Door3D.insidePoint(state.gate.threshold, state.gate.top, state.gate.side) : null;
+    } else points[index] = value;
+    return true;
   }
   function allShapes() {
-    return [{id: 'floor', points: state.geometry.floor, visible: state.layers.floor},
-      ...state.geometry.objects.map(o => ({id: o.id, points: o.polygon, visible: state.layers.objects})),
-      {id: 'metric', points: state.geometry.metric?.corners, visible: state.layers.metric},
-      {id: 'gate', points: state.gate.points, visible: state.layers.gate}];
+    const scene = state.mode === 'scene';
+    return [{id: 'floor', points: state.geometry.floor, visible: scene && state.layers.floor},
+      ...state.geometry.objects.map(o => ({id: o.id, points: o.polygon, visible: scene && state.layers.objects})),
+      ...state.geometry.doors.map(d => ({id: d.id, points: d.quad, visible: scene && state.layers.doors})),
+      {id: 'metric', points: state.geometry.metric?.corners, visible: scene && state.layers.metric},
+      {id: 'gate', points: gateQuad(state.gate), visible: !scene && state.layers.gate}];
   }
   function setTool(tool) {
-    state.tool = tool; state.drawing = ['floor', 'object', 'metric', 'gate'].includes(tool);
+    if (tool === 'gate' && state.camera?.profile.zone !== 'ENTRANCE') return;
+    cancelJob();
+    state.tool = tool; state.drawing = ['floor', 'object', 'door', 'metric', 'gate'].includes(tool);
     if (tool === 'floor') state.selection = 'floor';
     if (tool === 'gate') state.selection = 'gate';
     if (tool === 'metric') state.selection = 'metric';
+    if (tool === 'door') state.selection = '';
     if (tool === 'object' && !state.geometry.objects.some(o => o.id === state.selection)) state.selection = '';
-    state.vertex = -1;
-    sync();
+    state.vertex = -1; sync();
   }
   function newObject() {
     if (!editable()) return null;
@@ -208,25 +254,17 @@
     ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [7, 5] : []);
     path(points, t, closed); ctx.stroke(); ctx.setLineDash([]);
   }
-  function drawArrow(t, color) {
-    const [a, b, inside] = state.gate.points;
-    stroke([a, b], t, color, false);
-    if (![a, b, inside].every(point)) return;
-    const aa = display(a, t), bb = display(b, t), ii = display(inside, t);
-    const mid = [(aa[0] + bb[0]) / 2, (aa[1] + bb[1]) / 2];
-    let nx = -(bb[1] - aa[1]), ny = bb[0] - aa[0];
-    const length = Math.hypot(nx, ny); if (length < 1e-6) return;
-    const sign = (ii[0] - mid[0]) * nx + (ii[1] - mid[1]) * ny >= 0 ? 1 : -1;
-    nx *= sign * 30 / length; ny *= sign * 30 / length;
-    const from = [mid[0] - nx, mid[1] - ny], to = [mid[0] + nx, mid[1] + ny];
-    const angle = Math.atan2(ny, nx);
-    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3; ctx.beginPath();
-    ctx.moveTo(...from); ctx.lineTo(...to);
-    ctx.moveTo(to[0] - 12 * Math.cos(angle - .45), to[1] - 12 * Math.sin(angle - .45));
-    ctx.lineTo(...to); ctx.lineTo(to[0] - 12 * Math.cos(angle + .45), to[1] - 12 * Math.sin(angle + .45)); ctx.stroke();
-    ctx.font = '13px sans-serif'; ctx.lineWidth = 4; ctx.strokeStyle = '#1C1B1F';
-    const label = 'Снаружи → внутрь', x = Math.max(t.x + 4, Math.min(mid[0] + 8, t.x + t.iw - ctx.measureText(label).width - 4)), y = mid[1] - 38;
-    ctx.strokeText(label, x, y); ctx.fillText(label, x, y);
+  function gateMetric() {
+    const s = state.saved, [a, b] = state.gate.threshold;
+    const dimensionsMatch = !state.snapshot || (state.snapshot.source_revision === s?.source_revision
+      && state.snapshot.width === s?.reference_width && state.snapshot.height === s?.reference_height);
+    return state.sceneCurrent && s?.status === 'CURRENT' && s.metric_transform && dimensionsMatch
+      && !geometryError(s.geometry) && contains(a, s.geometry.floor) && contains(b, s.geometry.floor)
+      && (!state.review || !gateDirty()) ? s.metric_transform : null;
+  }
+  function drawDoorFrame(quad, kind, t, inside = null, role = null, selected = false, metric = null) {
+    if (!quad.every(point)) { stroke(quad.slice(0, 2), t, getComputedStyle(root).getPropertyValue('--vid-warn').trim(), false); return; }
+    window.Door3D.draw(ctx, {quad, inside, kind, role, display: p => display(p, t), metric, selected});
   }
   function gridSpec(metric) {
     const mapped = state.geometry.floor.map(p => project(metric.forward, p));
@@ -273,11 +311,12 @@
     if (state.layers.floor) stroke(state.geometry.floor, t, green);
     if (state.layers.objects) for (const o of state.geometry.objects) stroke(o.polygon, t, orange);
     if (state.layers.metric) { drawGrid(t, green); stroke(state.geometry.metric?.corners, t, amber); }
-    if (state.layers.gate) drawArrow(t, amber);
+    if (state.layers.doors) for (const d of state.geometry.doors) drawDoorFrame(d.quad, d.kind, t, null, null, state.selection === d.id);
+    if (state.mode === 'gate' && state.layers.gate) drawDoorFrame(gateQuad(state.gate), state.gate.kind, t, state.gate.inside, state.gate.role, state.selection === 'gate', gateMetric());
     if (state.layers.suggestions) state.candidates.forEach((candidate, i) => { ctx.globalAlpha = String(i) === $('scene-ai-candidate').value ? 1 : .4; stroke(candidate.points, t, '#FFFFFF', true, true); });
     ctx.globalAlpha = 1;
     for (const shape of allShapes()) {
-      if (!shape.visible) continue;
+      if (!shape.visible || !showsHandles(shape)) continue;
       (shape.points || []).forEach((p, i) => {
         if (!point(p)) return;
         const [x, y] = display(p, t), selected = shape.id === state.selection;
@@ -342,30 +381,33 @@
     state.previewTimer = setTimeout(() => { try { drawRectified(); } catch (_) { $('scene-rectified').hidden = true; message('Не удалось построить проекцию в браузере. Черновик сохранён.', 'err'); } }, 180);
   }
   function syncGateFields() {
-    gateNames.forEach((name, i) => ['x','y'].forEach((axis,j) => { $(`gate-${name}-${axis}`).value = state.gate.points[i]?.[j] ?? ''; }));
     $('calibration-role').value = state.gate.role; $('calibration-enabled').checked = state.gate.enabled;
-    for (const option of $('calibration-role').options) option.disabled = Boolean(state.config?.role && option.value !== state.config.role);
+    $('calibration-kind').value = state.gate.kind;
+    const selected = $('calibration-scene-door').value;
+    $('calibration-scene-door').replaceChildren(new Option('Выберите дверь или проход', ''),
+      ...state.geometry.doors.filter(d => !doorError(d.quad)).map(d => new Option(d.label, d.id)));
+    $('calibration-scene-door').value = selected;
   }
   function renderCoordinates() {
     const list = $('scene-coordinate-list'); list.replaceChildren();
     const points = selectedPoints();
-    if (!points) { const p = document.createElement('p'); p.textContent = 'Выберите контур, вход или масштаб.'; list.append(p); return; }
+    if (!points) { const p = document.createElement('p'); p.textContent = 'Выберите контур, проход или масштаб.'; list.append(p); return; }
     points.forEach((p, i) => {
       const row = document.createElement('div'); row.className = 'scene-coordinate-row';
       const select = document.createElement('button'); select.type = 'button'; select.className = 'btn'; select.textContent = String(i+1); select.setAttribute('aria-label', `Выбрать вершину ${i+1}`); select.setAttribute('aria-pressed', String(state.vertex === i));
       select.addEventListener('click', () => { state.vertex = i; draw(); renderCoordinates(); }); row.append(select);
       ['X','Y'].forEach((axis,j) => {
         const label = document.createElement('label'); label.className = 'field'; label.textContent = axis;
-        const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = '1'; input.step = 'any'; input.value = p?.[j] ?? ''; input.disabled = !editable();
+        const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = '1'; input.step = 'any'; input.value = p?.[j] ?? ''; input.disabled = !editable() || !point(p);
         input.setAttribute('aria-label', `Вершина ${i+1}, ${axis}`);
         input.addEventListener('change', () => {
           if (!editable()) return;
           const value = input.value === '' ? NaN : Number(input.value);
           if (!Number.isFinite(value) || value < 0 || value > 1) { message('Координата должна быть от 0 до 1.', 'err'); return; }
-          checkpoint(); const next = [...(points[i] || [null,null])]; next[j] = value; points[i] = next; state.vertex = i; sync();
+          checkpoint(); const next = [...p]; next[j] = value; moveVertex(i, next); state.vertex = i; sync();
         }); label.append(input); row.append(label);
       });
-      const remove = document.createElement('button'); remove.className = 'btn'; remove.type = 'button'; remove.setAttribute('aria-label', `Удалить вершину ${i+1}`); remove.disabled = !editable();
+      const remove = document.createElement('button'); remove.className = 'btn'; remove.type = 'button'; remove.setAttribute('aria-label', `Удалить вершину ${i+1}`); remove.disabled = !editable() || fixedShape(state.selection);
       const icon = document.createElementNS('http://www.w3.org/2000/svg','svg');
       icon.setAttribute('viewBox','0 0 24 24'); icon.setAttribute('width','20'); icon.setAttribute('height','20'); icon.setAttribute('aria-hidden','true');
       const lines = document.createElementNS('http://www.w3.org/2000/svg','path');
@@ -374,45 +416,74 @@
       remove.addEventListener('click', () => { state.vertex = i; deleteVertex(); }); row.append(remove); list.append(row);
     });
   }
+  function renderAnalysis() {
+    const list = $('scene-analysis-results'); list.replaceChildren();
+    for (const item of state.analysisItems) {
+      const shape = item.id === 'floor' ? (state.geometry.floor && {label: 'Пол'}) :
+        [...state.geometry.objects, ...state.geometry.doors].find(shape => shape.id === item.id);
+      if (!shape) continue;
+      const row = document.createElement('div'); row.className = 'scene-analysis-row';
+      const select = document.createElement('button'); select.type = 'button'; select.className = 'scene-analysis-select';
+      const kind = {FLOOR: 'пол', OBJECT: 'предмет', DOOR: 'дверь', PASSAGE: 'проход'}[item.kind];
+      select.textContent = `${shape.label} · ${kind}${Number.isFinite(item.score) ? ` · ${(item.score * 100).toFixed(0)}%` : ''}${item.outline === 'BOX' ? ' · рамка' : ''}`;
+      select.setAttribute('aria-pressed', String(state.selection === item.id));
+      select.addEventListener('click', () => { state.selection = item.id; state.vertex = -1; state.tool = 'select'; state.drawing = false; sync(); });
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn'; remove.textContent = 'Удалить'; remove.disabled = !editable();
+      remove.setAttribute('aria-label', `Удалить: ${shape.label}`);
+      remove.addEventListener('click', () => { state.selection = item.id; clearSelected(); });
+      row.append(select, remove); list.append(row);
+    }
+  }
   function sync() {
-    const options = [['','Нет выбора'],['floor','Пол'], ...state.geometry.objects.map(o => [o.id, o.label || 'Без названия']), ['gate','Вход'], ['metric','Масштаб']];
+    const options = state.mode === 'gate' ? [['', 'Нет выбора'], ['gate', 'Проход учёта']] :
+      [['', 'Нет выбора'], ['floor', 'Пол'], ...state.geometry.objects.map(o => [o.id, o.label || 'Без названия']),
+        ...state.geometry.doors.map(d => [d.id, d.label]), ['metric', 'Масштаб']];
     $('scene-selection').replaceChildren(...options.map(([value, label]) => new Option(label,value)));
     $('scene-selection').value = state.selection;
-    const object = state.geometry.objects.find(o => o.id === state.selection);
+    const object = selectedDoor() || state.geometry.objects.find(o => o.id === state.selection);
     if (object) $('scene-object-label').value = object.label;
     $('scene-width').value = state.geometry.metric?.width_m ?? ''; $('scene-depth').value = state.geometry.metric?.depth_m ?? '';
     syncGateFields();
-    root.querySelectorAll('[data-scene-tool]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.sceneTool === state.tool)));
+    $('calibration-validation').textContent = state.gate.threshold.some(point) ? gateError() : 'Отметьте два конца порога или возьмите проход из сцены.';
+    root.querySelectorAll('[data-scene-tool]').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.sceneTool === state.tool));
+      button.hidden = Boolean(button.dataset.mappingMode && button.dataset.mappingMode !== state.mode);
+    });
     $('scene-ai-panel').hidden = state.tool !== 'ai'; $('scene-tool-hint').textContent = hints[state.tool];
     state.metric = null;
     try { state.metric = compileMetric(); $('scene-metric-status').textContent = state.metric ? 'Проекция черновика построена. Окончательная численная проверка выполняется при сохранении.' : 'Масштаб не задан; положение и ширина в метрах не определяются.'; }
     catch (e) { $('scene-metric-status').textContent = e.message; }
-    $('scene-draft-status').textContent = `${sceneDirty() ? 'Сцена: есть несохранённые изменения.' : 'Сцена: без изменений.'} ${gateDirty() ? 'Вход: есть несохранённые изменения.' : 'Вход: без изменений.'} Эти две разметки сохраняются отдельно.`;
-    buttons(); renderCoordinates(); draw(); schedulePreview(); gateWidth();
+    $('scene-draft-status').textContent = `${sceneDirty() ? 'Сцена: есть несохранённые изменения.' : 'Сцена: без изменений.'} ${gateDirty() ? 'Проход: есть несохранённые изменения.' : 'Проход: без изменений.'} Эти две разметки сохраняются отдельно.`;
+    buttons(); renderCoordinates(); renderAnalysis(); draw(); schedulePreview(); gateWidth();
   }
   function buttons() {
     root.setAttribute('aria-busy', String(state.busy));
+    const entrance = state.camera?.profile.zone === 'ENTRANCE';
     $('calibration-freeze').disabled = state.busy;
     $('scene-undo').disabled = !editable() || !state.undo.length; $('scene-redo').disabled = !editable() || !state.redo.length;
     $('scene-save').disabled = !saveable() || !state.saved || Boolean(geometryError());
-    $('calibration-save').disabled = !saveable() || !state.config || Boolean(gateError());
+    $('calibration-save').disabled = !entrance || !saveable() || !state.config || Boolean(gateError());
     $('calibration-disable').disabled = state.busy || !state.config?.role || !state.config?.enabled;
-    $('calibration-clear').disabled = !editable();
+    $('calibration-clear').disabled = !entrance || !editable();
     $('scene-reconcile').hidden = !state.review;
     $('scene-keep-draft').disabled = !state.validSnapshot || state.busy || !$('scene-reviewed').checked;
     $('scene-use-saved').disabled = !state.validSnapshot || state.busy;
-    $('scene-ai-submit').disabled = !saveable() || Boolean(state.job);
-    $('scene-ai-cancel').disabled = !state.job;
+    $('scene-ai-submit').disabled = !saveable() || Boolean(state.job) || !state.saved?.assistance_available;
+    $('scene-ai-cancel').disabled = !state.job || state.job.kind === 'analysis';
     $('scene-ai-accept').disabled = !saveable() || !state.candidates.length;
+    $('scene-analysis').disabled = !saveable() || !state.saved?.analysis_available || Boolean(state.job);
+    $('scene-analysis-cancel').hidden = state.job?.kind !== 'analysis';
+    $('scene-analysis-help').textContent = !state.saved?.analysis_available ? 'Модель распознавания не установлена — пересоберите модели' :
+      !state.validSnapshot ? 'Зафиксируйте свежий кадр для распознавания.' : state.review ? 'Сначала подтвердите сверку разметки с новым кадром.' : 'Результат — черновик. Проверьте его и сохраните сцену.';
     root.querySelectorAll('[data-scene-tool]').forEach(button => { button.disabled = state.busy; });
-    for (const id of ['scene-finish','scene-new-object','scene-clear-selected','scene-add-vertex','scene-remove-metric','scene-ai-clear','scene-width','scene-depth','scene-object-label','calibration-role','calibration-enabled']) $(id).disabled = !editable();
-    gateNames.forEach(name => ['x','y'].forEach(axis => { $(`gate-${name}-${axis}`).disabled = !editable(); }));
-    $('scene-add-vertex').disabled = !editable() || !selectedPoints()?.length || ['gate','metric'].includes(state.selection);
+    for (const id of ['scene-finish','scene-new-object','scene-clear-selected','scene-add-vertex','scene-remove-metric','scene-ai-clear','scene-width','scene-depth','scene-object-label','scene-door-kind','calibration-role','calibration-enabled','calibration-kind','calibration-scene-door','calibration-flip']) $(id).disabled = !editable();
+    $('scene-add-vertex').disabled = !editable() || !selectedPoints()?.length || fixedShape(state.selection) || state.selection === 'metric';
     $('scene-clear-selected').disabled = !editable() || !state.selection;
+    $('calibration-flip').disabled = !editable() || !state.gate.threshold.every(point);
   }
   function showRuntime() {
     const r = state.runtime; if (!r) return;
-    const parts = [r.role === 'ENTRY' ? 'Вход' : r.role === 'EXIT' ? 'Выход' : 'Роль не назначена', r.enabled ? 'учёт включён' : 'учёт отключён', `поток: ${state.cameraStatus}`];
+    const parts = [{ENTRY: 'Только вход', EXIT: 'Только выход', BOTH: 'Вход и выход'}[r.role] || 'Роль не назначена', r.enabled ? 'учёт включён' : 'учёт отключён', `поток: ${state.cameraStatus}`];
     if (r.camera_enabled === false) parts.push('камера отключена');
     if (r.ai_enabled === false) parts.push('ИИ выключен'); else if (r.ai_included === false) parts.push('камера исключена из ИИ'); else if (r.ai_available === false) parts.push('ИИ недоступен');
     parts.push(r.commissioning_required ? 'наладка не подтверждена — автоматический учёт запрещён' : 'акт наладки сохранён; готовность проверяет монитор учёта');
@@ -432,9 +503,17 @@
   }
   function errorMessage(error, id = 'scene-message') {
     const code = error.detail?.code;
-    if (error.status === 409 || error.status === 410) markStale(code || 'Кадр истёк, источник или конфигурация изменились.', error.status !== 410);
-    const known = {SCENE_MODEL_UNAVAILABLE: 'Модель ИИ-подсказок недоступна. Ручная разметка работает.', SCENE_INFERENCE_FAILED: 'Ошибка модели ИИ. Предложение не создано; ручная разметка работает.', SCENE_BUSY: 'Сервис занят или лимит замороженных кадров исчерпан. Дождитесь завершения/истечения кадров и повторите.', SCENE_GEOMETRY_INVALID: 'Геометрия отклонена сервером. Проверьте пересечения и масштаб; можно убрать масштаб и сохранить контуры.'};
-    message(known[code] || (error.status === 409 || error.status === 410 ? 'Сохранение не подтверждено. Черновик сохранён; требуется новый кадр и сверка.' : error.detail?.message || error.message || 'Нет связи. Черновик сохранён.'), 'err', id);
+    if ((error.status === 409 && code !== 'SCENE_JOB_KIND_MISMATCH') || error.status === 410) markStale(code || 'Кадр истёк, источник или конфигурация изменились.', error.status !== 410);
+    const known = {
+      SCENE_MODEL_UNAVAILABLE: 'Модель ИИ-подсказок недоступна. Ручная разметка работает.',
+      SCENE_DETECTOR_UNAVAILABLE: 'Модель распознавания не установлена — пересоберите модели. Ручная разметка работает.',
+      SCENE_INFERENCE_FAILED: 'Ошибка модели ИИ. Разметка не создана; ручная разметка работает.',
+      SCENE_BUSY: 'Модель занята. Дождитесь завершения текущего запроса и повторите распознавание.',
+      SCENE_JOB_KIND_MISMATCH: 'Получен результат другого типа запроса. Повторите распознавание на свежем кадре.',
+      SCENE_GEOMETRY_INVALID: 'Геометрия отклонена сервером. Проверьте пересечения и масштаб; можно убрать масштаб и сохранить контуры.',
+    };
+    message(known[code] || (typeof error.detail === 'string' ? error.detail : error.detail?.message)
+      || (error.status === 409 || error.status === 410 ? 'Сохранение не подтверждено. Черновик сохранён; требуется новый кадр и сверка.' : error.message || 'Нет связи. Черновик сохранён.'), 'err', id);
   }
   async function request(url, method, payload) {
     return window.OperatorUI.api(url, {method, headers: {'Content-Type':'application/json'}, ...(payload !== undefined ? {body: JSON.stringify(payload)} : {})});
@@ -475,42 +554,43 @@
       message('Исправьте введённые координаты и измерения перед сохранением.','err'); return;
     }
     const error = geometryError(); if (error) { message(error,'err'); return; }
-    state.busy = true; buttons();
+    state.busy = true; cancelJob(); buttons();
     const epoch = state.sourceEpoch;
     try {
       const saved = await request(base,'PUT',{snapshot_id:state.snapshot.snapshot_id,expected_revision:state.saved.revision,expected_source_revision:state.snapshot.source_revision,geometry:clone(state.geometry)});
-      state.saved = saved; state.geometry = clone(saved.geometry); state.sceneCurrent = saved.status === 'CURRENT' && epoch === state.sourceEpoch;
-      message('Сцена сохранена. Линия входа и наладка не изменены.','ok'); showScene();
+      state.saved = {...state.saved, ...saved}; state.geometry = clone(saved.geometry); state.sceneCurrent = saved.status === 'CURRENT' && epoch === state.sourceEpoch;
+      message('Сцена сохранена. Проход учёта и наладка не изменены.', 'ok'); showScene();
       window.dispatchEvent(new CustomEvent('scene-saved',{detail:saved}));
     } catch (e) { errorMessage(e); }
     finally { state.busy = false; sync(); }
   }
   async function saveGate(disable = false) {
-    if (state.busy || !state.config || (!disable && !saveable())) return;
-    if (!disable && gateError()) { message(gateError(),'err','calibration-message'); return; }
+    if (state.busy || !state.config || (!disable && (!saveable() || state.camera?.profile.zone !== 'ENTRANCE'))) return;
+    if (!disable && gateError()) { message(gateError(), 'err', 'calibration-message'); return; }
     if (!disable && !$('calibration-form').reportValidity()) return;
     const c = state.config, g = disable ? gateFrom(c) : state.gate;
-    const payload = {role:g.role,enabled:disable ? false : g.enabled,line_start:g.points[0],line_end:g.points[1],inside_point:g.points[2],
-      reference_width:disable ? c.reference_width : state.snapshot.width,reference_height:disable ? c.reference_height : state.snapshot.height,
-      expected_revision:c.revision,expected_source_revision:disable ? c.source_revision : state.snapshot.source_revision};
-    state.busy = true; buttons();
+    const payload = {role: g.role, enabled: disable ? false : g.enabled,
+      line_start: g.threshold[0], line_end: g.threshold[1], inside_point: g.inside,
+      door_kind: g.kind, door_top: clone(g.top),
+      reference_width: disable ? c.reference_width : state.snapshot.width,
+      reference_height: disable ? c.reference_height : state.snapshot.height,
+      expected_revision: c.revision, expected_source_revision: disable ? c.source_revision : state.snapshot.source_revision};
+    state.busy = true; cancelJob(); buttons();
     try {
-      const saved = await request(attendance,'PUT',payload); state.config = saved; state.runtime = saved;
+      const saved = await request(attendance, 'PUT', payload); state.config = saved; state.runtime = saved;
       if (!disable) state.gate = gateFrom(saved); else state.gate.enabled = false;
-      message(disable ? 'Учёт отключён. Черновик геометрии сохранён.' : 'Линия входа сохранена. Требуется повторная наладка; сцена отдельно не сохранялась.','ok','calibration-message'); showRuntime();
-    } catch (e) { errorMessage(e,'calibration-message'); }
+      message(disable ? 'Учёт отключён. Черновик геометрии сохранён.' : 'Проход учёта сохранён. Требуется повторная наладка; сцена отдельно не сохранялась.', 'ok', 'calibration-message');
+      showRuntime();
+      window.dispatchEvent(new CustomEvent('camera-attendance-changed'));
+    } catch (e) { errorMessage(e, 'calibration-message'); }
     finally { state.busy = false; sync(); }
   }
   function gateWidth() {
-    let text = 'Ширина входа: не откалибрована.';
-    const s = state.saved, [a,b] = state.gate.points;
-    const dimensionsMatch = !state.snapshot || (state.snapshot.source_revision === s?.source_revision
-      && state.snapshot.width === s?.reference_width && state.snapshot.height === s?.reference_height);
-    if (state.sceneCurrent && s?.status === 'CURRENT' && s.metric_transform && dimensionsMatch
-        && point(a) && point(b) && contains(a,s.geometry.floor) && contains(b,s.geometry.floor)
-        && (!state.review || !gateDirty())) {
-      const aa=project(s.metric_transform.image_to_metres,a), bb=project(s.metric_transform.image_to_metres,b);
-      if (aa && bb) text = `Приблизительная ширина входа: ${Math.hypot(bb[0]-aa[0],bb[1]-aa[1]).toFixed(2)} м · по сохранённому полу${gateDirty() ? ', линия пока в черновике' : ''}.`;
+    let text = 'Ширина прохода: не откалибрована.';
+    const metric = gateMetric(), [a, b] = state.gate.threshold;
+    if (metric) {
+      const aa = project(metric.image_to_metres, a), bb = project(metric.image_to_metres, b);
+      if (aa && bb) text = `Приблизительная ширина прохода: ${Math.hypot(bb[0]-aa[0],bb[1]-aa[1]).toFixed(2)} м · по сохранённому полу${gateDirty() ? ', проход пока в черновике' : ''}.`;
     }
     $('scene-gate-width').textContent = text;
   }
@@ -537,34 +617,43 @@
     }
   }
   function deleteVertex() {
-    const p=selectedPoints(); if (!editable() || !p || state.vertex<0 || state.vertex>=p.length) return;
-    checkpoint(); if (state.selection==='gate') p[state.vertex]=null; else p.splice(state.vertex,1);
+    const p = selectedPoints(); if (!editable() || !p || fixedShape(state.selection) || state.vertex < 0 || state.vertex >= p.length) return;
+    checkpoint(); p.splice(state.vertex, 1);
     state.vertex=Math.min(state.vertex,p.length-1); sync();
   }
   function insertVertex(index, value) {
-    const p=selectedPoints(); if (!editable() || !p || !p.length || ['gate','metric'].includes(state.selection)) return;
+    const p = selectedPoints(); if (!editable() || !p?.length || fixedShape(state.selection) || state.selection === 'metric') return;
     if (p.length>=128) { message('Не больше 128 вершин в контуре.','err'); return; }
     checkpoint(); p.splice(index+1,0,value); state.vertex=index+1; sync();
+  }
+  function clearGate() {
+    state.gate = {...state.gate, threshold: [null, null], top: [null, null], inside: null};
   }
   function clearSelected() {
     if (!editable() || !state.selection) return;
     checkpoint();
-    if (state.selection==='floor') { state.geometry.floor=null; state.geometry.metric=null; }
-    else if (state.selection==='metric') state.geometry.metric=null;
-    else if (state.selection==='gate') state.gate.points=[null,null,null];
-    else state.geometry.objects=state.geometry.objects.filter(o=>o.id!==state.selection);
-    state.vertex=-1; sync();
+    if (state.selection === 'floor') { state.geometry.floor = null; state.geometry.metric = null; }
+    else if (state.selection === 'metric') state.geometry.metric = null;
+    else if (state.selection === 'gate') clearGate();
+    else {
+      state.geometry.objects = state.geometry.objects.filter(o => o.id !== state.selection);
+      state.geometry.doors = state.geometry.doors.filter(d => d.id !== state.selection);
+      state.selection = '';
+    }
+    state.vertex = -1; sync();
   }
+  // A model outline can have a hundred vertices; its handles appear once it is selected.
+  function showsHandles(shape) { return shape.id === state.selection || (shape.points || []).length <= 12; }
   function hitVertex(position) {
     const t=transform(); let best=null, distance=14;
-    for (const shape of allShapes()) if (shape.visible) (shape.points||[]).forEach((p,index)=>{
+    for (const shape of allShapes()) if (shape.visible && showsHandles(shape)) (shape.points||[]).forEach((p,index)=>{
       if (!point(p)) return; const q=display(p,t), d=Math.hypot(q[0]-position[0],q[1]-position[1]);
       if (d<distance) { distance=d; best={id:shape.id,index}; }
     }); return best;
   }
   function edgeHit(position) {
     const t=transform(); let best=null, distance=12;
-    for (const shape of allShapes()) if (shape.visible && !['gate','metric'].includes(shape.id) && shape.points?.length>=2) {
+    for (const shape of allShapes()) if (shape.visible && !fixedShape(shape.id) && shape.id !== 'metric' && shape.points?.length >= 2) {
       const p=shape.points;
       for (let i=0;i<p.length;i++) {
         const a=display(p[i],t), b=display(p[(i+1)%p.length],t), dx=b[0]-a[0],dy=b[1]-a[1], l=dx*dx+dy*dy;
@@ -576,28 +665,56 @@
   }
   function addPoint(p) {
     if (!editable()) return;
-    if (state.tool==='select') {
-      const match=allShapes().filter(s=>s.visible && s.id!=='gate' && contains(p,s.points)).pop();
-      state.selection=match?.id||''; state.vertex=-1; sync(); return;
+    if (state.tool === 'select') {
+      const match = allShapes().filter(s => s.visible && s.points?.every(point) && contains(p, s.points)).pop();
+      state.selection = match?.id || ''; state.vertex = -1; sync(); return;
     }
-    if (state.tool==='ai') {
-      const kind=$('scene-ai-prompt').value; if (kind==='box') return;
-      if (state.prompts.positive_points.length+state.prompts.negative_points.length>=32) { message('Не больше 32 точек подсказки.','err'); return; }
+    if (state.tool === 'ai') {
+      const kind = $('scene-ai-prompt').value; if (kind === 'box') return;
+      if (state.prompts.positive_points.length + state.prompts.negative_points.length >= 32) { message('Не больше 32 точек подсказки.', 'err'); return; }
       cancelJob(); state.prompts[`${kind}_points`].push(p); draw(); return;
     }
     if (!state.drawing) return;
     checkpoint();
-    if (state.tool==='floor') { state.selection='floor'; if (!state.geometry.floor) state.geometry.floor=[]; }
-    if (state.tool==='object' && !state.geometry.objects.some(o=>o.id===state.selection) && !newObject()) { state.undo.pop(); return; }
-    if (state.tool==='metric') { state.selection='metric'; if (!state.geometry.metric) state.geometry.metric={corners:[],width_m:null,depth_m:null}; }
-    if (state.tool==='gate') {
-      state.selection='gate'; const index=state.gate.points.findIndex(p=>!point(p));
-      if (index<0) { state.undo.pop(); message('Три точки уже заданы. Перетащите их или разметьте вход заново.'); return; }
-      state.gate.points[index]=p; state.vertex=index;
+    if (state.tool === 'door' || state.tool === 'gate') {
+      const gate = state.tool === 'gate';
+      let door = selectedDoor();
+      if (!gate && !door) {
+        if (state.geometry.doors.length >= 8) { state.undo.pop(); message('Допускается не больше 8 дверей и проходов.', 'err'); return; }
+        const kind = $('scene-door-kind').value;
+        door = {id: window.OperatorUI.newRequestId(), label: kind === 'DOOR' ? 'Дверь' : 'Проход', kind, quad: [null, null, null, null]};
+        state.geometry.doors.push(door); state.selection = door.id;
+      }
+      if (gate) state.selection = 'gate';
+      const threshold = gate ? state.gate.threshold : door.quad.slice(0, 2);
+      const index = threshold.findIndex(p => !point(p));
+      if (index < 0) { state.undo.pop(); message('Порог уже задан. Перетащите углы или начните новый проход.'); return; }
+      threshold[index] = p;
+      if (!gate) door.quad[index] = p;
+      state.vertex = index;
+      if (threshold.every(point)) {
+        const kind = gate ? state.gate.kind : door.kind;
+        const top = window.Door3D.extrude(threshold, kind, state.image.naturalWidth, state.image.naturalHeight);
+        const quad = [threshold[0], threshold[1], top?.[1], top?.[0]];
+        const error = doorError(quad, gate ? .05 : .02);
+        if (error) {
+          if (gate) state.gate.threshold[index] = null; else door.quad[index] = null;
+          message(top ? error : 'Порог у верхнего края: сдвиньте его ниже, чтобы поместились стойки.', 'err');
+        } else {
+          if (gate) {
+            state.gate.top = top; state.gate.side = window.Door3D.defaultSide(threshold, top);
+            state.gate.inside = window.Door3D.insidePoint(threshold, top, state.gate.side);
+          } else door.quad = quad;
+          state.tool = 'select'; state.drawing = false;
+        }
+      }
     } else {
-      const points=selectedPoints(), limit=state.tool==='metric'?4:128;
-      if (points.length>=limit) { state.undo.pop(); message(`Допускается не больше ${limit} вершин. Перетащите имеющиеся.`); return; }
-      points.push(p); state.vertex=points.length-1;
+      if (state.tool === 'floor') { state.selection = 'floor'; if (!state.geometry.floor) state.geometry.floor = []; }
+      if (state.tool === 'object' && !state.geometry.objects.some(o => o.id === state.selection) && !newObject()) { state.undo.pop(); return; }
+      if (state.tool === 'metric') { state.selection = 'metric'; if (!state.geometry.metric) state.geometry.metric = {corners: [], width_m: null, depth_m: null}; }
+      const points = selectedPoints(), limit = state.tool === 'metric' ? 4 : 128;
+      if (points.length >= limit) { state.undo.pop(); message(`Допускается не больше ${limit} вершин. Перетащите имеющиеся.`); return; }
+      points.push(p); state.vertex = points.length - 1;
     }
     sync();
   }
@@ -622,7 +739,7 @@
     const g=state.gesture; if (!g || g.id!==event.pointerId) return;
     const position=eventPosition(event), p=imagePoint(position,true);
     if (g.kind==='pan') { state.pan=[g.pan[0]+position[0]-g.start[0],g.pan[1]+position[1]-g.start[1]]; draw(); }
-    if (g.kind==='vertex') { selectedPoints()[state.vertex]=p; state.metric=null; draw(); }
+    if (g.kind==='vertex') { moveVertex(state.vertex, p); state.metric=null; draw(); }
     if (g.kind==='box') { state.prompts.box=[Math.min(g.start[0],p[0]),Math.min(g.start[1],p[1]),Math.max(g.start[0],p[0]),Math.max(g.start[1],p[1])]; draw(); }
   });
   function endPointer(event) {
@@ -648,7 +765,7 @@
       const points=selectedPoints(), p=points?.[state.vertex]; if (!point(p)) return;
       event.preventDefault(); checkpoint(); const step=event.shiftKey?10:1;
       const dx=event.key==='ArrowLeft'?-step:event.key==='ArrowRight'?step:0,dy=event.key==='ArrowUp'?-step:event.key==='ArrowDown'?step:0;
-      points[state.vertex]=[Math.max(0,Math.min(1,p[0]+dx/state.image.naturalWidth)),Math.max(0,Math.min(1,p[1]+dy/state.image.naturalHeight))]; sync();
+      moveVertex(state.vertex, [Math.max(0,Math.min(1,p[0]+dx/state.image.naturalWidth)),Math.max(0,Math.min(1,p[1]+dy/state.image.naturalHeight))]); sync();
     }
   });
   canvas.addEventListener('keyup',event=>{ if (event.code==='Space') state.space=false; });
@@ -658,47 +775,110 @@
     if ((event.ctrlKey||event.metaKey) && event.key.toLowerCase()==='z') { event.preventDefault(); history(!event.shiftKey); }
   });
   function clearCandidates() { state.candidates=[]; $('scene-ai-candidate').replaceChildren(new Option('Нет предложений','')); }
+  const jobPath = job => `${base}/${job.kind === 'analysis' ? 'analysis' : 'suggestions'}${job.id ? `/${encodeURIComponent(job.id)}` : ''}`;
+  const jobStatus = job => $(job.kind === 'analysis' ? 'scene-analysis-status' : 'scene-ai-status');
   async function cancelJob() {
-    ++state.jobEpoch; clearTimeout(state.jobTimer); const job=state.job || state.completedJob; state.job=null; state.completedJob=null; clearCandidates(); buttons(); draw();
-    if (!job?.id) return;
-    try { await request(`${base}/suggestions/${encodeURIComponent(job.id)}`,'DELETE'); }
-    catch (e) { if (e.status!==410) $('scene-ai-status').textContent='Отмена на сервере не подтверждена. Поздний результат будет проигнорирован; повторный запрос может временно получить SCENE_BUSY.'; }
+    const epoch = ++state.jobEpoch; clearTimeout(state.jobTimer);
+    const job = state.job || state.completedJob; state.job = null; state.completedJob = null;
+    clearCandidates(); buttons(); draw();
+    if (!job) return;
+    jobStatus(job).textContent = 'Запрос отменён. Поздний результат будет проигнорирован.';
+    if (!job.id) return;
+    try { await request(jobPath(job), 'DELETE'); }
+    catch (e) { if (e.status !== 410 && epoch === state.jobEpoch) jobStatus(job).textContent = 'Отмена на сервере не подтверждена. Поздний результат будет проигнорирован; дождитесь освобождения модели перед повтором.'; }
   }
   async function submitSuggestion() {
-    if (!saveable() || state.job) return;
-    const prompts=state.prompts;
-    if (!prompts.positive_points.length && !prompts.negative_points.length && !prompts.box) { message('Добавьте точки или рамку для ИИ.','err'); return; }
-    if (prompts.box && (prompts.box[0]>=prompts.box[2] || prompts.box[1]>=prompts.box[3])) { message('Рамка должна иметь ненулевую ширину и высоту.','err'); return; }
-    if ($('scene-ai-kind').value==='object' && !$('scene-object-label').value.trim()) { message('Введите название объекта.','err'); return; }
-    // Superseded terminal records are cancelled too; the server owns their TTL.
+    if (!saveable() || state.job || !state.saved?.assistance_available) return;
+    const prompts = state.prompts;
+    if (!prompts.positive_points.length && !prompts.negative_points.length && !prompts.box) { message('Добавьте точки или рамку для ИИ.', 'err'); return; }
+    if (prompts.box && (prompts.box[0] >= prompts.box[2] || prompts.box[1] >= prompts.box[3])) { message('Рамка должна иметь ненулевую ширину и высоту.', 'err'); return; }
+    const kind = $('scene-ai-kind').value;
+    if (kind === 'object' && !$('scene-object-label').value.trim()) { message('Введите название объекта.', 'err'); return; }
+    submitJob(kind, {kind, ...clone(prompts)});
+  }
+  function submitAnalysis() {
+    if (!saveable() || state.job || !state.saved?.analysis_available) return;
+    submitJob('analysis', {});
+  }
+  async function submitJob(kind, payload) {
     cancelJob();
-    clearCandidates(); const epoch=++state.jobEpoch, snapshot=state.snapshot.snapshot_id, started=performance.now(), kind=$('scene-ai-kind').value;
-    state.job={id:null,snapshot,epoch,kind,started}; buttons(); $('scene-ai-status').textContent='Отправка запроса…';
+    const job = {id: null, snapshot: state.snapshot.snapshot_id, epoch: ++state.jobEpoch, kind, started: performance.now()};
+    state.job = job; buttons(); jobStatus(job).textContent = 'Отправка запроса…';
     try {
-      const result=await request(`${base}/suggestions`,'POST',{snapshot_id:snapshot,kind,...clone(prompts)});
-      if (epoch!==state.jobEpoch || state.snapshot?.snapshot_id!==snapshot || !saveable()) {
-        await request(`${base}/suggestions/${encodeURIComponent(result.job_id)}`,'DELETE'); return;
+      const result = await request(jobPath(job), 'POST', {snapshot_id: job.snapshot, ...payload});
+      if (job.epoch !== state.jobEpoch || state.job !== job || state.snapshot?.snapshot_id !== job.snapshot || !saveable()) {
+        await request(jobPath({...job, id: result.job_id}), 'DELETE'); return;
       }
-      state.job.id=result.job_id; pollJob(state.job);
-    } catch (e) { if (epoch===state.jobEpoch) { state.job=null; $('scene-ai-status').textContent=`Предложение недоступно: ${e.detail?.code||e.message}. Ручная разметка работает.`; errorMessage(e); buttons(); } }
+      job.id = result.job_id; pollJob(job);
+    } catch (e) {
+      if (job.epoch === state.jobEpoch) {
+        state.job = null; jobStatus(job).textContent = 'Запрос не принят. Ручная разметка доступна.';
+        errorMessage(e); buttons();
+      }
+    }
+  }
+  function analysisGeometry(draft, metric) {
+    return {version: 2, floor: draft.floor ? clone(draft.floor) : null,
+      objects: (draft.objects || []).map(({id, label, polygon}) => ({id, label, polygon: clone(polygon)})),
+      doors: (draft.doors || []).map(({id, label, kind, quad}) => ({id, label, kind, quad: clone(quad)})),
+      metric: metric ? clone(metric) : null};
+  }
+  function acceptAnalysis(result) {
+    const draft = result.draft;
+    const warnings = {FLOOR_NOT_FOUND: 'Пол не найден — обведите вручную', NO_DOORS_FOUND: 'Двери не найдены', NO_OBJECTS_FOUND: 'Предметы не найдены'};
+    const warningText = (result.warnings || []).map(code => warnings[code] || code).join('. ');
+    const hasDraft = draft && (draft.floor || draft.objects?.length || draft.doors?.length);
+    if (!hasDraft) { $('scene-analysis-status').textContent = `${warningText || 'Пригодной разметки нет.'} Текущий черновик не изменён.`; return; }
+    const existing = state.geometry.floor || state.geometry.objects.length || state.geometry.doors.length;
+    if (existing && !confirm('Заменить текущую разметку результатом распознавания?')) {
+      $('scene-analysis-status').textContent = `Результат не применён. ${warningText}`; return;
+    }
+    const geometry = analysisGeometry(draft, state.geometry.metric);
+    let removedMetric = false;
+    if (geometry.metric && geometryError(geometry)) { geometry.metric = null; removedMetric = true; }
+    const error = geometryError(geometry);
+    if (error) { message(`Результат распознавания отклонён: ${error}`, 'err'); return; }
+    checkpoint();
+    state.geometry = geometry;
+    state.analysisItems = [
+      ...(draft.floor ? [{id: 'floor', kind: 'FLOOR'}] : []),
+      ...(draft.objects || []).map(({id, score, outline}) => ({id, kind: 'OBJECT', score, outline})),
+      ...(draft.doors || []).map(({id, kind, score}) => ({id, kind, score})),
+    ];
+    state.selection = ''; state.vertex = -1; state.tool = 'select'; state.drawing = false;
+    modeTabs.select('scene');
+    $('scene-analysis-status').textContent = `${warningText}${removedMetric ? ' Масштаб удалён: опорные углы не подходят к новому полу.' : ''} Разметка применена только в черновик. Проверьте и нажмите «Сохранить сцену».`;
+    message('Распознавание ничего не сохраняет автоматически. Проверьте все контуры.', 'ok'); sync();
   }
   async function pollJob(job) {
     try {
-      const result=await window.OperatorUI.api(`${base}/suggestions/${encodeURIComponent(job.id)}`);
-      if (job.epoch!==state.jobEpoch || state.job!==job || state.snapshot?.snapshot_id!==job.snapshot || !state.validSnapshot) return;
-      if (result.snapshot_id!==job.snapshot || result.job_id!==job.id) { markStale('Ответ ИИ относится к другому кадру.'); return; }
-      if (result.state==='QUEUED' || result.state==='RUNNING') {
-        $('scene-ai-status').textContent=result.state==='QUEUED'?'В очереди локального CPU…':'Модель строит контур на CPU…';
-        state.jobTimer=setTimeout(()=>pollJob(job),600); return;
+      const result = await window.OperatorUI.api(jobPath(job));
+      if (job.epoch !== state.jobEpoch || state.job !== job || state.snapshot?.snapshot_id !== job.snapshot || !state.validSnapshot || state.review) return;
+      if (result.snapshot_id !== job.snapshot || result.job_id !== job.id) { markStale('Ответ ИИ относится к другому кадру.'); return; }
+      const elapsed = `${((performance.now() - job.started) / 1000).toFixed(1)} с`;
+      if (result.state === 'QUEUED' || result.state === 'RUNNING') {
+        jobStatus(job).textContent = `${elapsed} · ${result.state === 'QUEUED' ? 'В очереди локальной модели…' : job.kind === 'analysis' ? 'Распознавание сцены…' : 'Модель строит контур…'}`;
+        state.jobTimer = setTimeout(() => pollJob(job), 600); return;
       }
-      state.job=null; state.completedJob=job;
-      if (result.state==='SUCCEEDED') {
-        state.candidates=(result.polygons||[]).slice(0,3).filter(p=>p.needs_review===true && Number.isFinite(p.score) && !polygonError(p.points)).map(p=>({...p,kind:job.kind}));
-        $('scene-ai-candidate').replaceChildren(...state.candidates.map((p,i)=>new Option(`Кандидат ${i+1} · оценка модели ${p.score.toFixed(3)}`,String(i))));
-        $('scene-ai-status').textContent=`${((performance.now()-job.started)/1000).toFixed(1)} с · ${state.candidates.length ? 'Проверьте пунктирный контур и примите в черновик. Ничего не сохранено.' : 'Пригодных простых контуров нет. Уточните подсказки или обведите вручную.'}`;
-      } else $('scene-ai-status').textContent=result.state==='CANCELLED'?'Запрос отменён.':`ИИ не создал контур: ${result.error_code||'SCENE_INFERENCE_FAILED'}. Ручная разметка доступна.`;
+      state.job = null; state.completedJob = job;
+      if (result.state === 'SUCCEEDED' && job.kind === 'analysis') {
+        acceptAnalysis(result);
+        $('scene-analysis-status').textContent = `${elapsed} · ${$('scene-analysis-status').textContent}`;
+      } else if (result.state === 'SUCCEEDED') {
+        state.candidates = (result.polygons || []).slice(0, 3).filter(p => p.needs_review === true && Number.isFinite(p.score) && !polygonError(p.points)).map(p => ({...p, kind: job.kind}));
+        $('scene-ai-candidate').replaceChildren(...state.candidates.map((p, i) => new Option(`Кандидат ${i+1} · оценка модели ${p.score.toFixed(3)}`, String(i))));
+        jobStatus(job).textContent = `${elapsed} · ${state.candidates.length ? 'Проверьте пунктирный контур и примите в черновик. Ничего не сохранено.' : 'Пригодных простых контуров нет. Уточните подсказки или обведите вручную.'}`;
+      } else {
+        jobStatus(job).textContent = result.state === 'CANCELLED' ? 'Запрос отменён.' : 'Модель не создала разметку. Ручная разметка доступна.';
+        if (result.state !== 'CANCELLED') errorMessage({detail: {code: result.error_code || 'SCENE_INFERENCE_FAILED'}});
+      }
       buttons(); draw();
-    } catch (e) { if (job.epoch===state.jobEpoch) { state.job=null; $('scene-ai-status').textContent=`Запрос не завершён: ${e.detail?.code||e.message}.`; errorMessage(e); buttons(); } }
+    } catch (e) {
+      if (job.epoch === state.jobEpoch) {
+        state.job = null; jobStatus(job).textContent = 'Запрос не завершён. Ручная разметка доступна.';
+        errorMessage(e); buttons();
+      }
+    }
   }
   function acceptSuggestion() {
     if (!saveable()) return;
@@ -718,11 +898,12 @@
   $('scene-reviewed').addEventListener('change',buttons);
   $('scene-keep-draft').addEventListener('click',()=>{
     if (!state.validSnapshot || !$('scene-reviewed').checked || state.busy) return;
-    state.review=false; state.undo=[]; state.redo=[]; message('Проверенный черновик привязан к новому кадру. Сохраните сцену и вход отдельными действиями.'); sync();
+    state.review=false; state.undo=[]; state.redo=[]; message('Проверенный черновик привязан к новому кадру. Сохраните сцену и проход отдельными действиями.'); sync();
   });
   $('scene-use-saved').addEventListener('click',()=>{
     if (!state.validSnapshot || state.busy) return;
     state.undo=[]; state.redo=[]; state.geometry=clone(state.saved.geometry||emptyGeometry()); if (state.config) state.gate=gateFrom(state.config);
+    cancelJob(); state.analysisItems = [];
     // Imported or dimension-mismatched saved coordinates still require explicit review.
     state.review=state.saved.status==='STALE' || Boolean(state.saved.reference_width && (state.saved.reference_width!==state.snapshot.width || state.saved.reference_height!==state.snapshot.height))
       || Boolean(state.config?.reference_width && (state.config.reference_width!==state.snapshot.width || state.config.reference_height!==state.snapshot.height));
@@ -730,14 +911,14 @@
   });
   $('scene-undo').addEventListener('click',()=>history(true)); $('scene-redo').addEventListener('click',()=>history(false));
   $('scene-selection').addEventListener('change',()=>{state.selection=$('scene-selection').value;state.vertex=-1;state.tool='select';state.drawing=false;sync();});
-  $('scene-object-label').addEventListener('change',()=>{const o=state.geometry.objects.find(o=>o.id===state.selection);if(o&&editable()){checkpoint();o.label=$('scene-object-label').value.trim();sync();}});
+  $('scene-object-label').addEventListener('change', () => { const o = selectedDoor() || state.geometry.objects.find(o => o.id === state.selection); if (o && editable()) { checkpoint(); o.label = $('scene-object-label').value.trim(); sync(); } });
   $('scene-new-object').addEventListener('click',()=>{if(!editable())return;checkpoint();const o=newObject();if(!o){state.undo.pop();return;}state.tool='object';state.drawing=true;state.vertex=-1;sync();});
   $('scene-finish').addEventListener('click',()=>{
-    const p=selectedPoints(), error=state.selection==='gate'?gateError():polygonError(p);
-    if(error){message(error,'err');return;}state.drawing=false;state.tool='select';sync();message('Контур завершён в черновике. Можно перемещать и добавлять вершины.','ok');
+    const p = selectedPoints(), error = state.selection === 'gate' ? gateError() : selectedDoor() ? doorError(p) : polygonError(p);
+    if (error) { message(error, 'err'); return; } state.drawing = false; state.tool = 'select'; sync(); message('Контур завершён в черновике. Проверьте его перед сохранением.', 'ok');
   });
   $('scene-clear-selected').addEventListener('click',clearSelected);
-  $('calibration-clear').addEventListener('click',()=>{if(!editable())return;checkpoint();state.gate.points=[null,null,null];setTool('gate');});
+  $('calibration-clear').addEventListener('click', () => { if (!editable()) return; checkpoint(); clearGate(); setTool('gate'); });
   $('scene-add-vertex').addEventListener('click',()=>{
     const p=selectedPoints();if(!p?.length)return;const i=state.vertex>=0?state.vertex:p.length-1,a=p[i],b=p[(i+1)%p.length];if(point(a)&&point(b))insertVertex(i,[(a[0]+b[0])/2,(a[1]+b[1])/2]);
   });
@@ -746,10 +927,25 @@
     if(!editable())return;checkpoint();if(!state.geometry.metric)state.geometry.metric={corners:[],width_m:null,depth_m:null};
     state.geometry.metric[key]=$(id).value===''?null:Number($(id).value);sync();
   });
-  gateNames.forEach((name,i)=>['x','y'].forEach((axis,j)=>$(`gate-${name}-${axis}`).addEventListener('change',()=>{
-    if(!editable())return;const value=$(`gate-${name}-${axis}`).value;if(value==='' || !Number.isFinite(Number(value)) || Number(value)<0 || Number(value)>1){message('Введите координату от 0 до 1.','err','calibration-message');return;}
-    checkpoint();const p=state.gate.points[i]?[...state.gate.points[i]]:[null,null];p[j]=Number(value);state.gate.points[i]=p;sync();
-  })));
+  $('calibration-flip').addEventListener('click', () => {
+    if (!editable() || !state.gate.threshold.every(point)) return;
+    checkpoint(); state.gate.side *= -1;
+    state.gate.inside = window.Door3D.insidePoint(state.gate.threshold, state.gate.top, state.gate.side); sync();
+  });
+  $('calibration-kind').addEventListener('change', () => {
+    if (!editable()) return;
+    checkpoint(); state.gate.kind = $('calibration-kind').value; sync();
+  });
+  $('calibration-scene-door').addEventListener('change', () => {
+    if (!editable()) return;
+    const door = state.geometry.doors.find(d => d.id === $('calibration-scene-door').value);
+    if (!door || doorError(door.quad)) return;
+    checkpoint();
+    state.gate.threshold = clone(door.quad.slice(0, 2)); state.gate.top = clone([door.quad[3], door.quad[2]]);
+    state.gate.kind = door.kind; state.gate.side = window.Door3D.defaultSide(state.gate.threshold, state.gate.top);
+    state.gate.inside = window.Door3D.insidePoint(state.gate.threshold, state.gate.top, state.gate.side);
+    state.selection = 'gate'; state.vertex = -1; sync();
+  });
   $('calibration-role').addEventListener('change',()=>{if(!editable())return;checkpoint();state.gate.role=$('calibration-role').value;sync();});
   $('calibration-enabled').addEventListener('change',()=>{if(!editable())return;checkpoint();state.gate.enabled=$('calibration-enabled').checked;sync();});
   $('scene-fit').addEventListener('click',()=>{state.zoom=1;state.pan=[0,0];draw();});
@@ -758,26 +954,48 @@
   $('scene-ai-accept').addEventListener('click',acceptSuggestion); $('scene-ai-candidate').addEventListener('change',draw);
   $('scene-ai-clear').addEventListener('click',()=>{cancelJob();state.prompts={positive_points:[],negative_points:[],box:null};draw();});
   $('scene-ai-kind').addEventListener('change',cancelJob);
+  $('scene-analysis').addEventListener('click', submitAnalysis);
+  $('scene-analysis-cancel').addEventListener('click', cancelJob);
   new ResizeObserver(draw).observe($('calibration-image'));
   window.addEventListener('resize',draw);
   window.addEventListener('camera-state',event=>{
-    const c=event.detail;state.cameraStatus=c.status||'OFFLINE';showRuntime();
+    const c = event.detail; updateCamera(c);
     if ((c.enabled===false && state.sceneCurrent) || (state.validSnapshot && state.snapshot && c.source_revision!=null && c.source_revision!==state.snapshot.source_revision)
         || (state.sceneCurrent && c.source_revision!=null && c.source_revision!==state.saved?.source_revision)) markStale('Источник камеры изменён или отключён.');
   });
   window.addEventListener('camera-detections',event=>liveMetrics(event.detail));
   window.addEventListener('cameras-changed',()=>markStale('Подключение камеры изменено.'));
   window.addEventListener('beforeunload',event=>{if(sceneDirty()||gateDirty()){event.preventDefault();event.returnValue='';}});
-  window.addEventListener('pagehide',()=>{
-    clearTimeout(state.jobTimer);clearTimeout(state.ttlTimer);clearTimeout(state.previewTimer);
-    if(state.job?.id)fetch(`${base}/suggestions/${encodeURIComponent(state.job.id)}`,{method:'DELETE',headers:{'X-Operator-Request':'1'},keepalive:true}).catch(()=>{});
+  window.addEventListener('pagehide', () => {
+    ++state.jobEpoch; clearTimeout(state.jobTimer); clearTimeout(state.ttlTimer); clearTimeout(state.previewTimer);
+    const job = state.job || state.completedJob;
+    if (job?.id) window.OperatorUI.api(jobPath(job), {method: 'DELETE', keepalive: true}).catch(() => {});
   });
+  const modeTabs = window.OperatorUI.tabs($('mapping-mode-tabs'), {hash: false, onChange(mode) {
+    cancelJob(); state.mode = mode; state.selection = mode === 'gate' ? 'gate' : '';
+    state.vertex = -1; state.tool = 'select'; state.drawing = false; sync();
+  }});
+  function updateCamera(camera) {
+    state.camera = camera; state.cameraStatus = camera.status || 'OFFLINE';
+    const allowed = camera.profile?.zone === 'ENTRANCE', button = $('mapping-mode-gate');
+    const changed = button.disabled === allowed;
+    button.disabled = !allowed; $('mapping-entrance-help').hidden = allowed;
+    if (changed) modeTabs.refresh();
+    showRuntime(); buttons();
+  }
   async function load() {
-    state.busy=true;buttons();
-    const results=await Promise.allSettled([window.OperatorUI.api(base),window.OperatorUI.api(attendance)]);
-    if(results[0].status==='fulfilled'){state.saved=results[0].value;state.geometry=clone(state.saved.geometry||emptyGeometry());state.sceneCurrent=state.saved.status==='CURRENT';showScene();}else errorMessage(results[0].reason);
-    if(results[1].status==='fulfilled'){state.config=results[1].value;state.runtime=state.config;state.gate=gateFrom(state.config);showRuntime();}else errorMessage(results[1].reason,'calibration-message');
-    state.busy=false;sync();
+    state.busy = true; buttons();
+    const results = await Promise.allSettled([window.OperatorUI.api(base), window.OperatorUI.api(attendance), window.OperatorUI.api(`/api/cameras/${cameraId}`)]);
+    if (results[0].status === 'fulfilled') {
+      state.saved = results[0].value; state.geometry = clone(state.saved.geometry || emptyGeometry());
+      state.sceneCurrent = state.saved.status === 'CURRENT'; showScene();
+    } else errorMessage(results[0].reason);
+    if (results[1].status === 'fulfilled') {
+      state.config = results[1].value; state.runtime = state.config; state.gate = gateFrom(state.config); showRuntime();
+    } else errorMessage(results[1].reason, 'calibration-message');
+    if (results[2].status === 'fulfilled') updateCamera(results[2].value);
+    else message('Настройки камеры недоступны. Проход учёта станет доступен после восстановления связи.', 'err', 'calibration-message');
+    state.busy = false; sync();
   }
   load();
   // Reuses the prior attendance status cadence, never a second detection poll.

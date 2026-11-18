@@ -13,9 +13,14 @@
     <header class="camera-page-heading">
       <a class="back-link" href="/">Все камеры</a>
       <h1 id="camera-title">Камера</h1>
-      <nav class="profile-sections" aria-label="Разделы камеры"><a href="#camera-live">Живое видео</a><a href="#camera-recording">Локальная запись</a><a href="#camera-archive">Архив регистратора</a><a href="#calibration-heading">Учёт и разметка</a></nav>
+      <nav id="camera-tabs" class="tabs" role="tablist" aria-label="Разделы камеры">
+        <button id="camera-tab-overview" type="button" role="tab" data-tab="overview" aria-controls="overview" aria-selected="true">Обзор</button>
+        <button id="camera-tab-mapping" type="button" role="tab" data-tab="mapping" aria-controls="mapping" aria-selected="false" tabindex="-1">Разметка</button>
+        <button id="camera-tab-recording" type="button" role="tab" data-tab="recording" aria-controls="recording" aria-selected="false" tabindex="-1">Запись и архив</button>
+      </nav>
       <p id="camera-connection" class="muted"></p>
     </header>
+    <div id="overview" class="camera-overview" role="tabpanel" aria-labelledby="camera-tab-overview">
     <section id="camera-live" class="video-panel" aria-label="Живое видео">
       <img id="stream" src="/api/cameras/{{ camera_id }}/stream" alt="Живой поток камеры">
       <div id="boxes" class="boxes-overlay"></div>
@@ -39,6 +44,43 @@
       </dl>
       <p class="muted small">RTSP → FFmpeg → MJPEG + AI (YOLO → трекинг → лица). Статус обновляется каждые 2 сек.</p>
     </aside>
+    <section id="camera-controls" class="panel calibration-panel" aria-labelledby="camera-controls-heading">
+      <div class="panel-head"><h2 id="camera-controls-heading">Управление камерой</h2></div>
+      <div class="calibration-actions">
+        <label class="checkbox-field"><input id="camera-enabled" type="checkbox" role="switch" disabled>Камера включена</label>
+        <button id="camera-reconnect" class="btn" type="button" disabled>Переподключить</button>
+      </div>
+      <fieldset class="scene-section"><legend>Поток</legend>
+        <div class="camera-segmented">
+          <label><input type="radio" name="camera-stream" value="main" disabled>Основной</label>
+          <label><input type="radio" name="camera-stream" value="sub" disabled>Дополнительный</label>
+        </div>
+        <p class="muted small">Смена потока отключает учёт и требует новой разметки прохода.</p>
+      </fieldset>
+      <form id="camera-profile-form">
+        <div class="scene-edit-controls">
+          <label class="field">Рабочее место<select id="camera-workplace" disabled><option value="">Без рабочего места</option></select></label>
+          <fieldset class="camera-zone-field"><legend>Тип камеры</legend>
+            <div class="camera-segmented">
+              <label><input type="radio" name="camera-zone" value="ENTRANCE" disabled>Вход</label>
+              <label><input type="radio" name="camera-zone" value="INTERIOR" disabled>Внутренняя</label>
+            </div>
+          </fieldset>
+        </div>
+        <p id="camera-zone-help" class="muted small"></p>
+        <div class="scene-edit-controls">
+          <label class="checkbox-field"><input id="camera-ai-enabled" type="checkbox" role="switch" disabled>AI-анализ</label>
+          <label class="field">Частота AI, к/с<input id="camera-ai-fps" type="number" min="0.5" max="30" step="any" placeholder="по умолчанию" aria-describedby="camera-fps-help" disabled></label>
+        </div>
+        <p id="camera-ai-help" class="muted small"></p>
+        <p id="camera-fps-help" class="muted small">Пустое поле — общая частота AI.</p>
+        <button id="camera-profile-save" class="btn primary" type="submit" disabled>Сохранить настройки</button>
+      </form>
+      <p id="camera-controls-message" class="form-status" role="status" aria-live="polite"></p>
+    </section>
+    </div>
+
+    <div id="recording" class="camera-tab-panel" role="tabpanel" aria-labelledby="camera-tab-recording" hidden>
 
     <section id="camera-recording" class="panel calibration-panel" aria-labelledby="recording-heading">
       <div class="panel-head"><h2 id="recording-heading">Локальная запись</h2></div>
@@ -75,20 +117,31 @@
       <button id="camera-edit-archive" class="btn" type="button">Настроить подключение и архив</button>
       <a class="btn" href="/recordings?camera_id={{ camera_id }}&amp;source=dahua&amp;at={{ recordings_at | urlencode }}">Смотреть архив регистратора</a>
     </section>
+    </div>
 
+    <div id="mapping" class="camera-tab-panel" role="tabpanel" aria-labelledby="camera-tab-mapping" hidden>
     <section id="scene-editor" class="panel calibration-panel" aria-labelledby="calibration-heading">
-      <div class="panel-head"><h2 id="calibration-heading">Сцена и линия входа</h2></div>
+      <div class="panel-head"><h2 id="calibration-heading">Сцена и проход учёта</h2></div>
       <p id="scene-state" class="muted" role="status">Загрузка сохранённой сцены…</p>
-      <p class="muted">Обведите видимый пол и предметы на неподвижном кадре. Предметы — описательные контуры, не зоны исключения людей. ИИ предлагает форму только по вашим точкам; скрытый за мебелью пол не восстанавливается.</p>
+      <p class="muted">Разметьте видимый пол, предметы и проходы на неподвижном кадре. Распознавание создаёт только черновик для проверки; скрытый за мебелью пол не восстанавливается.</p>
+      <div id="mapping-mode-tabs" class="tabs" role="tablist" aria-label="Режим разметки">
+        <button id="mapping-mode-scene" type="button" role="tab" data-tab="scene" aria-controls="mapping-scene-panel" aria-selected="true">Сцена</button>
+        <button id="mapping-mode-gate" type="button" role="tab" data-tab="gate" aria-controls="mapping-gate-panel" aria-selected="false" tabindex="-1" disabled>Проход учёта</button>
+      </div>
+      <p id="mapping-entrance-help" class="muted small">Отнесите камеру к входам на вкладке <a href="#overview">«Обзор»</a></p>
       <div class="calibration-actions">
         <button id="calibration-freeze" class="btn" type="button">Зафиксировать свежий кадр</button>
+        <button id="scene-analysis" class="btn primary" type="button" aria-describedby="scene-analysis-help" disabled>Распознать сцену</button>
+        <button id="scene-analysis-cancel" class="btn" type="button" hidden>Отменить распознавание</button>
         <button id="scene-undo" class="btn" type="button" disabled>Отменить</button>
         <button id="scene-redo" class="btn" type="button" disabled>Повторить</button>
       </div>
+      <p id="scene-analysis-help" class="muted small">Модель распознавания не установлена — пересоберите модели</p>
+      <p id="scene-analysis-status" class="muted small" role="status" aria-live="polite"></p>
       <p id="calibration-metadata" class="muted small">Нужен свежий кадр этой камеры. Сохранённая разметка доступна и без видео.</p>
       <div id="scene-reconcile" class="scene-reconcile" hidden>
         <p id="scene-reconcile-text">Черновик сохранён. Получите свежий кадр и явно сопоставьте с ним разметку.</p>
-        <label class="checkbox-field"><input id="scene-reviewed" type="checkbox">Я проверил каждый контур, масштаб и линию на новом кадре</label>
+        <label class="checkbox-field"><input id="scene-reviewed" type="checkbox">Я проверил каждый контур, масштаб и проход на новом кадре</label>
         <div class="calibration-actions">
           <button id="scene-keep-draft" class="btn" type="button" disabled>Применить проверенный черновик к кадру</button>
           <button id="scene-use-saved" class="btn" type="button" disabled>Отбросить черновик, загрузить сохранённое</button>
@@ -96,17 +149,18 @@
       </div>
       <div class="scene-toolbar" role="group" aria-label="Инструменты разметки">
         <button class="btn" type="button" data-scene-tool="select" aria-pressed="true">Выбрать</button>
-        <button class="btn" type="button" data-scene-tool="floor" aria-pressed="false">Пол</button>
-        <button class="btn" type="button" data-scene-tool="object" aria-pressed="false">Объект</button>
-        <button class="btn" type="button" data-scene-tool="gate" aria-pressed="false">Вход</button>
-        <button class="btn" type="button" data-scene-tool="metric" aria-pressed="false">Масштаб</button>
-        <button class="btn" type="button" data-scene-tool="ai" aria-pressed="false">ИИ-подсказка</button>
+        <button class="btn" type="button" data-scene-tool="floor" data-mapping-mode="scene" aria-pressed="false">Пол</button>
+        <button class="btn" type="button" data-scene-tool="object" data-mapping-mode="scene" aria-pressed="false">Объект</button>
+        <button class="btn" type="button" data-scene-tool="door" data-mapping-mode="scene" aria-pressed="false">Двери и проходы</button>
+        <button class="btn" type="button" data-scene-tool="gate" data-mapping-mode="gate" aria-pressed="false" hidden>Проход учёта</button>
+        <button class="btn" type="button" data-scene-tool="metric" data-mapping-mode="scene" aria-pressed="false">Масштаб</button>
+        <button class="btn" type="button" data-scene-tool="ai" data-mapping-mode="scene" aria-pressed="false">ИИ-подсказка</button>
       </div>
       <p id="scene-tool-hint" class="muted small" aria-live="polite">Выберите контур или вершину. Координаты доступны ниже.</p>
       <div class="scene-views">
         <div>
           <div id="calibration-image" class="calibration-image scene-viewport" hidden>
-            <canvas id="calibration-canvas" tabindex="0" aria-label="Редактор сцены. Стрелки перемещают выбранную вершину, Delete удаляет её." aria-describedby="scene-gestures"></canvas>
+            <canvas id="calibration-canvas" tabindex="0" aria-label="Редактор сцены. Стрелки перемещают выбранную вершину; Delete удаляет вершину обычного контура. У прохода всегда четыре угла." aria-describedby="scene-gestures"></canvas>
           </div>
           <div class="calibration-actions">
             <button id="scene-zoom-out" class="btn" type="button" aria-label="Уменьшить кадр">Уменьшить</button>
@@ -121,89 +175,87 @@
           <p id="scene-grid-info" class="muted small"></p>
         </figure>
       </div>
-      <p id="scene-gestures" class="muted small">Точки: щелчок, затем «Завершить контур»; вершины: перетаскивание. Двойной щелчок по ребру вставляет вершину. Стрелки — 1 исходный пиксель, Shift — 10; Delete — удалить вершину. Колесо — масштаб, пробел + перетаскивание — сдвиг. Ctrl/Cmd+Z — отмена, Ctrl/Cmd+Shift+Z — повтор. На сенсорном экране включите «Перемещение кадра» для сдвига.</p>
-      <div class="scene-edit-controls">
-        <label class="field">Выбранный слой<select id="scene-selection"><option value="">Нет выбора</option></select></label>
-        <label class="field">Название объекта (задаёт оператор)<input id="scene-object-label" maxlength="80" autocomplete="off"></label>
-        <div class="calibration-actions">
-          <button id="scene-finish" class="btn" type="button">Завершить контур</button>
-          <button id="scene-new-object" class="btn" type="button">Новый объект</button>
-          <button id="scene-clear-selected" class="btn danger" type="button">Очистить выбранное</button>
-        </div>
-      </div>
+      <p id="scene-gestures" class="muted small">Точки: щелчок, затем «Завершить контур»; у прохода — два щелчка по порогу. Вершины: перетаскивание. Двойной щелчок по ребру обычного контура вставляет вершину. Стрелки — 1 исходный пиксель, Shift — 10; Delete — удалить вершину обычного контура. Колесо — масштаб, пробел + перетаскивание — сдвиг. Ctrl/Cmd+Z — отмена, Ctrl/Cmd+Shift+Z — повтор. На сенсорном экране включите «Перемещение кадра» для сдвига.</p>
       <fieldset class="scene-layers"><legend>Видимость слоёв</legend>
         <label><input type="checkbox" data-scene-layer="floor" checked>Пол</label>
         <label><input type="checkbox" data-scene-layer="objects" checked>Объекты</label>
-        <label><input type="checkbox" data-scene-layer="gate" checked>Вход</label>
+        <label><input type="checkbox" data-scene-layer="doors" checked>Двери и проходы</label>
+        <label><input type="checkbox" data-scene-layer="gate" checked>Проход учёта</label>
         <label><input type="checkbox" data-scene-layer="metric" checked>Масштаб и сетка</label>
         <label><input type="checkbox" data-scene-layer="suggestions" checked>ИИ-кандидаты</label>
       </fieldset>
+      <label class="field scene-shape-selection">Выбранный слой<select id="scene-selection"><option value="">Нет выбора</option></select></label>
       <details class="scene-coordinates"><summary>Точные координаты выбранного контура (0–1)</summary>
-        <p class="muted small">Значения сохраняются без округления. Выберите вершину в таблице или на кадре.</p>
+        <p class="muted small">Значения сохраняются без округления. У двери и прохода четыре угла: порог, затем верхние углы справа налево.</p>
         <div id="scene-coordinate-list"></div>
         <button id="scene-add-vertex" class="btn" type="button">Вставить вершину после выбранной</button>
       </details>
-      <fieldset id="scene-ai-panel" class="scene-section" hidden><legend>ИИ-подсказка · требует проверки</legend>
+      <div id="mapping-scene-panel" role="tabpanel" aria-labelledby="mapping-mode-scene">
         <div class="scene-edit-controls">
-          <label class="field">Контур<select id="scene-ai-kind"><option value="floor">Пол</option><option value="object">Объект</option></select></label>
-          <label class="field">Подсказка на кадре<select id="scene-ai-prompt"><option value="positive">Точка внутри</option><option value="negative">Точка снаружи</option><option value="box">Рамка перетаскиванием</option></select></label>
+          <label class="field">Название объекта или прохода<input id="scene-object-label" maxlength="80" autocomplete="off"></label>
+          <label class="field">Тип нового прохода<select id="scene-door-kind"><option value="DOOR">Дверь</option><option value="PASSAGE">Проход</option></select></label>
+          <div class="calibration-actions">
+            <button id="scene-finish" class="btn" type="button">Завершить контур</button>
+            <button id="scene-new-object" class="btn" type="button">Новый объект</button>
+            <button id="scene-clear-selected" class="btn danger" type="button">Очистить выбранное</button>
+          </div>
         </div>
-        <p class="muted small">До 32 точек суммарно. Выберите, что обвести; название объекта введите выше. Пунктир — предложение, не сохранённая геометрия.</p>
-        <div class="calibration-actions">
-          <button id="scene-ai-submit" class="btn" type="button">Предложить контур</button>
-          <button id="scene-ai-cancel" class="btn" type="button" disabled>Отменить запрос</button>
-          <button id="scene-ai-clear" class="btn" type="button">Очистить подсказки</button>
-        </div>
-        <p id="scene-ai-status" role="status" aria-live="polite">Модель работает локально на CPU. При ошибке можно продолжить ручную разметку.</p>
-        <label class="field">Кандидат<select id="scene-ai-candidate"><option value="">Нет предложений</option></select></label>
-        <button id="scene-ai-accept" class="btn" type="button" disabled>Принять выбранный контур в черновик</button>
-      </fieldset>
-      <fieldset class="scene-section"><legend>Масштаб по измеренному прямоугольнику</legend>
-        <p class="muted small">Инструментом «Масштаб» отметьте на полу четыре угла в порядке (0,0), (ширина,0), (ширина,глубина), (0,глубина). Введите реальные измерения; пиксели не являются метрами.</p>
-        <div class="scene-edit-controls">
-          <label class="field">Измеренная ширина, м<input id="scene-width" type="number" min="0" max="1000" step="any"></label>
-          <label class="field">Измеренная глубина, м<input id="scene-depth" type="number" min="0" max="1000" step="any"></label>
-          <button id="scene-remove-metric" class="btn" type="button">Убрать масштаб</button>
-        </div>
-        <p id="scene-metric-status" class="muted small" role="status">Масштаб не задан.</p>
-        <p class="muted small">Плоская проекция приблизительна: зависит от измерений, искажений объектива и неподвижности камеры. Это не геодезическое измерение; верх мебели не является полом. Перемещение камеры без смены потока автоматически не определяется.</p>
-      </fieldset>
-      <div class="calibration-actions"><button id="scene-save" class="btn primary" type="button" disabled>Сохранить сцену</button></div>
-      <p id="scene-draft-status" class="muted small" role="status">Сцена не изменена. Сохранение сцены не сохраняет линию входа и не меняет наладку.</p>
+        <fieldset id="scene-ai-panel" class="scene-section" hidden><legend>ИИ-подсказка · требует проверки</legend>
+          <div class="scene-edit-controls">
+            <label class="field">Контур<select id="scene-ai-kind"><option value="floor">Пол</option><option value="object">Объект</option></select></label>
+            <label class="field">Подсказка на кадре<select id="scene-ai-prompt"><option value="positive">Точка внутри</option><option value="negative">Точка снаружи</option><option value="box">Рамка перетаскиванием</option></select></label>
+          </div>
+          <p class="muted small">До 32 точек суммарно. Выберите, что обвести; название объекта введите выше. Пунктир — предложение, не сохранённая геометрия.</p>
+          <div class="calibration-actions">
+            <button id="scene-ai-submit" class="btn" type="button">Предложить контур</button>
+            <button id="scene-ai-cancel" class="btn" type="button" disabled>Отменить запрос</button>
+            <button id="scene-ai-clear" class="btn" type="button">Очистить подсказки</button>
+          </div>
+          <p id="scene-ai-status" role="status" aria-live="polite">Модель работает локально на CPU. При ошибке можно продолжить ручную разметку.</p>
+          <label class="field">Кандидат<select id="scene-ai-candidate"><option value="">Нет предложений</option></select></label>
+          <button id="scene-ai-accept" class="btn" type="button" disabled>Принять выбранный контур в черновик</button>
+        </fieldset>
+        <fieldset class="scene-section"><legend>Масштаб по измеренному прямоугольнику</legend>
+          <p class="muted small">Инструментом «Масштаб» отметьте на полу четыре угла в порядке (0,0), (ширина,0), (ширина,глубина), (0,глубина). Введите реальные измерения; пиксели не являются метрами.</p>
+          <div class="scene-edit-controls">
+            <label class="field">Измеренная ширина, м<input id="scene-width" type="number" min="0" max="1000" step="any"></label>
+            <label class="field">Измеренная глубина, м<input id="scene-depth" type="number" min="0" max="1000" step="any"></label>
+            <button id="scene-remove-metric" class="btn" type="button">Убрать масштаб</button>
+          </div>
+          <p id="scene-metric-status" class="muted small" role="status">Масштаб не задан.</p>
+          <p class="muted small">Плоская проекция приблизительна: зависит от измерений, искажений объектива и неподвижности камеры. Это не геодезическое измерение; верх мебели не является полом. Перемещение камеры без смены потока автоматически не определяется.</p>
+        </fieldset>
+        <div class="calibration-actions"><button id="scene-save" class="btn primary" type="button" disabled>Сохранить сцену</button></div>
+        <div id="scene-analysis-results" class="scene-analysis-results" aria-label="Результаты распознавания"></div>
+      </div>
+      <p id="scene-draft-status" class="muted small" role="status">Сцена не изменена. Сохранение сцены не сохраняет проход учёта и не меняет наладку.</p>
       <p id="scene-message" class="test-result" role="status" aria-live="polite" hidden></p>
-      <h3>Линия входа и выхода</h3>
-      <p id="calibration-state" class="muted" aria-live="polite">Загрузка конфигурации учёта…</p>
-      <p class="muted">Отметьте два конца конечного отрезка в проёме, затем точку внутри помещения. Стрелка «Снаружи → внутрь» обозначает внутреннюю сторону, независимо от роли камеры. Пересечение определяется по низу рамки человека, а не по лицу.</p>
-      <p id="scene-gate-width" class="muted small">Ширина входа: не откалибрована.</p>
-      <form id="calibration-form">
-        <div class="calibration-options">
-          <label class="field">Назначение камеры<select id="calibration-role" required><option value="">Не назначена</option><option value="ENTRY">Вход — снаружи внутрь</option><option value="EXIT">Выход — изнутри наружу</option></select></label>
-          <label class="checkbox-field"><input id="calibration-enabled" type="checkbox">Включить учёт по этой камере</label>
-        </div>
-        <div class="calibration-coordinates">
-          <fieldset><legend>Начало линии</legend>
-            <label class="field">X (0–1)<input id="gate-start-x" type="number" min="0" max="1" step="any" required></label>
-            <label class="field">Y (0–1)<input id="gate-start-y" type="number" min="0" max="1" step="any" required></label>
-          </fieldset>
-          <fieldset><legend>Конец линии</legend>
-            <label class="field">X (0–1)<input id="gate-end-x" type="number" min="0" max="1" step="any" required></label>
-            <label class="field">Y (0–1)<input id="gate-end-y" type="number" min="0" max="1" step="any" required></label>
-          </fieldset>
-          <fieldset><legend>Точка внутри</legend>
-            <label class="field">X (0–1)<input id="gate-inside-x" type="number" min="0" max="1" step="any" required></label>
-            <label class="field">Y (0–1)<input id="gate-inside-y" type="number" min="0" max="1" step="any" required></label>
-          </fieldset>
-        </div>
-        <p class="muted small">Линия и расстояние от неё до внутренней точки — не меньше 0,05. Ноги должны быть видны по обе стороны. Если камеру передвинули, выполните разметку и наладку заново.</p>
-        <div class="calibration-actions">
-          <button id="calibration-save" class="btn primary" type="submit" disabled>Сохранить линию входа</button>
-          <button id="calibration-clear" class="btn" type="button" disabled>Разметить вход заново</button>
-          <button id="calibration-disable" class="btn danger" type="button" disabled>Отключить учёт</button>
-        </div>
-      </form>
-      <p id="calibration-message" class="test-result" role="status" aria-live="polite" hidden></p>
-      <p class="muted small">Назначенную роль нельзя стереть — камеру можно отключить. Разметка не заменяет наладку: автоматический учёт разрешается только после её подтверждения. <a href="/presence">История и ручная проверка</a>.</p>
+      <div id="mapping-gate-panel" role="tabpanel" aria-labelledby="mapping-mode-gate" hidden>
+        <h3>Проход учёта</h3>
+        <p id="calibration-state" class="muted" aria-live="polite">Загрузка конфигурации учёта…</p>
+        <p class="muted">Отметьте два конца порога: стойки и верх прохода появятся автоматически. Перетащите четыре угла на края проёма. Пересечение порога определяется по низу рамки человека, а не по лицу.</p>
+        <p id="scene-gate-width" class="muted small">Ширина прохода: не откалибрована.</p>
+        <p id="calibration-validation" class="muted small" role="status"></p>
+        <form id="calibration-form">
+          <div class="calibration-options">
+            <label class="field">Что считать<select id="calibration-role" required><option value="BOTH">Вход и выход</option><option value="ENTRY">Только вход</option><option value="EXIT">Только выход</option></select></label>
+            <label class="field">Тип прохода<select id="calibration-kind"><option value="DOOR">Дверь</option><option value="PASSAGE">Открытый проход (лестница, коридор)</option></select></label>
+            <label class="field">Взять из сцены<select id="calibration-scene-door"><option value="">Выберите дверь или проход</option></select></label>
+            <label class="checkbox-field"><input id="calibration-enabled" type="checkbox">Включить учёт по этой камере</label>
+          </div>
+          <div class="calibration-actions"><button id="calibration-flip" class="btn" type="button">Поменять «внутри» и «снаружи»</button></div>
+          <p class="muted small">Порог и расстояние от него до внутренней точки — не меньше 0,05. Ноги должны быть видны по обе стороны. Если камеру передвинули, выполните разметку и наладку заново.</p>
+          <div class="calibration-actions">
+            <button id="calibration-save" class="btn primary" type="submit" disabled>Сохранить проход учёта</button>
+            <button id="calibration-clear" class="btn" type="button" disabled>Разметить проход заново</button>
+            <button id="calibration-disable" class="btn danger" type="button" disabled>Отключить учёт</button>
+          </div>
+        </form>
+        <p id="calibration-message" class="test-result" role="status" aria-live="polite" hidden></p>
+        <p class="muted small">Один проход должен считать ровно один ракурс камеры. Две камеры на одном проходе создадут дубли событий для ручной проверки. Назначенную роль нельзя стереть, но можно менять между входом и выходом или отключить учёт. Разметка не заменяет наладку. <a href="/presence">История и ручная проверка</a>.</p>
+      </div>
     </section>
+    </div>
   </main>
   {% include "camera_setup.html" %}
 {% endblock %}
@@ -212,6 +264,7 @@
   <script>window.CAMERA_ID = {{ camera_id }};</script>
   <script src="/static/js/camera_setup.js"></script>
   <script src="/static/js/camera.js"></script>
+  <script src="/static/js/door3d.js"></script>
   <script src="/static/js/scene_editor.js"></script>
   <script src="/static/js/camera_recording.js"></script>
 {% endblock %}

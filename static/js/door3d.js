@@ -140,7 +140,7 @@
     }
     path(ctx, [a, b]); ctx.lineWidth = 9; ctx.strokeStyle = '#1C1B1F'; ctx.stroke();
     ctx.lineWidth = 5; ctx.strokeStyle = selected ? amber : green; ctx.stroke();
-    caption(ctx, 'Порог — считается пересечение', [middle[0], middle[1] - 15]);
+    if (validPoint(inside) || selected) caption(ctx, 'Порог — считается пересечение', [middle[0], middle[1] - 15]);
     if (selected) {
       for (const point of points) {
         ctx.beginPath(); ctx.arc(...point, 6, 0, Math.PI * 2);

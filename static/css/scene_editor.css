@@ -44,3 +44,37 @@
   .scene-coordinate-row input { padding-inline: 6px; }
   #scene-editor .calibration-actions .btn { white-space: normal; }
 }
+
+.camera-overview { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 24px; align-items: start; min-width: 0; }
+.camera-tab-panel { grid-column: 1 / -1; display: grid; gap: 24px; min-width: 0; }
+#camera-tabs { margin-top: 20px; }
+#camera-controls .scene-section { margin-block: 24px; }
+#camera-controls .checkbox-field { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; }
+#camera-controls input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--md-primary); }
+.camera-zone-field { flex: 1 1 280px; min-width: 0; border: 0; padding: 0; margin: 0 0 14px; }
+.camera-zone-field legend { font-size: 13px; font-weight: 500; color: var(--md-on-surface-variant); margin-bottom: 6px; }
+.camera-segmented { display: flex; flex-wrap: wrap; gap: 4px; }
+.camera-segmented label { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; min-height: 44px; border: 1px solid var(--md-outline); border-radius: 8px; cursor: pointer; }
+.camera-segmented label:has(:checked) { background: var(--md-primary-container); color: var(--md-on-primary-container); border-color: var(--md-primary); }
+.camera-segmented label:has(:disabled) { cursor: not-allowed; color: var(--md-on-surface-variant); background: var(--md-surface-container); }
+.camera-segmented input { accent-color: var(--md-primary); margin: 0; }
+#camera-controls :is(input, select, button):focus-visible, .scene-analysis-row button:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 3px; }
+#camera-controls .field input::placeholder { color: var(--md-on-surface-variant); opacity: 1; }
+#camera-controls :is(input, select):disabled { cursor: not-allowed; }
+#camera-controls-message { min-height: 1.5em; margin-bottom: 0; }
+#camera-zone-help, #camera-ai-help { min-height: 1.5em; margin-block: 0 14px; }
+#mapping-mode-tabs { margin-bottom: 18px; }
+#mapping-entrance-help { margin-block: 12px 18px; }
+.scene-shape-selection { max-width: 420px; }
+.scene-analysis-results:empty { display: none; }
+.scene-analysis-results { margin-block: 24px; border-top: 1px solid var(--md-outline-variant); }
+.scene-analysis-row { display: flex; align-items: center; gap: 12px; padding-block: 10px; border-bottom: 1px solid var(--md-outline-variant); }
+.scene-analysis-select { flex: 1; min-width: 0; min-height: 44px; border: 0; background: transparent; color: var(--md-on-surface); text-align: left; padding: 10px 8px; font: inherit; cursor: pointer; overflow-wrap: anywhere; }
+.scene-analysis-select:hover, .scene-analysis-select[aria-pressed="true"] { color: var(--md-primary); background: var(--md-primary-container); border-radius: 8px; }
+#scene-analysis-status { min-height: 1.5em; font-variant-numeric: tabular-nums; }
+@media (max-width: 850px) {
+  .camera-overview { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #camera-controls :is(input, select, button), #scene-editor .btn { transition: none; }
+}
