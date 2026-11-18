@@ -22,7 +22,9 @@ from app.database.database import get_db
 from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision
 from app.services.visit_identity_service import IdentityInput, RestoreIdentityInput, VisitIdentityService
 from app.services.visit_sample_service import VisitPhotoInput, RemoveVisitSampleInput
-from app.time_utils import utcnow
+from app.services.visit_time_service import VisitTimeService, VisitTimeInput, VisitTimeApplyInput, VisitTimeUndoInput
+from app.attendance_types import milliseconds
+from app.time_utils import attendance_iso, utcnow
 
 router = APIRouter(prefix="/visits", tags=["human-visits"], route_class=PhotoUploadRoute)
 
@@ -218,6 +220,8 @@ def api_get_visit(visit_id: UUID, request: Request, db: Session = Depends(get_db
                   employee_sample_eligible=eligible, employee_sample_reason=reason)
     result["photo_sha256"] = (hashlib.sha256(visit.snapshot).hexdigest()
                               if result["photo_status"] == "AVAILABLE" and visit.snapshot else None)
+    result["time_bounds"] = {"started_at": attendance_iso(milliseconds(visit.started_at)),
+                             "ended_at": attendance_iso(milliseconds(visit.last_seen_at))}
     return result
 
 
@@ -328,3 +332,30 @@ async def api_remove_visit_sample(visit_id: UUID, payload: RemoveVisitSampleInpu
 @router.get("/{visit_id}/employee-samples")
 async def api_visit_samples(visit_id: UUID, request: Request):
     return await run_in_threadpool(_sample_service(request).samples, str(visit_id))
+
+
+def _time_service(request, db):
+    return VisitTimeService(db.get_bind(), getattr(request.app.state, "presence", None), now=utcnow)
+
+
+@router.post("/{visit_id}/time/preview", dependencies=[Depends(require_operator_request)])
+def api_preview_visit_time(visit_id: UUID, payload: VisitTimeInput, request: Request,
+                           db: Session = Depends(get_db)):
+    return _time_service(request, db).preview(visit_id, payload)
+
+
+@router.post("/{visit_id}/time/apply", dependencies=[Depends(require_operator_request)])
+def api_apply_visit_time(visit_id: UUID, payload: VisitTimeApplyInput, request: Request,
+                         db: Session = Depends(get_db)):
+    return _time_service(request, db).apply(visit_id, payload)
+
+
+@router.post("/{visit_id}/time/undo", dependencies=[Depends(require_operator_request)])
+def api_undo_visit_time(visit_id: UUID, payload: VisitTimeUndoInput, request: Request,
+                        db: Session = Depends(get_db)):
+    return _time_service(request, db).undo(visit_id, payload)
+
+
+@router.get("/{visit_id}/time/history")
+def api_visit_time_history(visit_id: UUID, request: Request, db: Session = Depends(get_db)):
+    return _time_service(request, db).history(visit_id)

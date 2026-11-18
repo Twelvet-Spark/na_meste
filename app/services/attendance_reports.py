@@ -340,36 +340,48 @@ def list_corrections(db: Session, from_date: date | None, to_date: date | None, 
                       for kind, row in items[:CORRECTION_LIMIT]]}
 
 
-def create_correction(engine, kind: str, payload: CorrectionInput, now: datetime) -> dict:
+def insert_correction(writer: Session, kind: str, payload: CorrectionInput, now: datetime) -> dict:
+    """Insert within the caller's transaction, including grouped journal corrections."""
     model = _CORRECTION_MODELS[kind]
     values = {"employee_id": payload.employee_id, "started_at": milliseconds(payload.started_at),
               "ended_at": milliseconds(payload.ended_at), "actor": payload.actor, "reason": payload.reason}
+    employee = writer.get(Employee, payload.employee_id)
+    if employee is None:
+        raise HTTPException(404, "Сотрудник не найден")
+    existing = writer.query(model).filter_by(request_id=str(payload.request_id)).one_or_none()
+    if existing is not None:
+        if any(getattr(existing, name) != value for name, value in values.items()):
+            raise HTTPException(409, "request_id уже использован с другими данными")
+        return _correction_view(kind, existing, employee.name)
+    if values["ended_at"] > now:
+        raise HTTPException(422, "Время в будущем недопустимо")
+    row = model(request_id=str(payload.request_id), created_at=now, **values)
+    writer.add(row)
+    writer.flush()
+    return _correction_view(kind, row, employee.name)
+
+
+def create_correction(engine, kind: str, payload: CorrectionInput, now: datetime) -> dict:
     with immediate_session(engine) as writer:
-        employee = writer.get(Employee, payload.employee_id)
-        if employee is None:
-            raise HTTPException(404, "Сотрудник не найден")
-        existing = writer.query(model).filter_by(request_id=str(payload.request_id)).one_or_none()
-        if existing is not None:
-            if any(getattr(existing, name) != value for name, value in values.items()):
-                raise HTTPException(409, "request_id уже использован с другими данными")
-            return _correction_view(kind, existing, employee.name)
-        if values["ended_at"] > now:
-            raise HTTPException(422, "Время в будущем недопустимо")
-        row = model(request_id=str(payload.request_id), created_at=now, **values)
-        writer.add(row)
+        return insert_correction(writer, kind, payload, now)
+
+
+def revoke_correction_row(writer: Session, kind: str, correction_id: int, payload: RevokeInput,
+                          now: datetime, *, allow_revoked=False) -> dict:
+    model = _CORRECTION_MODELS[kind]
+    row = writer.get(model, correction_id)
+    if row is None:
+        raise HTTPException(404, "Корректировка не найдена")
+    if row.revoked_at is not None:
+        if not allow_revoked:
+            raise HTTPException(409, "Корректировка уже отменена")
+    else:
+        row.revoked_at, row.revoked_by, row.revoke_reason = now, payload.actor, payload.reason
         writer.flush()
-        return _correction_view(kind, row, employee.name)
+    employee = writer.get(Employee, row.employee_id)
+    return _correction_view(kind, row, employee.name if employee is not None else None)
 
 
 def revoke_correction(engine, kind: str, correction_id: int, payload: RevokeInput, now: datetime) -> dict:
-    model = _CORRECTION_MODELS[kind]
     with immediate_session(engine) as writer:
-        row = writer.get(model, correction_id)
-        if row is None:
-            raise HTTPException(404, "Корректировка не найдена")
-        if row.revoked_at is not None:
-            raise HTTPException(409, "Корректировка уже отменена")
-        row.revoked_at, row.revoked_by, row.revoke_reason = now, payload.actor, payload.reason
-        writer.flush()
-        employee = writer.get(Employee, row.employee_id)
-        return _correction_view(kind, row, employee.name if employee is not None else None)
+        return revoke_correction_row(writer, kind, correction_id, payload, now)
