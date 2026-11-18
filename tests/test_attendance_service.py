@@ -101,7 +101,7 @@ def error_status(status, operation):
 
 
 @contextmanager
-def database(*, commissioned=False):
+def database(*, commissioned=False, roles=("ENTRY", "EXIT")):
     with tempfile.TemporaryDirectory() as directory:
         engine = create_engine(
             f"sqlite:///{Path(directory).as_posix()}/attendance.db",
@@ -117,13 +117,13 @@ def database(*, commissioned=False):
         try:
             with immediate_session(engine) as db:
                 db.add_all([Employee(id=1, name="Employee 1"), Employee(id=2, name="Other")])
-                for camera_id, role in ((1, "ENTRY"), (2, "EXIT")):
+                for camera_id, role in enumerate(roles, 1):
                     db.add(Camera(id=camera_id, name=role, nvr_host="unused", username="u",
                                   password="p", channel=camera_id, enabled=True))
                 db.flush()
                 db.add_all([CameraProfile(camera_id=camera_id, zone="ENTRANCE", ai_enabled=True, revision=0)
-                            for camera_id in (1, 2)])
-                for camera_id, role in ((1, "ENTRY"), (2, "EXIT")):
+                            for camera_id in range(1, len(roles) + 1)])
+                for camera_id, role in enumerate(roles, 1):
                     db.add(AttendanceCamera(
                         camera_id=camera_id, role=role, enabled=True, revision=3, source_revision=2,
                         line_start=[.2, .5], line_end=[.8, .5], inside_point=[.5, .8],
@@ -153,12 +153,12 @@ def database(*, commissioned=False):
             engine.dispose()
 
 
-def crossing(*, when=BASE, ordinal=1, employee=1, direction="ENTRY", eligible=True):
+def crossing(*, when=BASE, ordinal=1, employee=1, direction="ENTRY", eligible=True, camera=None):
     # Obtain real immutable evidence and bounded JPEGs from the actual detector.
     path = Trajectory(role=direction)
     path.walk([.25, .3, .45, .55, .7] if direction == "ENTRY" else [.75, .7, .55, .45, .3])
     evidence = single_crossing(path, direction=direction)
-    camera_id = 1 if direction == "ENTRY" else 2
+    camera_id = camera or (1 if direction == "ENTRY" else 2)
     delta = when - evidence.occurred_at
     faces = tuple(replace(
         face, received_at=face.received_at + delta,
@@ -790,6 +790,37 @@ def test_reassignment_to_lower_employee_id_releases_old_stable_projection_key_fi
             assert row.entry_event_id == entry.id and row.employee_id == 1
             assert {ref.employee_id for ref in db.query(AttendanceEmployeeReference).filter_by(
                 event_id=entry.id)} == {1, 2}
+
+
+@test
+def test_both_camera_counts_entries_and_exits_while_an_entry_camera_rejects_exits():
+    # Health coverage is configured to be satisfied, so only the per-camera direction rule can add the reason.
+    with database(roles=("BOTH",)) as (engine, service):
+        service.health.configure_cameras([(1, "BOTH", 2, True, True, True)])
+        entry = service.record_crossing(crossing(camera=1, direction="ENTRY", eligible=False))
+        exit_ = service.record_crossing(crossing(camera=1, direction="EXIT", ordinal=2, eligible=False,
+                                                 when=BASE + timedelta(hours=1)))
+        with Session(engine) as db:
+            assert all("CAMERA_UNCONFIGURED" not in db.get(AttendanceEvent, identifier).reason_codes
+                       for identifier in (entry, exit_))
+    with database(roles=("ENTRY", "BOTH")) as (engine, service):
+        service.health.configure_cameras([(1, "ENTRY", 2, True, True, True), (2, "BOTH", 2, True, True, True)])
+        wrong_way = service.record_crossing(crossing(camera=1, direction="EXIT", eligible=False))
+        counted = service.record_crossing(crossing(camera=2, direction="EXIT", ordinal=2, eligible=False,
+                                                   when=BASE + timedelta(hours=1)))
+        with Session(engine) as db:
+            assert "CAMERA_UNCONFIGURED" in db.get(AttendanceEvent, wrong_way).reason_codes
+            assert "CAMERA_UNCONFIGURED" not in db.get(AttendanceEvent, counted).reason_codes
+
+
+@test
+def test_one_both_camera_can_hold_a_valid_commission_but_one_entry_camera_cannot():
+    with database(commissioned=True, roles=("BOTH",)) as (engine, service):
+        with Session(engine) as db:
+            assert service._commission_valid(db, invalidate=False)
+    with database(commissioned=True, roles=("ENTRY",)) as (engine, service):
+        with Session(engine) as db:
+            assert not service._commission_valid(db, invalidate=False)
 
 
 if __name__ == "__main__":

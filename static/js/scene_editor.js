@@ -163,15 +163,17 @@
   const saveable = () => editable() && state.validSnapshot && !state.review;
   const selectedDoor = () => state.geometry.doors.find(d => d.id === state.selection);
   const fixedShape = id => id === 'gate' || state.geometry.doors.some(d => d.id === id);
+  // A running analysis would overwrite hand edits; a pending MobileSAM suggestion never touches the geometry.
+  function cancelAnalysis() { if ((state.job || state.completedJob)?.kind === 'analysis') cancelJob(); }
   function checkpoint() {
-    if (state.job) cancelJob();
+    cancelAnalysis();
     state.undo.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection, analysisItems: clone(state.analysisItems)});
     if (state.undo.length > 60) state.undo.shift();
     state.redo.length = 0;
   }
   function history(undo) {
     if (!editable()) return;
-    cancelJob();
+    cancelAnalysis();
     const from = undo ? state.undo : state.redo, to = undo ? state.redo : state.undo;
     if (!from.length) return;
     to.push({geometry: clone(state.geometry), gate: clone(state.gate), selection: state.selection, analysisItems: clone(state.analysisItems)});
@@ -211,7 +213,7 @@
   }
   function setTool(tool) {
     if (tool === 'gate' && state.camera?.profile.zone !== 'ENTRANCE') return;
-    cancelJob();
+    cancelAnalysis();
     state.tool = tool; state.drawing = ['floor', 'object', 'door', 'metric', 'gate'].includes(tool);
     if (tool === 'floor') state.selection = 'floor';
     if (tool === 'gate') state.selection = 'gate';
@@ -567,6 +569,7 @@
   async function saveGate(disable = false) {
     if (state.busy || !state.config || (!disable && (!saveable() || state.camera?.profile.zone !== 'ENTRANCE'))) return;
     if (!disable && gateError()) { message(gateError(), 'err', 'calibration-message'); return; }
+    if (!disable && state.gate.enabled && !state.camera.profile.ai_enabled) { message('Включите AI для камеры на вкладке «Обзор», прежде чем включать учёт.', 'err', 'calibration-message'); return; }
     if (!disable && !$('calibration-form').reportValidity()) return;
     const c = state.config, g = disable ? gateFrom(c) : state.gate;
     const payload = {role: g.role, enabled: disable ? false : g.enabled,

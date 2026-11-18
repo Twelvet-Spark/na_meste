@@ -1073,6 +1073,20 @@ def test_lifespan_model_initialization_exception_keeps_real_manual_accounting_av
                 asyncio.run(exercise())
 
 
+@test
+def test_one_both_camera_is_technically_ready_after_warmup_but_one_entry_camera_is_not():
+    with database() as (_engine, service):
+        clock = Clock()
+        health = health_for(service, clock)
+        health.configure_cameras([(1, "BOTH", 2, True, True, True)])
+        warm(health, clock)
+        snapshot = health.snapshot()
+        assert snapshot["technical_ready"] and "CAMERA_UNCONFIGURED" not in snapshot["reasons"]
+        health.configure_cameras([(1, "ENTRY", 2, True, True, True)])
+        snapshot = health.snapshot()
+        assert not snapshot["technical_ready"] and "CAMERA_UNCONFIGURED" in snapshot["reasons"]
+
+
 if __name__ == "__main__":
     failures = 0
     for case in TESTS:

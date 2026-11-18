@@ -156,6 +156,25 @@ def enabled_attendance_blocks_leaving_entrances_or_switching_ai_off():
 
 
 @test
+def a_migrated_counting_camera_without_ai_can_still_be_saved_and_switched_on():
+    with fixture() as f:
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=0, zone="ENTRANCE", ai_enabled=False))
+        with Session(f.engine) as db:
+            row = db.get(AttendanceCamera, 1)
+            row.role, row.enabled, row.door_kind = "BOTH", True, "DOOR"
+            row.line_start, row.line_end, row.inside_point = [.2, .5], [.8, .5], [.5, .8]
+            row.door_top, row.reference_width, row.reference_height = [[.2, .1], [.8, .1]], 640, 480
+            db.commit()
+        # The legacy AI_CAMERAS upgrade can leave this state; unchanged fields must not block unrelated edits.
+        saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
+            expected_revision=1, zone="ENTRANCE", ai_enabled=False, workplace_id=1))["profile"]
+        assert saved["workplace_id"] == 1 and saved["ai_enabled"] is False
+        assert f.client.json("PUT", "/api/cameras/1/profile", dict(
+            expected_revision=2, ai_enabled=True))["profile"]["ai_enabled"] is True
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=3, ai_enabled=False), status=409)
+
+
+@test
 def reconnect_restarts_only_a_running_enabled_camera():
     with fixture() as f:
         status = f.client.json("POST", "/api/cameras/1/reconnect")

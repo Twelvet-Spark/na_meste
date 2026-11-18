@@ -43,7 +43,8 @@ function renderControls() {
     profileRevision = profile.revision;
   }
   $('camera-workplace').disabled = false;
-  $('camera-ai-enabled').disabled = counting;
+  // Counting needs AI, so the switch is locked only while AI is on; a camera left without AI can be repaired.
+  $('camera-ai-enabled').disabled = counting && profile.ai_enabled;
   $('camera-ai-enabled').setAttribute('aria-describedby', 'camera-ai-help');
   $('camera-ai-fps').disabled = counting;
   $('camera-profile-save').disabled = false;
@@ -52,7 +53,7 @@ function renderControls() {
     input.setAttribute('aria-describedby', 'camera-zone-help');
   });
   $('camera-zone-help').textContent = counting ? 'Сначала отключите учёт на этой камере, чтобы сделать её внутренней.' : '';
-  $('camera-ai-help').textContent = counting ? 'Камера учёта требует AI; сначала отключите учёт.' : '';
+  $('camera-ai-help').textContent = counting ? (profile.ai_enabled ? 'Камера учёта требует AI; сначала отключите учёт.' : 'Учёт включён, но AI выключен — включите AI.') : '';
   $('camera-fps-help').textContent = counting ? 'Камера учёта работает с частотой учёта' : 'Пустое поле — общая частота AI.';
 }
 function showCamera(cam) {

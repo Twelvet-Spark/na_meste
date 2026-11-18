@@ -327,9 +327,11 @@ def update_profile(db: Session, camera_id: int, data: CameraProfileUpdate, *,
                     raise HTTPException(422, "Выберите активное рабочее место")
             config = writer.get(AttendanceCamera, camera_id)
             if config is not None and config.enabled:
-                if changes.get("zone", row.zone) != "ENTRANCE":
+                # Only a change into an invalid state is refused, so a camera left invalid by the
+                # legacy AI_CAMERAS upgrade can still be saved and repaired.
+                if row.zone == "ENTRANCE" and changes.get("zone", row.zone) != "ENTRANCE":
                     raise HTTPException(409, "Сначала отключите учёт на этой камере")
-                if not changes.get("ai_enabled", row.ai_enabled):
+                if row.ai_enabled and not changes.get("ai_enabled", row.ai_enabled):
                     raise HTTPException(409, "Камера учёта требует AI; сначала отключите учёт")
             changed = False
             for name, value in changes.items():
