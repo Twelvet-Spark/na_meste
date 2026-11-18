@@ -149,7 +149,7 @@
     for (const kind of ['photo', 'face']) {
       clearImage(kind); UI.message($(`visit-${kind}-status`), labels.EXPIRED);
     }
-    renderVisit(); corrections.update(visit, digests); controls();
+    renderVisit(); corrections.update(visit, digests, { evidenceOnly: true }); controls();
   }
 
   async function loadVisit() {

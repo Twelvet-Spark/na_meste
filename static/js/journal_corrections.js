@@ -336,7 +336,7 @@
     locked,
     samplePending: () => blocked('sample'),
     setLoading(value) { refreshBusy = value; sync(); },
-    update(value, imageDigests) {
+    update(value, imageDigests, { evidenceOnly = false } = {}) {
       visit = value; digests = { ...imageDigests };
       if (!blocked('sample')) {
         const src = $('visit-photo').getAttribute('src');
@@ -351,7 +351,8 @@
         $('time-end').value = visit.time_bounds.ended_at.slice(0, -offset.length).replace(/(\.\d{3})\d+$/, '$1');
         $('time-zone').textContent = `Время организации: UTC${offset === 'Z' ? '+00:00' : offset}, не часовой пояс браузера. Интервал не расширяется автоматически.`;
       }
-      invalidatePreview(); sync(); loadHistory();
+      if (!evidenceOnly) invalidatePreview();
+      sync(); loadHistory();
     },
   };
   window.addEventListener('beforeunload', (event) => { if (locked()) { event.preventDefault(); event.returnValue = ''; } });

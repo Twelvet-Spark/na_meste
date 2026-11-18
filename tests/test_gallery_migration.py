@@ -100,7 +100,7 @@ def test_v3_upgrade_preserves_unconvertible_samples_before_target_publication():
             store = EmbeddingStore(MODEL)
             assert store.refresh(db) == 1 and store.match(vector(2)).employee_id == 41
         with engine.connect() as connection:
-            assert connection.exec_driver_sql("SELECT version FROM operator_schema").scalar_one() == 6
+            assert connection.exec_driver_sql("SELECT version FROM operator_schema").scalar_one() == 7
             assert connection.exec_driver_sql(
                 "SELECT count(*) FROM sqlite_master WHERE name='presence_sessions'").scalar_one() == 0
 
