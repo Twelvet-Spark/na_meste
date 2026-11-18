@@ -10,6 +10,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid4, uuid5
+from hashlib import sha256
 import json
 import sys
 import tempfile
@@ -118,6 +119,14 @@ def idle(journal):
 def rows(engine, cls):
     with Session(engine) as db:
         return list(db.scalars(select(cls)))
+
+
+def photo_metadata(engine, visit_id):
+    with engine.connect() as connection:
+        return connection.exec_driver_sql(
+            "SELECT sha256, captured_at, frame_seq, native_width, native_height "
+            "FROM human_visit_photo_metadata WHERE visit_id = ?", (visit_id,),
+        ).one_or_none()
 
 
 def start(engine, clock, **kwargs):
@@ -286,17 +295,21 @@ def image_failure_does_not_rollback_metadata_and_retention_is_visit_only():
             journal.observe(1, packet(clock, 1), outcome(person()))
         idle(journal)
         assert rows(engine, HumanVisit)[0].snapshot is None
+        assert photo_metadata(engine, rows(engine, HumanVisit)[0].id) is None
         clock.advance(5)
         journal.observe(1, packet(clock, 2), outcome(person(score=.9, evidence=face(clock, 2))))
         idle(journal)
         visit = rows(engine, HumanVisit)[0]
         assert visit.snapshot and visit.face_thumbnail
         assert visit.face_quality['sha256']
+        provenance = photo_metadata(engine, visit.id)
+        assert provenance.sha256 == sha256(visit.snapshot).hexdigest()
         clock.advance(86401)
         journal.tick(clock.now())
         idle(journal)
         visit = rows(engine, HumanVisit)[0]
         assert visit.snapshot is None and visit.face_thumbnail is None and visit.images_purged_at
+        assert photo_metadata(engine, visit.id) == provenance
         assert rows(engine, EmployeeFace)[0].thumbnail == b'enrollment'
         assert rows(engine, GlobalObservation)[0].snapshot == b'historical'
         assert rows(engine, HumanVisitEvent)
@@ -474,23 +487,62 @@ def image_representative_improves_only_after_five_seconds_and_is_bounded():
         first_frame = np.zeros((900, 1400, 3), np.uint8)
         journal.observe(1, packet(clock, 1, frame=first_frame), outcome(person(score=.5)))
         idle(journal)
-        initial = rows(engine, HumanVisit)[0].snapshot
+        visit = rows(engine, HumanVisit)[0]
+        initial = visit.snapshot
         assert initial and len(initial) <= 262144
         assert max(cv2.imdecode(np.frombuffer(initial, np.uint8), cv2.IMREAD_COLOR).shape[:2]) <= 640
+        initial_metadata = photo_metadata(engine, visit.id)
+        assert initial_metadata.sha256 == sha256(initial).hexdigest()
+        assert datetime.fromisoformat(initial_metadata.captured_at) == STAMP
+        assert (initial_metadata.frame_seq, initial_metadata.native_width,
+                initial_metadata.native_height) == (1, 980, 720)
         brighter = np.full_like(first_frame, 190)
         clock.advance(4.9)
         journal.observe(1, packet(clock, 2, frame=brighter), outcome(person(score=.9)))
         idle(journal)
         assert rows(engine, HumanVisit)[0].snapshot == initial
-        clock.advance(.1)
+        assert photo_metadata(engine, visit.id) == initial_metadata
+        clock.advance(.100123)
         journal.observe(1, packet(clock, 3, frame=brighter), outcome(person(score=.9)))
         idle(journal)
         improved = rows(engine, HumanVisit)[0].snapshot
         assert improved != initial
+        improved_metadata = photo_metadata(engine, visit.id)
+        assert improved_metadata.sha256 == sha256(improved).hexdigest()
+        assert datetime.fromisoformat(improved_metadata.captured_at) == STAMP + timedelta(seconds=5)
+        assert improved_metadata.frame_seq == 3
         clock.advance(5)
-        journal.observe(1, packet(clock, 4, frame=first_frame), outcome(person(score=.7)))
+        journal.observe(1, packet(clock, 4, frame=first_frame),
+                        outcome(person(score=.7, evidence=face(clock, 4))))
         idle(journal)
         assert rows(engine, HumanVisit)[0].snapshot == improved
+        assert rows(engine, HumanVisit)[0].face_thumbnail
+        assert photo_metadata(engine, visit.id) == improved_metadata
+        finish(journal)
+
+
+@test
+def expired_checkpoint_cannot_advance_person_photo_provenance():
+    with database() as engine:
+        clock = Clock()
+        journal = start(engine, clock, image_keep_days=1)
+        admission = journal.observe(1, packet(clock, 1), outcome(person(score=.5)))[0]
+        idle(journal)
+        original = rows(engine, HumanVisit)[0].snapshot
+        gate = TransactionGate()
+        with patch.object(module, 'immediate_session', gate):
+            clock.advance(5)
+            brighter = np.full((160, 160, 3), 190, np.uint8)
+            journal.observe(1, packet(clock, 2, frame=brighter), outcome(person(score=.9)))
+            assert gate.entered.wait(5)
+            clock.advance(86401)
+            gate.release.set()
+            idle(journal)
+        visit = rows(engine, HumanVisit)[0]
+        assert visit.snapshot is None and visit.images_purged_at is not None
+        provenance = photo_metadata(engine, admission.visit_id)
+        assert provenance.sha256 == sha256(original).hexdigest()
+        assert provenance.frame_seq == 1
         finish(journal)
 
 

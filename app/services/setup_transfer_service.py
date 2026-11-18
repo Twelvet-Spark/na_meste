@@ -11,6 +11,7 @@ from uuid import UUID
 
 import numpy as np
 from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from app.ai.face_recognition import is_normalized_embedding
 
@@ -77,18 +78,29 @@ def _schema(connection):
 
 
 def _empty(connection):
+    learning_seed = False
     # Do not use _catalog's LIKE filter: '_' also matches non-system names.
     for (name,) in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'"):
         if name.startswith("sqlite_") or name in {"operator_schema", "attendance_runtime"}:
             continue
         quoted = connection.dialect.identifier_preparer.quote_identifier(name)
+        if name == "operator_learning_runtime":
+            # Only the pristine seed is a system marker; anything else is operator data or damage.
+            try:
+                rows = connection.exec_driver_sql(f"SELECT id, revision FROM {quoted} LIMIT 2").all()
+            except SQLAlchemyError:
+                return False
+            if len(rows) == 1 and type(rows[0][0]) is int and type(rows[0][1]) is int and tuple(rows[0]) == (1, 0):
+                learning_seed = True
+                continue
+            return False
         if connection.exec_driver_sql(f"SELECT 1 FROM {quoted} LIMIT 1").first() is not None:
             return False
-    return True
+    return learning_seed
 
 
 def _warnings(document, preparation):
-    warnings = ["TRANSFER_NO_HISTORY_OR_VIDEO"]
+    warnings = ["TRANSFER_NO_HISTORY_OR_VIDEO", "TRANSFER_NO_LEARNING_HISTORY"]
     counts = {}
     for face in document.faces:
         counts[face.employee_id] = counts.get(face.employee_id, 0) + 1
@@ -201,7 +213,7 @@ class SetupTransferService:
 
     def export(self, password: str) -> bytes:
         try:
-            payload = {"transfer_version": 5, "exported_at": datetime.now(timezone.utc).isoformat(),
+            payload = {"transfer_version": 6, "exported_at": datetime.now(timezone.utc).isoformat(),
                        "attendance_schema_version": attendance_schema.SCHEMA_VERSION,
                        "operator_schema_version": operator_schema.VERSION,
                        "face_model_id": self.face_model_id, "embedding_encoding": "float32-le-512"}

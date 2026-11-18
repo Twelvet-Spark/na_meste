@@ -1,4 +1,4 @@
-"""Additive operator-v1..v6 storage contracts; isolated databases only.
+"""Additive operator-v1..v8 storage contracts; isolated databases only.
 
 Run: .venv/Scripts/python.exe tests/test_operator_storage.py
 All databases and backups are temporary. Legacy employees use pinned old DDL,
@@ -75,7 +75,10 @@ OPERATOR_V2_TABLES = OPERATOR_V1_TABLES | {"camera_archives"}
 MEDIA_TABLES = {"recording_sessions", "recording_segments", "recording_connections", "recording_gaps"}
 V4_TABLES = {"face_model_metadata", "camera_scenes", "human_visits",
              "human_visit_events", "human_journal_gaps"}
-OPERATOR_TABLES = OPERATOR_V2_TABLES | MEDIA_TABLES | V4_TABLES | {"camera_profiles", "human_visit_identity_revisions"}
+V8_TABLES = {"operator_learning_runtime", "human_visit_photo_metadata", "recognition_feedback",
+             "recognition_examples"}
+OPERATOR_TABLES = (OPERATOR_V2_TABLES | MEDIA_TABLES | V4_TABLES | V8_TABLES
+                   | {"camera_profiles", "human_visit_identity_revisions"})
 STAMP = datetime(2026, 11, 11, 4, 5, 6, 123456)
 
 # Genuine committed-v1 fixtures are pinned independently of the implementation
@@ -326,7 +329,8 @@ def assert_operator_current(engine):
     tables = set(inspect(engine).get_table_names())
     assert OPERATOR_TABLES <= tables, f"Missing additive operator tables: {OPERATOR_TABLES - tables}"
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 7)]
+        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 8)]
+        assert connection.exec_driver_sql("SELECT id,revision FROM operator_learning_runtime").all() == [(1, 0)]
         assert connection.exec_driver_sql("SELECT schema_version FROM attendance_runtime").scalar_one() == 3
     assert ATTENDANCE_TABLES <= tables, f"Missing attendance tables: {ATTENDANCE_TABLES - tables}"
     assert not DROPPED_TABLES & tables, f"Old history tables survived: {DROPPED_TABLES & tables}"
@@ -761,7 +765,8 @@ def test_v3_upgrade_backs_up_before_v4_and_preserves_existing_ddl():
         committed_v3(engine)
         before = dump(engine)
         # Everything the work-time upgrade or later operator steps rebuild, drop or add.
-        changed = V4_TABLES | ATTENDANCE_TABLES | ATTENDANCE_V2_TABLES | DROPPED_TABLES | {"camera_profiles", "human_visit_identity_revisions"}
+        changed = (V4_TABLES | ATTENDANCE_TABLES | ATTENDANCE_V2_TABLES | DROPPED_TABLES
+                   | {"camera_profiles", "human_visit_identity_revisions"} | V8_TABLES)
         old_sql = tuple(row for row in catalog(engine) if row[2] not in changed)
         schema.initialize_attendance_schema(engine)
         assert_operator_current(engine)
@@ -1025,6 +1030,360 @@ def test_committed_v5_failed_backup_refuses_before_any_history_is_dropped():
         committed_v5(engine)
         (root / "backups").write_text("not a directory", encoding="utf-8")
         refused_without_mutation(engine)
+
+
+V8_OBJECTS = (("index", "ix_recognition_examples_model"), ("index", "ix_recognition_feedback_visit_created"),
+              ("index", "ix_recognition_feedback_employee_created"), ("table", "recognition_examples"),
+              ("table", "recognition_feedback"), ("table", "human_visit_photo_metadata"),
+              ("table", "operator_learning_runtime"))
+VISIT_SHA = "c" * 64
+
+
+def committed_v7(engine):
+    """Populated operator v7/attendance v3: the deployed predecessor of the learning tables.
+
+    Built from the pinned v5 fixture, upgraded, then stripped of exactly the v8 objects; the stripped
+    catalog is asserted equal to the frozen v7 DDL so the fixture cannot drift.
+    """
+    import shutil
+    committed_v5(engine)
+    schema.initialize_attendance_schema(engine)
+    shutil.rmtree(schema.BACKUP_DIR, ignore_errors=True)  # only the upgrade under test may leave a backup
+    with engine.begin() as connection:
+        for kind, name in V8_OBJECTS:
+            connection.exec_driver_sql(f"DROP {kind.upper()} {name}")
+        connection.exec_driver_sql("UPDATE operator_schema SET version=7 WHERE id=1")
+    with engine.begin() as connection:
+        assert operator_schema.preflight(connection) == 7
+        connection.exec_driver_sql(
+            "INSERT INTO human_visits (id,camera_id,tracking_generation,track_id,source_revision,stream_id,"
+            "started_at,last_seen_at,ended_at,status,employee_id,identity_state,last_bbox,max_person_score,"
+            "snapshot,face_thumbnail,image_expires_at) VALUES ('visit-1',12,'generation-1',3,1,'stream-1',?,?,?,"
+            "'CLOSED',41,'FACE_CONFIRMED','[1,2,3,4]',0.9,x'ffd8aa',x'ffd8bb',?)",
+            (STAMP, STAMP, STAMP, "2026-12-11 00:00:00"))
+        connection.exec_driver_sql(
+            "INSERT INTO human_visit_identity_revisions (visit_id,revision,mode,employee_id,actor,reason,"
+            "created_at,request_id) VALUES ('visit-1',1,'EMPLOYEE',41,'Оператор','Проверка',?,?)",
+            (STAMP, "11111111-1111-4111-8111-111111111111"))
+        connection.exec_driver_sql(
+            "INSERT INTO employee_faces (id,employee_id,embedding,thumbnail,created_at) "
+            "VALUES (5,41,x'0102',x'03',?)", (STAMP,))
+        connection.exec_driver_sql(
+            "INSERT INTO attendance_presence_segments (employee_id,camera_id,started_at,last_seen_at,face_seen) "
+            "VALUES (41,12,?,?,1)", (STAMP, STAMP))
+
+
+def v7_state(engine):
+    tables = ("human_visits", "human_visit_identity_revisions", "employee_faces",
+              "attendance_presence_segments", "employees", "cameras", "workplaces", "operator_requests")
+    with engine.connect() as connection:
+        return {name: connection.exec_driver_sql(f"SELECT * FROM {name} ORDER BY 1").all() for name in tables}
+
+
+@test
+def test_v7_populated_upgrade_adds_learning_tables_after_exact_backup_and_preserves_data():
+    with database() as (engine, root):
+        committed_v7(engine)
+        assert not any(name == "operator_learning_runtime" for _kind, name, *_rest in catalog(engine))
+        before, preserved = dump(engine), v7_state(engine)
+        old_catalog = catalog(engine)
+        checked = []
+
+        def observe(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("CREATE TABLE"):
+                backups = list((root / "backups").glob("*.db"))
+                assert len(backups) == 1, "Backup must precede the first v8 DDL"
+                with closing(sqlite3.connect(backups[0])) as backup:
+                    assert tuple(backup.iterdump()) == before
+                checked.append(statement)
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            schema.initialize_attendance_schema(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert len(checked) == 4
+        assert_operator_current(engine)
+        assert v7_state(engine) == preserved
+        new_catalog = catalog(engine)
+        assert set(old_catalog) <= set(new_catalog), "Existing DDL must stay byte for byte"
+        assert {(kind, name) for kind, name, *_rest in new_catalog} - {
+            (kind, name) for kind, name, *_rest in old_catalog} == set(V8_OBJECTS), \
+            "Only the four tables and three indexes are added"
+        with engine.connect() as connection:
+            for name in ("recognition_feedback", "recognition_examples", "human_visit_photo_metadata"):
+                assert connection.exec_driver_sql(f"SELECT count(*) FROM {name}").scalar_one() == 0, \
+                    "No metadata, feedback or examples may be fabricated for pre-v8 images"
+            assert operator_schema.preflight(connection) == 8
+        assert len(list((root / "backups").glob("*.db"))) == 1
+        installed = dump(engine)
+        schema.initialize_attendance_schema(engine)
+        assert dump(engine) == installed and len(list((root / "backups").glob("*.db"))) == 1
+
+
+@test
+def test_v7_upgrade_converges_with_fresh_install_catalog():
+    with database() as (fresh, _root), database() as (upgraded, _other):
+        schema.initialize_attendance_schema(fresh)
+        committed_v7(upgraded)
+        schema.initialize_attendance_schema(upgraded)
+        normalized = lambda engine: tuple((kind, name, table, schema._sql_key(sql or ""))
+                                          for kind, name, table, sql in catalog(engine)
+                                          if name in {n for _k, n in V8_OBJECTS} | V8_TABLES)
+        assert normalized(fresh) == normalized(upgraded) and len(normalized(fresh)) == 7
+
+
+@test
+def test_v8_failure_rolls_back_every_learning_object_and_seed_and_retry_converges():
+    for marker in ("CREATE TABLE RECOGNITION_EXAMPLES", "INSERT INTO OPERATOR_LEARNING_RUNTIME",
+                   "UPDATE OPERATOR_SCHEMA SET VERSION=8"):
+        with database() as (engine, root):
+            committed_v7(engine)
+            before, attempted = dump(engine), []
+
+            def fail(connection, cursor, statement, parameters, context, executemany, marker=marker):
+                if " ".join(statement.split()).upper().startswith(marker):
+                    attempted.append(statement)
+                    raise OperationalError(statement, parameters, RuntimeError("injected v8 failure"))
+
+            event.listen(engine, "before_cursor_execute", fail)
+            try:
+                try:
+                    schema.initialize_attendance_schema(engine)
+                except OperationalError:
+                    pass
+                else:
+                    raise AssertionError(f"{marker} was never reached")
+            finally:
+                event.remove(engine, "before_cursor_execute", fail)
+            assert attempted
+            assert dump(engine) == before, "A failed v8 upgrade must leave committed v7 untouched"
+            with engine.connect() as connection:
+                assert operator_schema.preflight(connection) == 7
+            assert len(list((root / "backups").glob("*.db"))) == 1
+            schema.initialize_attendance_schema(engine)
+            assert_operator_current(engine)
+
+
+@test
+def test_v7_failed_backup_refuses_before_learning_ddl():
+    with database() as (engine, root):
+        committed_v7(engine)
+        (root / "backups").write_text("not a directory", encoding="utf-8")
+        refused_without_mutation(engine)
+
+
+@test
+def test_v8_preflight_rejects_changed_missing_and_unexpected_learning_objects():
+    mutations = (
+        "DROP INDEX ix_recognition_examples_model",
+        "CREATE INDEX unexpected_operator_index ON recognition_examples (model_id)",
+        "DROP TABLE recognition_examples",
+        "ALTER TABLE operator_learning_runtime ADD COLUMN extra INTEGER",
+    )
+    for statement in mutations:
+        with database() as (engine, root):
+            schema.initialize_attendance_schema(engine)
+            with engine.begin() as connection:
+                connection.exec_driver_sql(statement)
+            before = dump(engine)
+            try:
+                schema.initialize_attendance_schema(engine)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"Drifted v8 catalog accepted: {statement}")
+            assert dump(engine) == before
+
+
+def learning_parents(connection):
+    connection.exec_driver_sql(
+        "INSERT INTO employees (id,name,external_id,active,created_at,updated_at) VALUES (41,'A','e',1,?,?)",
+        (STAMP, STAMP))
+    connection.exec_driver_sql(
+        "INSERT INTO cameras (id,name,nvr_host,rtsp_port,username,password,channel,stream_type,enabled,"
+        "created_at,updated_at) VALUES (12,'C','unused',554,'u','p',1,'main',1,?,?)", (STAMP, STAMP))
+    connection.exec_driver_sql(
+        "INSERT INTO human_visits (id,camera_id,tracking_generation,track_id,source_revision,stream_id,"
+        "started_at,last_seen_at,status,identity_state,last_bbox,max_person_score,image_expires_at) VALUES "
+        "('visit-1',12,'g',1,1,'s',?,?,'ACTIVE','UNKNOWN','[1,2,3,4]',0.5,?)", (STAMP, STAMP, STAMP))
+
+
+FEEDBACK_COLUMNS = ("id", "visit_id", "employee_id", "action", "source", "source_sha256", "image_sha256", "crop",
+                    "captured_at", "image_jpeg", "actor", "reason", "created_at", "identity_revision", "face_id",
+                    "face_key", "face_status", "revoked_at", "revoked_by", "revoke_reason")
+
+
+def insert(connection, table, columns, defaults, **override):
+    values = {**defaults, **override}
+    connection.exec_driver_sql(
+        f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+        tuple(values[name] for name in columns))
+
+
+FEEDBACK = {"id": "00000000-0000-4000-8000-000000000001", "visit_id": "visit-1", "employee_id": 41,
+            "action": "ACCEPT", "source": "PHOTO_CROP", "source_sha256": "a" * 64, "image_sha256": "b" * 64,
+            "crop": "[0.1, 0.2, 0.8, 0.9]", "captured_at": "2026-11-11 04:05:06.123", "image_jpeg": b"\xff",
+            "actor": "Оператор", "reason": "Проверка", "created_at": "2026-11-11 04:05:07",
+            "identity_revision": None, "face_id": None, "face_key": None, "face_status": "INELIGIBLE",
+            "revoked_at": None, "revoked_by": None, "revoke_reason": None}
+EXAMPLE_COLUMNS = ("feedback_id", "modality", "polarity", "model_id", "alignment_id", "embedding")
+EXAMPLE = {"feedback_id": FEEDBACK["id"], "modality": "BODY", "polarity": "POSITIVE", "model_id": "d" * 64,
+           "alignment_id": None, "embedding": b"\0" * 2048}
+METADATA_COLUMNS = ("visit_id", "sha256", "captured_at", "frame_seq", "native_width", "native_height")
+METADATA = {"visit_id": "visit-1", "sha256": VISIT_SHA, "captured_at": "2026-11-11 04:05:06.250000",
+            "frame_seq": 0, "native_width": 16, "native_height": 32}
+
+
+def rejected(engine, table, columns, defaults, **override):
+    from sqlalchemy.exc import IntegrityError
+    with engine.connect() as connection:
+        try:
+            insert(connection, table, columns, defaults, **override)
+        except IntegrityError:
+            return True
+        finally:
+            connection.rollback()
+    return False
+
+
+def accepted(engine, table, columns, defaults, **override):
+    with engine.connect() as connection:
+        try:
+            insert(connection, table, columns, defaults, **override)
+        finally:
+            connection.rollback()
+
+
+def assert_learning_constraints(engine):
+    """Identical contract for the frozen DDL and the ORM-created test schema."""
+    first, second, third = (f"00000000-0000-4000-8000-00000000000{i}" for i in (1, 2, 3))
+    with engine.begin() as connection:
+        learning_parents(connection)
+        connection.exec_driver_sql(
+            "INSERT INTO human_visits (id,camera_id,tracking_generation,track_id,source_revision,stream_id,"
+            "started_at,last_seen_at,status,identity_state,last_bbox,max_person_score,image_expires_at) VALUES "
+            "('visit-2',12,'g',2,1,'s',?,?,'ACTIVE','UNKNOWN','[1,2,3,4]',0.5,?)", (STAMP, STAMP, STAMP))
+        insert(connection, "recognition_feedback", FEEDBACK_COLUMNS, FEEDBACK)
+        # Boundary-valid rows: integer crop, no capture time/image, full face pair, complete revoke triple.
+        insert(connection, "recognition_feedback", FEEDBACK_COLUMNS, FEEDBACK,
+               id=second, crop="[0, 0, 1, 1]", captured_at=None, image_jpeg=None, face_id=5, face_key="c" * 64,
+               face_status="ADDED", identity_revision=1, revoked_at="2026-11-11 05:00:00",
+               revoked_by="Оператор", revoke_reason="Ошибка")
+        insert(connection, "recognition_feedback", FEEDBACK_COLUMNS, FEEDBACK,
+               id=third, captured_at="2026-11-11 04:05:06.123000", action="REJECT", source="UPLOAD",
+               image_jpeg=b"x" * 262144, face_status="NEGATIVE_ADDED")
+        insert(connection, "recognition_examples", EXAMPLE_COLUMNS, EXAMPLE)
+        insert(connection, "recognition_examples", EXAMPLE_COLUMNS, EXAMPLE, modality="FACE", polarity="NEGATIVE",
+                alignment_id="aligned")
+        insert(connection, "human_visit_photo_metadata", METADATA_COLUMNS, METADATA)
+    fresh_feedback = {**FEEDBACK, "id": "00000000-0000-4000-8000-0000000000ff"}
+    accepted(engine, "recognition_feedback", FEEDBACK_COLUMNS, fresh_feedback)  # control: only overrides fail
+    bad_feedback = (
+        {"action": "MAYBE"}, {"source": "FILE"}, {"source_sha256": "A" * 64}, {"source_sha256": "a" * 63},
+        {"source_sha256": "a" * 64 + "\0suffix"}, {"source_sha256": b"a" * 64},
+        {"image_sha256": "b" * 65}, {"image_sha256": "g" * 64}, {"crop": "[0.5, 0.2, 0.5, 0.9]"},
+        {"crop": "[0, 0, 1, 2]"}, {"crop": '[0, 0, "1", 1]'}, {"crop": '{"a": 1}'}, {"crop": "[0, 0, 1]"},
+        {"crop": "[0.2, 0.6, 0.8, 0.1]"}, {"crop": "[-0.1, 0, 1, 1]"}, {"crop": "not json"}, {"crop": None},
+        {"captured_at": "2026-11-11 04:05:06.123456"}, {"captured_at": "2026-11-11T04:05:06"},
+        {"captured_at": "not a date"}, {"image_jpeg": b"x" * 262145}, {"image_jpeg": "text"},
+        {"actor": "   "}, {"actor": ""}, {"actor": "x" * 101}, {"reason": " "}, {"reason": "x" * 1001},
+        {"actor": "\t\r\n"}, {"reason": "Example\0hidden"},
+        {"face_id": 5}, {"face_key": "k"}, {"face_id": 0, "face_key": "k"}, {"face_status": "DONE"},
+        {"employee_id": 999}, {"visit_id": "missing"}, {"identity_revision": 0}, {"id": "short"},
+        {"created_at": None},
+        {"revoked_at": "2026-11-11 05:00:00"}, {"revoked_by": "Оператор"}, {"revoke_reason": "Ошибка"},
+        {"revoked_at": "2026-11-11 05:00:00", "revoked_by": "Оператор"},
+        {"revoked_at": "2026-11-11 05:00:00", "revoked_by": "Оператор", "revoke_reason": " "},
+        {"revoked_at": "2026-11-11 05:00:00", "revoked_by": " ", "revoke_reason": "Ошибка"},
+    )
+    for override in bad_feedback:
+        assert rejected(engine, "recognition_feedback", FEEDBACK_COLUMNS, fresh_feedback, **override), \
+            f"Invalid feedback accepted: {override}"
+    for override in ({"feedback_id": second}, {"feedback_id": third}):
+        accepted(engine, "recognition_examples", EXAMPLE_COLUMNS, EXAMPLE, **override)  # controls
+    bad_examples = (
+        {"embedding": b"\0" * 2047}, {"embedding": b"\0" * 2049}, {"embedding": "x" * 2048},
+        {"model_id": "d" * 63}, {"feedback_id": second, "modality": "FACE", "polarity": "POSITIVE",
+                                 "alignment_id": "aligned"},
+        {"feedback_id": second, "modality": "FACE", "alignment_id": None, "polarity": "NEGATIVE"},
+        {"feedback_id": second, "alignment_id": "aligned"}, {"feedback_id": second, "modality": "ARM"},
+        {"feedback_id": second, "polarity": "NEUTRAL"},
+        {},  # duplicates (feedback_id, modality)
+        {"feedback_id": "00000000-0000-4000-8000-0000000000aa"},  # missing feedback FK
+    )
+    for override in bad_examples:
+        assert rejected(engine, "recognition_examples", EXAMPLE_COLUMNS, EXAMPLE, **override), \
+            f"Invalid example accepted: {override}"
+    second_visit = {**METADATA, "visit_id": "visit-2"}
+    accepted(engine, "human_visit_photo_metadata", METADATA_COLUMNS, second_visit)
+    for override in ({"sha256": "G" * 64}, {"sha256": "c" * 63}, {"frame_seq": -1}, {"native_width": 0},
+                     {"native_height": -5}, {"captured_at": "2026-11-11 04:05:06.123456"},
+                     {"frame_seq": 2.5}, {"native_width": "wide"},
+                     {"captured_at": None}, {"visit_id": "missing"}, {"visit_id": "visit-1"}):
+        assert rejected(engine, "human_visit_photo_metadata", METADATA_COLUMNS, second_visit, **override), \
+            f"Invalid metadata accepted: {override}"
+    with engine.connect() as connection:
+        for statement in ("DELETE FROM human_visits WHERE id='visit-1'", "DELETE FROM employees WHERE id=41",
+                          f"DELETE FROM recognition_feedback WHERE id='{first}'"):
+            try:
+                connection.exec_driver_sql(statement)
+            except Exception as exc:
+                assert "FOREIGN KEY" in str(exc).upper(), exc
+            else:
+                raise AssertionError(f"ON DELETE RESTRICT not enforced: {statement}")
+            finally:
+                connection.rollback()
+
+
+def assert_runtime_singleton(engine, *, seeded):
+    with engine.begin() as connection:
+        if not seeded:
+            assert connection.exec_driver_sql("SELECT count(*) FROM operator_learning_runtime").scalar_one() == 0, \
+                "Only the frozen install may seed the learning runtime"
+            connection.exec_driver_sql("INSERT INTO operator_learning_runtime (id) VALUES (1)")
+        assert connection.exec_driver_sql("SELECT id,revision FROM operator_learning_runtime").all() == [(1, 0)], \
+            "revision must default to 0"
+    from sqlalchemy.exc import IntegrityError
+    for statement in ("INSERT INTO operator_learning_runtime (id,revision) VALUES (2,0)",
+                      "INSERT INTO operator_learning_runtime (id,revision) VALUES (1,0)",
+                      "UPDATE operator_learning_runtime SET revision=-1",
+                      "UPDATE operator_learning_runtime SET id=2"):
+        with engine.connect() as connection:
+            try:
+                connection.exec_driver_sql(statement)
+            except IntegrityError:
+                pass
+            else:
+                raise AssertionError(f"Learning runtime accepted: {statement}")
+            finally:
+                connection.rollback()
+
+
+@test
+def test_frozen_v8_learning_constraints_reject_malformed_rows():
+    with database() as (engine, _root):
+        schema.initialize_attendance_schema(engine)
+        assert_runtime_singleton(engine, seeded=True)
+        assert_learning_constraints(engine)
+
+
+@test
+def test_orm_created_learning_tables_enforce_the_same_constraints_without_seeding_runtime():
+    with database() as (engine, _root):
+        Base.metadata.create_all(engine)
+        assert_runtime_singleton(engine, seeded=False)
+        assert_learning_constraints(engine)
+
+
+@test
+def test_deployed_catalogs_v1_to_v7_are_still_recognized():
+    assert sorted(operator_schema.SCHEMAS) == list(range(1, 9)) == sorted(operator_schema.INDEXES)
+    assert operator_schema.VERSION == 8
+    assert set(operator_schema.V8_TABLES) - set(operator_schema.V7_TABLES) == V8_TABLES
+    assert operator_schema.TABLES == frozenset(operator_schema.V8_TABLES)
+    for version in range(1, 8):
+        assert not V8_TABLES & set(operator_schema.SCHEMAS[version])
 
 
 if __name__ == "__main__":

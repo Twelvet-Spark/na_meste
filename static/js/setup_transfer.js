@@ -30,6 +30,7 @@
   };
   const warnings = {
     TRANSFER_NO_HISTORY_OR_VIDEO: 'История, видео и настройки этого компьютера не переносятся.',
+    TRANSFER_NO_LEARNING_HISTORY: 'Подтверждения, отклонения и образцы внешности из журнала не переносятся. Полная резервная копия базы сохраняет их.',
     TRANSFER_LEGACY_REMEDIATION: 'Есть старые карточки с неполными именами или набором фото вне 1–15. Они сохранятся для исправления.',
     TRANSFER_MISSING_THUMBNAILS: 'У части образцов нет миниатюр. Неподтверждённые старые векторы сохранятся, но не участвуют в распознавании.',
     TRANSFER_FACES_NEED_REENROLLMENT: 'Есть непригодные для текущей модели образцы. После импорта замените их новыми фотографиями; исходные фото не хранятся.',
@@ -118,7 +119,7 @@
       root.append(anchor); anchor.click(); anchor.remove();
       setTimeout(() => { URL.revokeObjectURL(url); urls.delete(url); }, 60000);
       exportForm.reset();
-      message(output, 'Файл передан браузеру для скачивания. Сохраните его и пароль отдельно. Видео и история не включены.');
+      message(output, `Файл передан браузеру для скачивания. Сохраните его и пароль отдельно. Видео и история не включены. ${warnings.TRANSFER_NO_LEARNING_HISTORY}`);
     });
   });
   importForm.addEventListener('submit', (event) => {

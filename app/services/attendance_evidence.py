@@ -1,4 +1,4 @@
-"""Bounded JPEG encoding of crossing evidence crops."""
+"""Bounded JPEG encoding of attendance and journal evidence crops."""
 from dataclasses import dataclass
 
 import cv2
@@ -7,7 +7,26 @@ import numpy as np
 _CONTEXT_MAX_DIMENSION = 640
 _CONTEXT_MAX_BYTES = 96 * 1024
 _FACE_MAX_BYTES = 32 * 1024
+_PERSON_MAX_DIMENSION = 640
+_PERSON_MAX_BYTES = 256 * 1024
 _JPEG_QUALITY = 70
+
+
+def encode_person_crop(image: np.ndarray) -> bytes | None:
+    """Canonical journal/learning JPEG, bounded without upscaling."""
+    if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
+            or image.ndim != 3 or image.shape[2] != 3 or not image.size):
+        return None
+    height, width = image.shape[:2]
+    if max(height, width) > _PERSON_MAX_DIMENSION:
+        scale = _PERSON_MAX_DIMENSION / max(height, width)
+        image = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))),
+                           interpolation=cv2.INTER_AREA)
+    for quality in (85, 65, 45, 25):
+        ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if ok and encoded.nbytes <= _PERSON_MAX_BYTES:
+            return encoded.tobytes()
+    return None
 
 
 @dataclass(frozen=True, slots=True)

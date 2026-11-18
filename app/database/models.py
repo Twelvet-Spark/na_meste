@@ -509,3 +509,122 @@ class HumanJournalGap(Base):
         CheckConstraint("ended_at IS NULL OR ended_at >= started_at"),
         Index("ix_human_journal_gaps_camera_started", "camera_id", "started_at"),
     )
+
+
+def _sha(column: str) -> str:
+    return (f"typeof({column}) = 'text' AND length({column}) = 64 AND "
+            f"length(CAST({column} AS BLOB)) = 64 AND {column} NOT GLOB '*[^0-9a-f]*'")
+
+
+def _ms(column: str) -> str:
+    """Naive UTC text with at most millisecond precision (SQLAlchemy may pad zeros to six digits)."""
+    return (f"typeof({column}) = 'text' AND datetime({column}) IS NOT NULL AND substr({column}, 11, 1) = ' ' "
+            f"AND length({column}) IN (19, 23, 26) AND (length({column}) < 26 OR substr({column}, 24, 3) = '000')")
+
+
+def _rectangle(column: str) -> str:
+    kinds = " AND ".join(f"json_type({column}, '$[{i}]') IN ('integer', 'real')" for i in range(4))
+    return (f"json_valid({column}) AND json_type({column}) = 'array' AND json_array_length({column}) = 4 "
+            f"AND {kinds} AND json_extract({column}, '$[0]') >= 0 AND json_extract({column}, '$[0]') < "
+            f"json_extract({column}, '$[2]') AND json_extract({column}, '$[2]') <= 1 "
+            f"AND json_extract({column}, '$[1]') >= 0 AND json_extract({column}, '$[1]') < "
+            f"json_extract({column}, '$[3]') AND json_extract({column}, '$[3]') <= 1")
+
+
+def _audit(column: str, limit: int) -> str:
+    return (f"typeof({column}) = 'text' AND length({column}) BETWEEN 1 AND {limit} AND "
+            f"instr({column}, char(0)) = 0 AND trim({column}, ' ' || char(9, 10, 11, 12, 13)) != ''")
+
+
+class RecognitionLearningRuntime(Base):
+    """Singleton revision of supervised recognition evidence; seeded only by the frozen operator install."""
+    __tablename__ = "operator_learning_runtime"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    __table_args__ = (CheckConstraint("id = 1"), CheckConstraint("typeof(revision) = 'integer' AND revision >= 0"))
+
+
+class HumanVisitPhotoMetadata(Base):
+    """Exact provenance of HumanVisit.snapshot; absent for pre-v8 images."""
+    __tablename__ = "human_visit_photo_metadata"
+    visit_id: Mapped[str] = mapped_column(ForeignKey("human_visits.id", ondelete="RESTRICT"), primary_key=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    captured_at: Mapped[datetime] = mapped_column(DateTime)
+    frame_seq: Mapped[int] = mapped_column(Integer)
+    native_width: Mapped[int] = mapped_column(Integer)
+    native_height: Mapped[int] = mapped_column(Integer)
+    __table_args__ = (
+        CheckConstraint(_sha("sha256")), CheckConstraint(_ms("captured_at")),
+        CheckConstraint("typeof(frame_seq) = 'integer' AND frame_seq >= 0"),
+        CheckConstraint("typeof(native_width) = 'integer' AND native_width > 0"),
+        CheckConstraint("typeof(native_height) = 'integer' AND native_height > 0"),
+    )
+
+
+class RecognitionFeedback(Base):
+    __tablename__ = "recognition_feedback"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    visit_id: Mapped[str] = mapped_column(ForeignKey("human_visits.id", ondelete="RESTRICT"))
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    action: Mapped[str] = mapped_column(String(6))
+    source: Mapped[str] = mapped_column(String(10))
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    image_sha256: Mapped[str] = mapped_column(String(64))
+    crop: Mapped[list] = mapped_column(JSON)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    image_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    actor: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    identity_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Audited external reference, deliberately not a FK: face IDs can be reused, so face_key must also match.
+    face_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    face_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    face_status: Mapped[str] = mapped_column(String(24))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    __table_args__ = (
+        CheckConstraint("length(id) = 36"),
+        CheckConstraint("action IN ('ACCEPT', 'REJECT')"),
+        CheckConstraint("source IN ('PHOTO_CROP', 'UPLOAD')"),
+        CheckConstraint(_sha("source_sha256")), CheckConstraint(_sha("image_sha256")),
+        CheckConstraint(_rectangle("crop")),
+        CheckConstraint(f"captured_at IS NULL OR ({_ms('captured_at')})"),
+        CheckConstraint("image_jpeg IS NULL OR (typeof(image_jpeg) = 'blob' AND length(image_jpeg) <= 262144)"),
+        CheckConstraint(_audit("actor", 100)), CheckConstraint(_audit("reason", 1000)),
+        CheckConstraint("identity_revision IS NULL OR identity_revision >= 1"),
+        CheckConstraint("face_id IS NULL OR face_id >= 1"),
+        CheckConstraint(f"face_key IS NULL OR ({_sha('face_key')})"),
+        CheckConstraint("face_status IN ('ADDED', 'NEGATIVE_ADDED', 'INELIGIBLE', 'LIMIT', 'CONFLICT', 'UNAVAILABLE')"),
+        CheckConstraint("(face_id IS NULL) = (face_key IS NULL)"),
+        CheckConstraint("(revoked_at IS NULL AND revoked_by IS NULL AND revoke_reason IS NULL) OR "
+                        "(revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND revoke_reason IS NOT NULL AND "
+                        f"{_audit('revoked_by', 100)} AND {_audit('revoke_reason', 1000)})"),
+        Index("ix_recognition_feedback_employee_created", "employee_id", "created_at", "id"),
+        Index("ix_recognition_feedback_visit_created", "visit_id", "created_at", "id"),
+    )
+
+
+class RecognitionExample(Base):
+    """Vector evidence of one feedback row; accepted face positives stay in EmployeeFace."""
+    __tablename__ = "recognition_examples"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    feedback_id: Mapped[str] = mapped_column(ForeignKey("recognition_feedback.id", ondelete="RESTRICT"))
+    modality: Mapped[str] = mapped_column(String(4))
+    polarity: Mapped[str] = mapped_column(String(8))
+    model_id: Mapped[str] = mapped_column(String(64))
+    alignment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding: Mapped[bytes] = mapped_column(LargeBinary)
+    __table_args__ = (
+        CheckConstraint("modality IN ('BODY', 'FACE')"),
+        CheckConstraint("polarity IN ('POSITIVE', 'NEGATIVE')"),
+        CheckConstraint(_sha("model_id")),
+        CheckConstraint("alignment_id IS NULL OR length(alignment_id) BETWEEN 1 AND 64"),
+        CheckConstraint("typeof(embedding) = 'blob' AND length(embedding) = 2048"),
+        CheckConstraint("(modality = 'BODY' AND alignment_id IS NULL) OR "
+                        "(modality = 'FACE' AND alignment_id IS NOT NULL)"),
+        CheckConstraint("polarity = 'NEGATIVE' OR modality = 'BODY'"),
+        UniqueConstraint("feedback_id", "modality"),
+        Index("ix_recognition_examples_model", "modality", "model_id", "feedback_id"),
+    )

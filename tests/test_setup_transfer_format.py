@@ -143,7 +143,7 @@ def password_and_corruption_are_authenticated():
 
 @test
 def schema_model_and_unknown_fields_fail_closed():
-    for key, value in (("transfer_version", 6), ("operator_schema_version", 999),
+    for key, value in (("transfer_version", 7), ("operator_schema_version", 999),
                        ("attendance_schema_version", 999), ("face_model_id", "2" * 64),
                        ("embedding_encoding", "pickle"), ("videos", [])):
         data = document()
@@ -365,6 +365,25 @@ def v5_setup_roundtrip_keeps_v4_import_and_excludes_correction_history():
     assert restored.faces == parse(old).faces
     current["human_visit_identity_revisions"] = []
     refuses(current, "TRANSFER_INVALID")
+
+
+@test
+def v6_is_current_and_historical_v1_to_v5_still_validate():
+    old = document()
+    current = {**old, "transfer_version": 6, "operator_schema_version": 8}
+    restored = transfer.decode_transfer(transfer.encode_transfer(parse(current), PASSWORD), PASSWORD)
+    assert isinstance(restored, transfer.SetupDocument) and restored.transfer_version == 6
+    assert restored.operator_schema_version == 8 and restored.attendance_schema_version == 3
+    assert restored.faces == parse(old).faces
+    for version, operator in ((6, 7), (5, 8), (6, 6)):
+        wrong = {**current, "transfer_version": version, "operator_schema_version": operator}
+        refuses(wrong, "TRANSFER_INCOMPATIBLE")
+    current["human_visit_identity_revisions"] = []
+    refuses(current, "TRANSFER_INVALID")
+    v5 = {**old, "transfer_version": 5, "operator_schema_version": 7}
+    assert type(parse(v5)) is transfer.SetupDocumentV5
+    for data in (document(), v3_document(), v2_document(), legacy_document()):
+        assert parse(data).transfer_version == data["transfer_version"]
 
 
 @test

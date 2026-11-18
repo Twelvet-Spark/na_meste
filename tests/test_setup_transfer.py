@@ -201,6 +201,39 @@ def emptiness_ignores_only_runtime_and_markers():
 
 
 @test
+def learning_runtime_seed_alone_is_empty_and_other_learning_state_is_not():
+    with database() as db:
+        assert service(db).status()["destination_empty"]
+        for statement in ("UPDATE operator_learning_runtime SET revision=1",
+                          "DELETE FROM operator_learning_runtime"):
+            with db.begin() as conn:
+                conn.exec_driver_sql("DELETE FROM operator_learning_runtime")
+                conn.exec_driver_sql("INSERT INTO operator_learning_runtime (id, revision) VALUES (1, 0)")
+                conn.exec_driver_sql(statement)
+            assert not service(db).status()["destination_empty"], statement
+    with database() as db:
+        with db.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE operator_learning_runtime")
+        refused(service(db).status, "TRANSFER_INCOMPATIBLE")
+    with database() as db:
+        with db.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE operator_learning_runtime")
+            conn.exec_driver_sql("CREATE TABLE operator_learning_runtime (x INTEGER)")
+            conn.exec_driver_sql("INSERT INTO operator_learning_runtime VALUES (1)")
+        refused(service(db).status, "TRANSFER_INCOMPATIBLE")
+
+
+@test
+def export_is_v6_and_preview_warns_that_learning_history_is_local():
+    with database() as source, database() as dest:
+        seed(source)
+        blob = service(source).export(PASSWORD)
+        assert decode_transfer(blob, PASSWORD, expected_face_model_id=MODEL_ID).transfer_version == 6
+        preview = service(dest).preview(blob, PASSWORD)
+        assert "TRANSFER_NO_LEARNING_HISTORY" in preview["warnings"]
+
+
+@test
 def stale_preview_concurrency_and_rollback_cannot_overwrite():
     with database() as source, database() as dest:
         seed(source)

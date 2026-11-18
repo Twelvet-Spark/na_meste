@@ -384,12 +384,18 @@ class SetupDocumentV4(_SetupRecords):
     profiles: list[CameraProfileRecord] = Field(max_length=10000)
 
 
-class SetupDocument(SetupDocumentV4):
+class SetupDocumentV5(SetupDocumentV4):
     transfer_version: Literal[5]
     operator_schema_version: Literal[7]
 
 
-TransferDocument = SetupDocument | SetupDocumentV4 | SetupDocumentV3 | SetupDocumentV2 | LegacySetupDocument
+class SetupDocument(SetupDocumentV5):
+    transfer_version: Literal[6]
+    operator_schema_version: Literal[8]
+
+
+TransferDocument = (SetupDocument | SetupDocumentV5 | SetupDocumentV4 | SetupDocumentV3 | SetupDocumentV2
+                    | LegacySetupDocument)
 
 
 def decode_binary(value: str) -> bytes:
@@ -474,13 +480,14 @@ def validate_document(payload: bytes, *, expected_face_model_id: str | None = No
         if not isinstance(raw, dict):
             raise TransferError("TRANSFER_INVALID")
         version = raw.get("transfer_version")
-        schemas = {1: (3, 1), 2: (4, 1), 3: (5, 2), 4: (6, 3), 5: (7, 3)}.get(version) if type(version) is int else None
+        schemas = {1: (3, 1), 2: (4, 1), 3: (5, 2), 4: (6, 3), 5: (7, 3),
+                   6: (8, 3)}.get(version) if type(version) is int else None
         if schemas is None or any(type(raw.get(k)) is not type(v) or raw.get(k) != v for k, v in (
             ("operator_schema_version", schemas[0]), ("attendance_schema_version", schemas[1]),
             ("embedding_encoding", "float32-le-512"))):
             raise TransferError("TRANSFER_INCOMPATIBLE")
         model = {1: LegacySetupDocument, 2: SetupDocumentV2, 3: SetupDocumentV3,
-                 4: SetupDocumentV4, 5: SetupDocument}[version]
+                 4: SetupDocumentV4, 5: SetupDocumentV5, 6: SetupDocument}[version]
         result = model.model_validate(raw)
         if version >= 2 and expected_face_model_id is not None:
             if result.face_model_id != expected_face_model_id or any(

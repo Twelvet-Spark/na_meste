@@ -6,7 +6,7 @@ Recording metadata is installed explicitly by version 3, never via create_all.
 from app.operator_settings import legacy_ai_camera_ids
 from app.time_utils import utcnow
 
-VERSION = 7
+VERSION = 8
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -263,9 +263,99 @@ V7_INDEXES = {
     **V6_INDEXES,
     "ix_visit_identity_revision": "CREATE INDEX ix_visit_identity_revision ON human_visit_identity_revisions (visit_id, revision)",
 }
+
+
+def _sha(column):
+    return (f"typeof({column}) = 'text' AND length({column}) = 64 AND "
+            f"length(CAST({column} AS BLOB)) = 64 AND {column} NOT GLOB '*[^0-9a-f]*'")
+
+
+def _ms(column):
+    """Naive UTC text with at most millisecond precision (SQLAlchemy may pad zeros to six digits)."""
+    return (f"typeof({column}) = 'text' AND datetime({column}) IS NOT NULL AND substr({column}, 11, 1) = ' ' "
+            f"AND length({column}) IN (19, 23, 26) AND (length({column}) < 26 OR substr({column}, 24, 3) = '000')")
+
+
+def _rectangle(column):
+    kinds = " AND ".join(f"json_type({column}, '$[{i}]') IN ('integer', 'real')" for i in range(4))
+    return (f"json_valid({column}) AND json_type({column}) = 'array' AND json_array_length({column}) = 4 "
+            f"AND {kinds} AND json_extract({column}, '$[0]') >= 0 AND json_extract({column}, '$[0]') < "
+            f"json_extract({column}, '$[2]') AND json_extract({column}, '$[2]') <= 1 "
+            f"AND json_extract({column}, '$[1]') >= 0 AND json_extract({column}, '$[1]') < "
+            f"json_extract({column}, '$[3]') AND json_extract({column}, '$[3]') <= 1")
+
+
+def _audit(column, limit):
+    return (f"typeof({column}) = 'text' AND length({column}) BETWEEN 1 AND {limit} AND "
+            f"instr({column}, char(0)) = 0 AND trim({column}, ' ' || char(9, 10, 11, 12, 13)) != ''")
+
+
+V8_TABLES = {
+    **V7_TABLES,
+    "operator_learning_runtime": """CREATE TABLE operator_learning_runtime (
+        id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(revision) = 'integer' AND revision >= 0)
+    )""",
+    "human_visit_photo_metadata": f"""CREATE TABLE human_visit_photo_metadata (
+        visit_id VARCHAR(36) NOT NULL PRIMARY KEY,
+        sha256 VARCHAR(64) NOT NULL CHECK ({_sha('sha256')}),
+        captured_at DATETIME NOT NULL CHECK ({_ms('captured_at')}),
+        frame_seq INTEGER NOT NULL CHECK (typeof(frame_seq) = 'integer' AND frame_seq >= 0),
+        native_width INTEGER NOT NULL CHECK (typeof(native_width) = 'integer' AND native_width > 0),
+        native_height INTEGER NOT NULL CHECK (typeof(native_height) = 'integer' AND native_height > 0),
+        FOREIGN KEY(visit_id) REFERENCES human_visits (id) ON DELETE RESTRICT
+    )""",
+    "recognition_feedback": f"""CREATE TABLE recognition_feedback (
+        id VARCHAR(36) NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+        visit_id VARCHAR(36) NOT NULL,
+        employee_id INTEGER NOT NULL,
+        action VARCHAR(6) NOT NULL CHECK (action IN ('ACCEPT', 'REJECT')),
+        source VARCHAR(10) NOT NULL CHECK (source IN ('PHOTO_CROP', 'UPLOAD')),
+        source_sha256 VARCHAR(64) NOT NULL CHECK ({_sha('source_sha256')}),
+        image_sha256 VARCHAR(64) NOT NULL CHECK ({_sha('image_sha256')}),
+        crop JSON NOT NULL CHECK ({_rectangle('crop')}),
+        captured_at DATETIME CHECK (captured_at IS NULL OR ({_ms('captured_at')})),
+        image_jpeg BLOB CHECK (image_jpeg IS NULL OR (typeof(image_jpeg) = 'blob' AND length(image_jpeg) <= 262144)),
+        actor VARCHAR(100) NOT NULL CHECK ({_audit('actor', 100)}),
+        reason VARCHAR(1000) NOT NULL CHECK ({_audit('reason', 1000)}),
+        created_at DATETIME NOT NULL,
+        identity_revision INTEGER CHECK (identity_revision IS NULL OR identity_revision >= 1),
+        face_id INTEGER CHECK (face_id IS NULL OR face_id >= 1),
+        face_key VARCHAR(64) CHECK (face_key IS NULL OR ({_sha('face_key')})),
+        face_status VARCHAR(24) NOT NULL CHECK (face_status IN ('ADDED', 'NEGATIVE_ADDED', 'INELIGIBLE', 'LIMIT', 'CONFLICT', 'UNAVAILABLE')),
+        revoked_at DATETIME,
+        revoked_by VARCHAR(100),
+        revoke_reason VARCHAR(1000),
+        CHECK ((face_id IS NULL) = (face_key IS NULL)),
+        CHECK ((revoked_at IS NULL AND revoked_by IS NULL AND revoke_reason IS NULL) OR (revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND revoke_reason IS NOT NULL AND {_audit('revoked_by', 100)} AND {_audit('revoke_reason', 1000)})),
+        FOREIGN KEY(visit_id) REFERENCES human_visits (id) ON DELETE RESTRICT,
+        FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT
+    )""",
+    "recognition_examples": f"""CREATE TABLE recognition_examples (
+        id INTEGER NOT NULL PRIMARY KEY,
+        feedback_id VARCHAR(36) NOT NULL,
+        modality VARCHAR(4) NOT NULL CHECK (modality IN ('BODY', 'FACE')),
+        polarity VARCHAR(8) NOT NULL CHECK (polarity IN ('POSITIVE', 'NEGATIVE')),
+        model_id VARCHAR(64) NOT NULL CHECK ({_sha('model_id')}),
+        alignment_id VARCHAR(64) CHECK (alignment_id IS NULL OR length(alignment_id) BETWEEN 1 AND 64),
+        embedding BLOB NOT NULL CHECK (typeof(embedding) = 'blob' AND length(embedding) = 2048),
+        CHECK ((modality = 'BODY' AND alignment_id IS NULL) OR (modality = 'FACE' AND alignment_id IS NOT NULL)),
+        CHECK (polarity = 'NEGATIVE' OR modality = 'BODY'),
+        UNIQUE (feedback_id, modality),
+        FOREIGN KEY(feedback_id) REFERENCES recognition_feedback (id) ON DELETE RESTRICT
+    )""",
+}
+V8_INDEXES = {
+    **V7_INDEXES,
+    "ix_recognition_feedback_employee_created": "CREATE INDEX ix_recognition_feedback_employee_created ON recognition_feedback (employee_id, created_at, id)",
+    "ix_recognition_feedback_visit_created": "CREATE INDEX ix_recognition_feedback_visit_created ON recognition_feedback (visit_id, created_at, id)",
+    "ix_recognition_examples_model": "CREATE INDEX ix_recognition_examples_model ON recognition_examples (modality, model_id, feedback_id)",
+}
 INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES, 6: V6_INDEXES, 7: V7_INDEXES}
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES, 6: V6_TABLES, 7: V7_TABLES}
-TABLES = frozenset(V7_TABLES)
+INDEXES[8] = V8_INDEXES
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES, 6: V6_TABLES, 7: V7_TABLES,
+           8: V8_TABLES}
+TABLES = frozenset(V8_TABLES)
 
 
 def _refuse(detail):
@@ -399,3 +489,14 @@ def install(connection, installed=0):
         connection.exec_driver_sql(V7_INDEXES["ix_visit_identity_revision"])
         connection.exec_driver_sql("UPDATE operator_schema SET version=7,updated_at=? WHERE id=1",
                                    (utcnow().isoformat(sep=" "),))
+        installed = 7
+    if installed == 7:
+        now = utcnow().isoformat(sep=" ")
+        for name, ddl in V8_TABLES.items():
+            if name not in V7_TABLES:
+                connection.exec_driver_sql(ddl)
+        for name, ddl in V8_INDEXES.items():
+            if name not in V7_INDEXES:
+                connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql("INSERT INTO operator_learning_runtime (id, revision) VALUES (1, 0)")
+        connection.exec_driver_sql("UPDATE operator_schema SET version=8,updated_at=? WHERE id=1", (now,))

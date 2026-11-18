@@ -28,7 +28,9 @@ from sqlalchemy import func, select, update
 from app.database.database import immediate_session
 from app.database.models import (
     AttendanceCamera, Camera, GlobalPerson, HumanJournalGap, HumanVisit, HumanVisitEvent,
+    HumanVisitPhotoMetadata,
 )
+from app.services.attendance_evidence import encode_person_crop
 from app.time_utils import utcnow
 
 _NAMESPACE = uuid5(NAMESPACE_URL, 'na_meste/human-journal/v1')
@@ -396,26 +398,14 @@ class HumanJournal:
                 events.append(self._event(visit, 'IDENTITY_CONFLICT', _utc(packet.received_at)))
         return events
 
-    @staticmethod
-    def _jpeg(image):
-        if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
-                or image.ndim != 3 or image.shape[2] != 3 or not image.size):
-            return None
-        height, width = image.shape[:2]
-        if max(height, width) > 640:
-            scale = 640 / max(height, width)
-            image = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))),
-                               interpolation=cv2.INTER_AREA)
-        for quality in (85, 65, 45, 25):
-            ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-            if ok and encoded.nbytes <= _IMAGE_BYTES:
-                return encoded.tobytes()
-        return None
-
     def _capture(self, visit, person, packet):
         if packet.received_mono - visit.image_mono < 5.:
             return False
         changed = False
+        captured_at = _utc(packet.received_at)
+        if visit.values['image_expires_at'] <= captured_at:
+            visit.values.update(snapshot=None, face_thumbnail=None)
+            visit.values.pop('snapshot_meta', None)
         # Encoding failures are deliberately image-only. Database failures are
         # never caught here and always go through the writer's degraded barrier.
         try:
@@ -425,11 +415,20 @@ class HumanJournal:
                 x1, y1, x2, y2 = visit.values['last_bbox']
                 rank = float(person.person_score) * (x2 - x1) * width * (y2 - y1) * height
                 if rank > visit.person_quality:
-                    image = self._jpeg(frame[max(0, int(y1 * height)):min(height, math.ceil(y2 * height)),
-                                             max(0, int(x1 * width)):min(width, math.ceil(x2 * width))])
+                    crop = frame[max(0, int(y1 * height)):min(height, math.ceil(y2 * height)),
+                                 max(0, int(x1 * width)):min(width, math.ceil(x2 * width))]
+                    image = encode_person_crop(crop)
                     if image is not None:
-                        visit.values['snapshot'] = image
                         visit.person_quality = rank
+                        if image != visit.values['snapshot']:
+                            visit.values['snapshot'] = image
+                            visit.values['snapshot_meta'] = dict(
+                                sha256=hashlib.sha256(image).hexdigest(),
+                                captured_at=captured_at.replace(
+                                    microsecond=captured_at.microsecond // 1000 * 1000),
+                                frame_seq=packet.seq, native_width=crop.shape[1],
+                                native_height=crop.shape[0],
+                            )
                         changed = True
         except (cv2.error, ValueError, TypeError, OverflowError, MemoryError):
             pass
@@ -457,7 +456,7 @@ class HumanJournal:
         # not consume work on every frame. Better images are reconsidered in 5s.
         visit.image_mono = packet.received_mono
         if changed:
-            visit.values['image_expires_at'] = _utc(packet.received_at) + timedelta(days=self.image_keep_days)
+            visit.values['image_expires_at'] = captured_at + timedelta(days=self.image_keep_days)
             visit.values['images_purged_at'] = None
         return changed
 
@@ -713,10 +712,13 @@ class HumanJournal:
     def _put_visit(db, values, at):
         row = db.get(HumanVisit, values['id'])
         data = dict(values)
+        photo_metadata = data.pop('snapshot_meta', None)
         # A delayed command cannot resurrect expired evidence after a purge.
         if data['image_expires_at'] <= at:
             data.update(snapshot=None, face_thumbnail=None,
                         images_purged_at=data['images_purged_at'] or at)
+        image = data['snapshot']
+        replaced = image is not None and (row is None or image != row.snapshot)
         if row is None:
             row = HumanVisit(**data)
             db.add(row)
@@ -727,11 +729,19 @@ class HumanJournal:
             for name, value in data.items():
                 setattr(row, name, value)
         db.flush()
+        if (replaced and photo_metadata is not None
+                and hashlib.sha256(image).hexdigest() == photo_metadata['sha256']):
+            metadata = db.get(HumanVisitPhotoMetadata, row.id)
+            if metadata is None:
+                db.add(HumanVisitPhotoMetadata(visit_id=row.id, **photo_metadata))
+            else:
+                for name, value in photo_metadata.items():
+                    setattr(metadata, name, value)
         return row
 
     def _write(self, command):
-        at = _utc(self._now())
         with immediate_session(self.engine) as db:
+            at = _utc(self._now())
             if command.kind == 'STARTUP':
                 for visit in db.scalars(select(HumanVisit).where(
                         HumanVisit.status != 'CLOSED').execution_options(yield_per=256)):
@@ -867,6 +877,7 @@ class HumanJournal:
             for visit in self._visits.values():
                 if visit.values['image_expires_at'] <= command.payload:
                     visit.values.update(snapshot=None, face_thumbnail=None, images_purged_at=command.payload)
+                    visit.values.pop('snapshot_meta', None)
         self._retire()
 
     def _retire(self):
