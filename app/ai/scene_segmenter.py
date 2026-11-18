@@ -21,9 +21,10 @@ import onnxruntime as ort
 from PIL import Image
 
 from app.ai.model_bundle import ModelBundle
-from app.scene_geometry import GeometryError, validate_geometry
+from app.scene_geometry import GeometryError, polygon_area, validate_geometry
 
 CACHE_TTL = 300
+MIN_FLOOR_AREA = .05
 
 
 class SceneSegmentationError(RuntimeError):
@@ -201,6 +202,48 @@ def _mask_polygon(binary, *, diagnostics=None):
     return None
 
 
+def _floor_polygon(binary):
+    """A floor is one region: drop specks and fill furniture holes, which suggestions never do.
+
+    Only floors are repaired this way; object and prompted outlines still go through _mask_polygon unchanged.
+    """
+    binary = np.asarray(binary, dtype=np.uint8)
+    height, width = binary.shape
+    kernel_size = max(3, round(.01 * min(height, width)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    def largest(mask):
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if count < 2:
+            return None
+        return (labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+
+    region = largest(binary)
+    if region is None:
+        return None
+    region = cv2.morphologyEx(cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel), cv2.MORPH_OPEN, kernel)
+    region = largest(region)
+    if region is None:
+        return None
+    contours, _hierarchy = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(region)
+    cv2.fillPoly(filled, [max(contours, key=cv2.contourArea)], 1)
+    return _mask_polygon(filled)
+
+
+def _best_floor(masks, scores):
+    if (not isinstance(masks, np.ndarray) or masks.ndim != 4 or masks.shape[:2] != (1, 4)
+            or masks.dtype != np.float32 or not isinstance(scores, np.ndarray)
+            or scores.shape != (1, 4) or scores.dtype != np.float32
+            or not np.isfinite(masks).all() or not np.isfinite(scores).all()):
+        raise SceneSegmentationError('SCENE_INFERENCE_FAILED', 'MobileSAM output contract mismatch')
+    for index in np.argsort(-scores[0], kind='stable'):
+        points = _floor_polygon(masks[0, index] > 0.)
+        if points is not None and polygon_area(points) >= MIN_FLOOR_AREA:
+            return PolygonSuggestion(points, float(scores[0, index]))
+    return None
+
+
 def _rank_polygons(masks, scores, height, width, *, diagnostics=None):
     if (not isinstance(masks, np.ndarray) or masks.shape != (1, 4, height, width)
             or masks.dtype != np.float32 or not isinstance(scores, np.ndarray)
@@ -311,6 +354,14 @@ class SceneSegmenter:
                 raise SceneSegmentationError('CAMERA_SOURCE_CHANGED', 'Snapshot invalidated during inference')
 
     def suggest(self, snapshot, positive_points, negative_points, box=None):
+        return self._infer(snapshot, positive_points, negative_points, box,
+                           lambda masks, scores: _rank_polygons(masks, scores, snapshot.height, snapshot.width))
+
+    def floor(self, snapshot, positive_points, negative_points):
+        """First-ranked usable floor outline, repaired for furniture holes, or None."""
+        return self._infer(snapshot, positive_points, negative_points, None, _best_floor)
+
+    def _infer(self, snapshot, positive_points, negative_points, box, convert):
         positive, negative, rectangle = validate_prompts(positive_points, negative_points, box)
         if not self._native_lock.acquire(blocking=False):
             raise SceneSegmentationError('SCENE_BUSY', 'Scene native worker is occupied')
@@ -358,7 +409,7 @@ class SceneSegmenter:
             feeds['image_embeddings'] = embedding
             masks, scores = self._decoder.run(['masks', 'iou_predictions'], feeds)
             self._check(snapshot, epoch)
-            result = _rank_polygons(masks, scores, snapshot.height, snapshot.width)
+            result = convert(masks, scores)
             self._check(snapshot, epoch)
             return result
         except Exception:

@@ -158,7 +158,7 @@ class _AppearanceWork:
     crop: np.ndarray
 
 
-def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=None):
+def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=None, scene_detector=None):
     """Actual resident sessions only; optional CPU scene work is separate."""
     result = {key: list(model.session.get_providers()) if model is not None else []
               for key, model in (("person_detection", detector), ("reid", reid))}
@@ -169,6 +169,7 @@ def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=
     providers = scene.providers() if scene is not None else {}
     for kind in ("encoder", "decoder"):
         result[f"scene_{kind}"] = list(providers.get(kind, ()))
+    result["scene_detector"] = list(scene_detector.session.get_providers()) if scene_detector is not None else []
     return result
 
 

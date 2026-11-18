@@ -16,7 +16,7 @@ REQUIRED_PROVIDER_KEYS = (
     "person_detection", "live_face_detection", "live_face_recognition",
     "enroll_face_detection", "enroll_face_recognition",
 )
-PROVIDER_KEYS = REQUIRED_PROVIDER_KEYS + ("reid", "scene_encoder", "scene_decoder")
+PROVIDER_KEYS = REQUIRED_PROVIDER_KEYS + ("reid", "scene_encoder", "scene_decoder", "scene_detector")
 
 
 @dataclass(frozen=True, slots=True)

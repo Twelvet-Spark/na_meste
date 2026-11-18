@@ -20,8 +20,9 @@ from fastapi.templating import Jinja2Templates
 
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.model_bundle import ModelBundle
-from app.ai.providers import provider_label
+from app.ai.providers import provider_label, resolve_providers
 from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
+from app.ai.scene_detector import SceneObjectDetector
 from app.ai.scene_segmenter import SceneSegmenter
 from app.api.attendance import router as attendance_router
 from app.api.cameras import router as cameras_router
@@ -108,8 +109,16 @@ async def lifespan(app: FastAPI):
             logger.error("Scene assistance unavailable: %s", app.state.scene_error)
     else:
         app.state.scene_error = "SCENE_MODEL_UNAVAILABLE"
+    app.state.scene_detector = None
+    app.state.scene_detector_error = None
+    if bundle is not None and bundle.component_status.get("scene_detector") == "READY":
+        try:
+            app.state.scene_detector = SceneObjectDetector(bundle, resolve_providers(settings.ai_device))
+        except Exception as exc:
+            app.state.scene_detector_error = getattr(exc, "code", "SCENE_DETECTOR_UNAVAILABLE")
+            logger.error("Scene detector unavailable: %s", app.state.scene_detector_error)
     app.state.scene_assistance = SceneAssistanceService(
-        app.state.scene_service, app.state.scene_segmenter)
+        app.state.scene_service, app.state.scene_segmenter, app.state.scene_detector)
     app.state.recordings = None
     app.state.recording_error = None
     try:
@@ -175,7 +184,8 @@ async def lifespan(app: FastAPI):
             engine, face_model_id=bundle.face_model_id,
             face_engine=app.state.face_engine, enrollment_semaphore=app.state.enrollment_lock)
     app.state.attendance.health.set_providers(loaded_providers(
-        enroll=app.state.face_engine, scene=app.state.scene_segmenter))
+        enroll=app.state.face_engine, scene=app.state.scene_segmenter,
+        scene_detector=app.state.scene_detector))
 
     if settings.ai_enabled:
         try:
@@ -199,7 +209,7 @@ async def lifespan(app: FastAPI):
         detector=worker.service.detector if worker is not None else None,
         live=worker.service.faces if worker is not None else None,
         enroll=app.state.face_engine, reid=worker.reid if worker is not None else None,
-        scene=app.state.scene_segmenter))
+        scene=app.state.scene_segmenter, scene_detector=app.state.scene_detector))
 
     with SessionLocal() as session:
         saved_sources = [

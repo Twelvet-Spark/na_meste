@@ -105,6 +105,13 @@ def freeze(client, camera=1, **kwargs):
     return client.json('POST', f'/api/cameras/{camera}/scene/snapshot', **kwargs)
 
 
+def saved_scene(client, camera=1):
+    """The persisted scene document; availability flags describe the running app, not the scene."""
+    document = client.json('GET', f'/api/cameras/{camera}/scene')
+    assert (document.pop('assistance_available'), document.pop('analysis_available')) == (False, False)
+    return document
+
+
 def payload(snapshot, *, revision=0, source=1, value=None):
     return dict(snapshot_id=snapshot['snapshot_id'], expected_revision=revision,
                 expected_source_revision=source, geometry=geometry() if value is None else value)
@@ -143,7 +150,7 @@ def test_real_routes_freeze_native_save_reload_and_preserve_commission():
         assert saved['reference_width'] == 640 and saved['reference_height'] == 360
         assert saved['geometry'] == value and saved['source_revision'] == saved['current_source_revision'] == 1
         assert saved['metric_transform']['rectified_width'] == 1280
-        assert client.json('GET', '/api/cameras/1/scene') == saved
+        assert saved_scene(client) == saved
         with Session(engine) as db:
             assert db.get(AttendanceRuntime, 1).commission_id == original_commission
             assert db.get(AttendanceCamera, 1).revision == 0
@@ -281,7 +288,7 @@ def test_rejected_geometry_and_scene_source_cas_preserve_saved_metadata():
         horizon['metric']['corners'] = [[.4, .2], [.6, .2], [.9, .5], [.1, .5]]
         horizon['floor'] = [[.5, .05], [.8, .2], [1, .6], [0, .6], [.2, .2]]
         put(client, payload(snap, revision=1, value=horizon), status=422)
-        assert client.json('GET', '/api/cameras/1/scene') == original
+        assert saved_scene(client) == original
         with Session(engine) as db:
             row = db.get(CameraScene, 1)
             assert row.revision == 1 and row.geometry == original['geometry']
@@ -385,7 +392,7 @@ def test_failed_encoding_and_database_write_release_slots_without_metadata_chang
             put(client, payload(snap, revision=1), status=503)
         finally:
             event.remove(engine, 'before_cursor_execute', fail_write)
-        assert client.json('GET', '/api/cameras/1/scene') == original
+        assert saved_scene(client) == original
         freeze(client, camera=2)
 
 

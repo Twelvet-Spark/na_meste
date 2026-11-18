@@ -36,7 +36,7 @@ SAFE_CODES = frozenset({
     "JOURNAL_WRITE_FAILED", "JOURNAL_CAPACITY_EXCEEDED", "JOURNAL_GAP", "JOURNAL_UNFLUSHED",
     "SCENE_BUSY", "SCENE_INFERENCE_FAILED", "SCENE_NATIVE_WORK_UNRESOLVED",
     "DECODE_HARDWARE_INIT_FAILED",
-    "SCENE_MODEL_UNAVAILABLE", "ENROLLMENT_BUSY", "LEGACY_MODEL_SETTINGS_IGNORED",
+    "SCENE_MODEL_UNAVAILABLE", "SCENE_DETECTOR_UNAVAILABLE", "ENROLLMENT_BUSY", "LEGACY_MODEL_SETTINGS_IGNORED",
 })
 PROVIDERS = frozenset({"CPUExecutionProvider", "CUDAExecutionProvider", "TensorrtExecutionProvider",
                       "DmlExecutionProvider", "OpenVINOExecutionProvider", "CoreMLExecutionProvider"})
@@ -328,9 +328,13 @@ class DiagnosticsService:
         model = getattr(self.state, "scene_segmenter", None)
         service = getattr(self.state, "scene_assistance", None)
         raw = service.health_snapshot() if service is not None else {}
-        return dict(model_available=model is not None,
+        detector = getattr(self.state, "scene_detector", None)
+        detector_error = getattr(self.state, "scene_detector_error", None)
+        return dict(model_available=model is not None, detector_available=detector is not None,
                     error_code=safe_code(getattr(self.state, "scene_error", None), "SCENE_MODEL_UNAVAILABLE")
                                if getattr(self.state, "scene_error", None) else None,
+                    detector_error_code=safe_code(detector_error, "SCENE_DETECTOR_UNAVAILABLE")
+                                        if detector_error else None,
                     last_inference_seconds=number(getattr(model, "last_inference_seconds", None)),
                     running=number(raw.get("running"), integer=True), queued=number(raw.get("queued"), integer=True),
                     records=number(raw.get("records"), integer=True), accepting=raw.get("accepting") is True,

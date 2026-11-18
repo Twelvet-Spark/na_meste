@@ -19,7 +19,10 @@ def _service(request: Request) -> SceneService:
 
 @router.get('/{camera_id}/scene')
 def get_scene(camera_id: int, request: Request):
-    return _service(request).get(camera_id)
+    assistance = getattr(request.app.state, 'scene_assistance', None)
+    segmenter = assistance is not None and assistance.segmenter is not None
+    return dict(_service(request).get(camera_id), assistance_available=segmenter,
+                analysis_available=segmenter and assistance.detector is not None)
 
 
 @router.put('/{camera_id}/scene', dependencies=[Depends(require_operator_request)])
@@ -58,3 +61,20 @@ def get_scene_suggestion(camera_id: int, job_id: str, request: Request):
                dependencies=[Depends(require_operator_request)])
 def cancel_scene_suggestion(camera_id: int, job_id: str, request: Request):
     return _assistance(request).cancel(camera_id, job_id)
+
+
+@router.post('/{camera_id}/scene/analysis', status_code=202,
+             dependencies=[Depends(require_operator_request)])
+def analyze_scene(camera_id: int, request: Request, payload: Any = Body(...)):
+    return _assistance(request).submit_analysis(camera_id, payload)
+
+
+@router.get('/{camera_id}/scene/analysis/{job_id}')
+def get_scene_analysis(camera_id: int, job_id: str, request: Request):
+    return _assistance(request).get(camera_id, job_id, ('analysis',))
+
+
+@router.delete('/{camera_id}/scene/analysis/{job_id}',
+               dependencies=[Depends(require_operator_request)])
+def cancel_scene_analysis(camera_id: int, job_id: str, request: Request):
+    return _assistance(request).cancel(camera_id, job_id, ('analysis',))

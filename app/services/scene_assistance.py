@@ -5,6 +5,7 @@ Camera invalidation callbacks may therefore safely arrive during native work.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import threading
@@ -15,12 +16,14 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from app.ai.scene_analyzer import analyze
 from app.ai.scene_segmenter import SceneSegmentationError, validate_prompts
 
 logger = logging.getLogger('app.scene.assistance')
 JOB_TTL = 300
 MAX_RECORDS = 16
 TERMINAL = frozenset(('SUCCEEDED', 'FAILED', 'CANCELLED'))
+SUGGESTION_KINDS = ('floor', 'object')
 
 
 def _error(status, code, message):
@@ -49,6 +52,8 @@ class _Job:
     box: list | None
     state: str = 'QUEUED'
     polygons: list = field(default_factory=list)
+    draft: dict | None = None
+    warnings: list = field(default_factory=list)
     error_code: str | None = None
 
 
@@ -61,9 +66,10 @@ class SceneAssistanceCloseResult:
 
 
 class SceneAssistanceService:
-    def __init__(self, scene_service, segmenter=None, *, monotonic=time.monotonic):
+    def __init__(self, scene_service, segmenter=None, detector=None, *, monotonic=time.monotonic):
         self.scene_service = scene_service
         self.segmenter = segmenter
+        self.detector = detector
         self._monotonic = monotonic
         self._condition = threading.Condition()
         self._jobs = OrderedDict()
@@ -80,9 +86,13 @@ class SceneAssistanceService:
     @staticmethod
     def _view(job):
         # Never expose the mutable record (or a saved native image) to a caller.
-        return dict(job_id=job.job_id, snapshot_id=job.snapshot_id, state=job.state,
-                    polygons=[dict(points=[list(point) for point in polygon['points']],
-                                   score=polygon['score'], needs_review=True) for polygon in job.polygons],
+        view = dict(job_id=job.job_id, snapshot_id=job.snapshot_id, state=job.state, kind=job.kind)
+        if job.kind == 'analysis':
+            return dict(view, draft=copy.deepcopy(job.draft), warnings=list(job.warnings),
+                        error_code=job.error_code)
+        return dict(view, polygons=[dict(points=[list(point) for point in polygon['points']],
+                                         score=polygon['score'], needs_review=True)
+                                    for polygon in job.polygons],
                     error_code=job.error_code)
 
     def _purge_locked(self):
@@ -91,7 +101,7 @@ class SceneAssistanceService:
         for key in expired:
             job = self._jobs[key]
             job.state = 'CANCELLED'
-            job.polygons = []
+            job.polygons, job.draft = [], None
             if self._queued == key:
                 self._queued = None
             if key != self._running:
@@ -122,19 +132,8 @@ class SceneAssistanceService:
                 raise _error(503, 'SCENE_BUSY', 'Scene job history is full')
             del self._jobs[oldest]
 
-    def submit(self, camera_id, payload):
-        if self.segmenter is None:
-            raise _error(503, 'SCENE_MODEL_UNAVAILABLE', 'Selected MobileSAM model is unavailable; manual editing remains available')
-        if not isinstance(payload, dict) or set(payload) != {
-                'snapshot_id', 'kind', 'positive_points', 'negative_points', 'box'}:
-            raise _error(422, 'SCENE_INPUT_INVALID', 'Invalid suggestion request fields')
-        if payload['kind'] not in ('floor', 'object'):
-            raise _error(422, 'SCENE_INPUT_INVALID', 'Choose floor or object explicitly')
-        identifier = _identifier(payload['snapshot_id'])
-        try:
-            positive, negative, box = validate_prompts(payload['positive_points'], payload['negative_points'], payload['box'])
-        except ValueError as exc:
-            raise _error(422, 'SCENE_INPUT_INVALID', str(exc)) from exc
+    def _admit(self, camera_id, snapshot_id, kind, positive=(), negative=(), box=None):
+        identifier = _identifier(snapshot_id)
         with self._condition:
             self._purge_locked()
             self._capacity_locked()
@@ -149,16 +148,41 @@ class SceneAssistanceService:
             self._capacity_locked(evict=True)
             job_id = str(uuid4())
             job = _Job(job_id, camera_id, identifier, epoch, self._monotonic() + JOB_TTL,
-                       payload['kind'], positive, negative, box)
+                       kind, list(positive), list(negative), box)
             self._jobs[job_id] = job
             self._queued = job_id
             self._condition.notify()
             return dict(job_id=job_id, snapshot_id=identifier, state='QUEUED')
 
-    def _validated_job(self, camera_id, job_id):
+    def submit(self, camera_id, payload):
+        if self.segmenter is None:
+            raise _error(503, 'SCENE_MODEL_UNAVAILABLE', 'Selected MobileSAM model is unavailable; manual editing remains available')
+        if not isinstance(payload, dict) or set(payload) != {
+                'snapshot_id', 'kind', 'positive_points', 'negative_points', 'box'}:
+            raise _error(422, 'SCENE_INPUT_INVALID', 'Invalid suggestion request fields')
+        if payload['kind'] not in SUGGESTION_KINDS:
+            raise _error(422, 'SCENE_INPUT_INVALID', 'Choose floor or object explicitly')
+        _identifier(payload['snapshot_id'])
+        try:
+            positive, negative, box = validate_prompts(payload['positive_points'], payload['negative_points'], payload['box'])
+        except ValueError as exc:
+            raise _error(422, 'SCENE_INPUT_INVALID', str(exc)) from exc
+        return self._admit(camera_id, payload['snapshot_id'], payload['kind'], positive, negative, box)
+
+    def submit_analysis(self, camera_id, payload):
+        if self.segmenter is None or self.detector is None:
+            raise _error(503, 'SCENE_DETECTOR_UNAVAILABLE',
+                         'Scene detector is unavailable; manual editing remains available')
+        if not isinstance(payload, dict) or set(payload) != {'snapshot_id'}:
+            raise _error(422, 'SCENE_INPUT_INVALID', 'Analysis accepts only snapshot_id')
+        return dict(self._admit(camera_id, payload['snapshot_id'], 'analysis'), kind='analysis')
+
+    def _validated_job(self, camera_id, job_id, expected_kinds):
         identifier = _identifier(job_id)
         with self._condition:
             job = self._lookup_locked(camera_id, identifier)
+            if job.kind not in expected_kinds:
+                raise _error(409, 'SCENE_JOB_KIND_MISMATCH', 'Job belongs to another assistance endpoint')
             token, epoch = job.snapshot_id, job.epoch
         # Source, reader identity, TTL and camera are checked even on terminal
         # results and DELETE replay; old outlines never survive a source change.
@@ -178,22 +202,22 @@ class SceneAssistanceService:
                 raise _error(409, 'CAMERA_SOURCE_CHANGED', 'Camera changed during job validation')
         return job
 
-    def get(self, camera_id, job_id):
-        job = self._validated_job(camera_id, job_id)
+    def get(self, camera_id, job_id, expected_kinds=SUGGESTION_KINDS):
+        job = self._validated_job(camera_id, job_id, expected_kinds)
         with self._condition:
             if self._epochs.get(camera_id, 0) != job.epoch:
                 raise _error(409, 'CAMERA_SOURCE_CHANGED', 'Camera changed before result publication')
             return self._view(self._lookup_locked(camera_id, job.job_id))
 
-    def cancel(self, camera_id, job_id):
-        job = self._validated_job(camera_id, job_id)
+    def cancel(self, camera_id, job_id, expected_kinds=SUGGESTION_KINDS):
+        job = self._validated_job(camera_id, job_id, expected_kinds)
         with self._condition:
             job = self._lookup_locked(camera_id, job.job_id)
             if self._epochs.get(camera_id, 0) != job.epoch:
                 raise _error(409, 'CAMERA_SOURCE_CHANGED', 'Camera changed before cancellation')
             if job.state not in TERMINAL:
                 job.state = 'CANCELLED'
-                job.polygons = []
+                job.polygons, job.draft = [], None
                 if self._queued == job.job_id:
                     self._queued = None
                 self._condition.notify_all()
@@ -204,7 +228,7 @@ class SceneAssistanceService:
             self._epochs[camera_id] = self._epochs.get(camera_id, 0) + 1
             for job in self._jobs.values():
                 if job.camera_id == camera_id:
-                    job.polygons = []
+                    job.polygons, job.draft = [], None
                     if job.state not in TERMINAL:
                         job.state = 'CANCELLED'
                         if self._queued == job.job_id:
@@ -226,6 +250,15 @@ class SceneAssistanceService:
                 if not self._admissible_locked(job):
                     return
             self.scene_service.get_snapshot(job.snapshot_id, job.camera_id)
+            if job.kind == 'analysis':
+                draft = analyze(snapshot, self.detector, self.segmenter)
+                self.scene_service.get_snapshot(job.snapshot_id, job.camera_id)
+                with self._condition:
+                    if self._admissible_locked(job):
+                        job.warnings = draft.pop('warnings')
+                        job.draft = draft
+                        job.state = 'SUCCEEDED'
+                return
             polygons = self.segmenter.suggest(snapshot, job.positive, job.negative, job.box)
             self.scene_service.get_snapshot(job.snapshot_id, job.camera_id)
             serialized = [dict(points=[list(point) for point in item.points],
@@ -269,7 +302,7 @@ class SceneAssistanceService:
                     if self._admissible_locked(job):
                         job.state = 'FAILED'
                         job.error_code = code
-                        job.polygons = []
+                        job.polygons, job.draft = [], None
             finally:
                 # Drop the local job reference before waiting; records contain
                 # only bounded prompts/results, never FrozenSceneSnapshot frames.

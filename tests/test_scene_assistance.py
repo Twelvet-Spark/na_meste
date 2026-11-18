@@ -52,6 +52,10 @@ class ControlledSegmenter:
             raise RuntimeError('native model failed')
         return [PolygonSuggestion([[.1, .1], [.8, .1], [.5, .8]], .9)]
 
+    def floor(self, snapshot, positive, negative):
+        self.calls += 1
+        return PolygonSuggestion([[0., .6], [1., .6], [1., 1.], [0., 1.]], .9)
+
     def invalidate(self, camera):
         pass
 
@@ -210,7 +214,7 @@ class AssistanceTests(unittest.TestCase):
             client.json('POST', url, body(snap), headers={'origin': 'http://evil.invalid'}, status=403)
             first = submit(client, snap)
             done = terminal(client, first)
-            self.assertEqual(set(done), {'job_id', 'snapshot_id', 'state', 'polygons', 'error_code'})
+            self.assertEqual(set(done), {'job_id', 'snapshot_id', 'state', 'kind', 'polygons', 'error_code'})
             self.assertEqual(done['state'], 'SUCCEEDED')
             self.assertIsNone(done['error_code'])
             self.assertTrue(done['polygons'][0]['needs_review'])
@@ -363,6 +367,108 @@ class AssistanceTests(unittest.TestCase):
             self.assertEqual(len(outcomes), 1)
             self.assertIsInstance(outcomes[0], dict, outcomes)
             self.assertEqual(terminal(client, outcomes[0])['state'], 'SUCCEEDED')
+
+
+class FakeDetector:
+    """Only the native detector is doubled; queue, snapshot leases and HTTP stay real."""
+    def __init__(self, detections=None):
+        from app.ai.scene_detector import SceneDetection
+        self.detections = [SceneDetection(0, 'DOOR', 'Дверь', [.4, .2, .6, .8], .9),
+                           SceneDetection(5, 'OBJECT', 'Стол', [.1, .65, .35, .9], .8)] if detections is None else detections
+        self.frames = []
+
+    def detect(self, frame):
+        self.frames.append(frame.shape)
+        return list(self.detections)
+
+
+@contextmanager
+def analysis_service(*, blocked=False, detector=True):
+    with assistance(blocked=blocked) as (client, engine, scene, readers, clock, service, native):
+        service.detector = FakeDetector() if detector else None
+        yield client, service, native, readers
+
+
+def analyze_body(snapshot, **extra):
+    return dict(snapshot_id=snapshot['snapshot_id'], **extra)
+
+
+def analysis_endpoint(job, camera=1):
+    return f'/api/cameras/{camera}/scene/analysis/{job["job_id"]}'
+
+
+def analysis_terminal(client, job):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = client.json('GET', analysis_endpoint(job))
+        if result['state'] in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+            return result
+        time.sleep(.005)
+    raise AssertionError('analysis never reached terminal state')
+
+
+class AnalysisTests(unittest.TestCase):
+    def test_analysis_job_returns_a_reviewable_draft_and_saves_nothing(self):
+        with analysis_service() as (client, service, _native, _readers):
+            snap = freeze(client)
+            url = '/api/cameras/1/scene/analysis'
+            client.json('POST', url, analyze_body(snap), operator=False, status=403)
+            job = client.json('POST', url, analyze_body(snap), status=202)
+            self.assertEqual(set(job), {'job_id', 'snapshot_id', 'state', 'kind'})
+            self.assertEqual((job['state'], job['kind']), ('QUEUED', 'analysis'))
+            done = analysis_terminal(client, job)
+            self.assertEqual(set(done), {'job_id', 'snapshot_id', 'state', 'kind', 'draft', 'warnings', 'error_code'})
+            self.assertEqual((done['state'], done['kind'], done['error_code']), ('SUCCEEDED', 'analysis', None))
+            draft = done['draft']
+            self.assertEqual(draft['floor'], [[0., .6], [1., .6], [1., 1.], [0., 1.]])
+            self.assertEqual([(d['kind'], d['quad']) for d in draft['doors']],
+                             [('DOOR', [[.4, .8], [.6, .8], [.6, .2], [.4, .2]])])
+            self.assertEqual([(o['label'], o['outline']) for o in draft['objects']], [('Стол', 'MASK')])
+            self.assertEqual(done['warnings'], [])
+            self.assertEqual(service.detector.frames, [(360, 640, 3)], 'The detector sees the frozen native frame')
+            self.assertEqual(client.json('GET', '/api/cameras/1/scene')['status'], 'UNSET')
+
+    def test_kind_mismatch_unavailable_detector_and_strict_body(self):
+        with analysis_service() as (client, _service, _native, _readers):
+            snap = freeze(client)
+            suggestion = submit(client, snap)
+            terminal(client, suggestion)
+            mismatch = client.json('GET', f'/api/cameras/1/scene/analysis/{suggestion["job_id"]}', status=409)
+            self.assertEqual(mismatch['detail']['code'], 'SCENE_JOB_KIND_MISMATCH')
+            analysis = client.json('POST', '/api/cameras/1/scene/analysis', analyze_body(snap), status=202)
+            analysis_terminal(client, analysis)
+            wrong = client.json('GET', endpoint(analysis), status=409)
+            self.assertEqual(wrong['detail']['code'], 'SCENE_JOB_KIND_MISMATCH')
+            client.json('DELETE', endpoint(analysis), status=409)
+            for value in (dict(analyze_body(snap), kind='floor'), {}, dict(snapshot_id='not-a-uuid')):
+                client.json('POST', '/api/cameras/1/scene/analysis', value, status=422)
+            self.assertEqual(client.json('GET', endpoint(suggestion))['kind'], 'floor')
+        with analysis_service(detector=False) as (client, _service, _native, _readers):
+            unavailable = client.json('POST', '/api/cameras/1/scene/analysis', analyze_body(freeze(client)), status=503)
+            self.assertEqual(unavailable['detail']['code'], 'SCENE_DETECTOR_UNAVAILABLE')
+
+    def test_analysis_shares_the_single_native_slot_and_can_be_cancelled(self):
+        with analysis_service(blocked=True) as (client, _service, native, _readers):
+            snap = freeze(client)
+            first = submit(client, snap)
+            self.assertTrue(native.entered.wait(2))
+            queued = client.json('POST', '/api/cameras/1/scene/analysis', analyze_body(snap), status=202)
+            busy = client.json('POST', '/api/cameras/1/scene/analysis', analyze_body(snap), status=503)
+            self.assertEqual(busy['detail']['code'], 'SCENE_BUSY')
+            self.assertEqual(client.json('DELETE', analysis_endpoint(queued))['state'], 'CANCELLED')
+            native.release.set()
+            self.assertEqual(terminal(client, first)['state'], 'SUCCEEDED')
+
+    def test_scene_document_reports_which_assistance_is_available(self):
+        with analysis_service() as (client, _service, _native, _readers):
+            scene = client.json('GET', '/api/cameras/1/scene')
+            self.assertEqual((scene['assistance_available'], scene['analysis_available']), (True, True))
+        with analysis_service(detector=False) as (client, _service, _native, _readers):
+            scene = client.json('GET', '/api/cameras/1/scene')
+            self.assertEqual((scene['assistance_available'], scene['analysis_available']), (True, False))
+        with assistance(available=False) as (client, *_rest):
+            scene = client.json('GET', '/api/cameras/1/scene')
+            self.assertEqual((scene['assistance_available'], scene['analysis_available']), (False, False))
 
 
 def real_model_proof(manifest, image, positive, negative, box, timeout_seconds, *, kind='floor', diagnostics=False):
