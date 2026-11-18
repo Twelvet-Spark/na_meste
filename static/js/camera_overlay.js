@@ -20,7 +20,7 @@
   function isFresh(data, now = Date.now()) {
     return Number.isFinite(data?.updated_at) && now / 1000 - data.updated_at >= -1 && now / 1000 - data.updated_at <= 2;
   }
-  function render(container, tracks, { image = null, links = false, metrics = false } = {}) {
+  function render(container, tracks, { image = null, links = false, metrics = false, compact = false } = {}) {
     container.replaceChildren();
     if (image) {
       const rect = fitRect(image.clientWidth, image.clientHeight, image.naturalWidth, image.naturalHeight, getComputedStyle(image).objectFit);
@@ -36,7 +36,20 @@
       Object.assign(box.style, { left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` });
       const acknowledged = links && typeof track.visit_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(track.visit_id);
       const text = document.createElement(acknowledged ? 'a' : 'span');
-      text.className = 'bbox-label'; text.textContent = label(track);
+      text.className = 'bbox-label';
+      if (compact) {
+        text.title = label(track);
+        const lines = [track.employee_id != null ? (track.employee_name || `#${track.employee_id}`) : 'Неизвестный'];
+        if (score(track.person_score)) lines.push(`чел. ${Math.round(track.person_score * 100)}%`);
+        if (track.employee_id != null) {
+          if (track.identity_source === 'REID') lines.push('по внешности');
+          else if (score(track.face_similarity)) lines.push(`лицо ${track.face_similarity.toFixed(2)}`);
+        }
+        for (const line of lines) {
+          const row = document.createElement('span'); row.textContent = line; text.append(row);
+        }
+        text.style.maxWidth = `${Math.min(100, Math.max(0, (1 - x1) * container.clientWidth))}px`;
+      } else text.textContent = label(track);
       if (acknowledged) {
         text.href = `/global/visits/${encodeURIComponent(track.visit_id)}`;
         text.style.pointerEvents = 'auto';

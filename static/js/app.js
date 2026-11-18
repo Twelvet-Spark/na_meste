@@ -229,7 +229,7 @@
       card.imageUrl = nextUrl; nextUrl = null;
       if (window.CameraOverlay.isFresh(detections)
           && detections.source_revision === card.camera.attendance.source_revision) {
-        window.CameraOverlay.render(card.boxes, detections.tracks, { image: card.image });
+        window.CameraOverlay.render(card.boxes, detections.tracks, { image: card.image, compact: true });
       } else card.boxes.replaceChildren();
     } catch (error) {
       card.boxes.replaceChildren();

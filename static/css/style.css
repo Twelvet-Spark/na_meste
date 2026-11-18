@@ -853,7 +853,8 @@ main > .panel + .panel { margin-top: 20px; }
 .camera-workspace .cam-card-actions { flex-wrap: wrap; margin-top: auto; }
 .camera-preview { position: relative; display: grid; place-items: center; aspect-ratio: 16 / 9; background: var(--md-surface-container); border-radius: 8px; overflow: hidden; font-size: 13px; text-decoration: none; }
 .camera-preview img { width: 100%; height: 100%; object-fit: contain; }
-.camera-preview .bbox-label { top: 0; max-width: 18rem; white-space: normal; font-size: 11px; padding: 2px 5px; border-radius: 4px; }
+.camera-preview .bbox-label { top: 0; width: max-content; white-space: nowrap; font-size: 10px; line-height: 1.3; padding: 2px 4px; border-radius: 4px; }
+.camera-preview .bbox-label > span { display: block; overflow: hidden; text-overflow: ellipsis; }
 .camera-zone { margin-block: 24px 32px; }
 .camera-zone h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 20px; font-weight: 500; }
 .cam-card-selection { display: flex; align-items: center; gap: 8px; align-self: start; min-height: 32px; color: var(--md-on-surface-variant); font-size: 13px; cursor: pointer; }
@@ -994,4 +995,23 @@ main > .panel + .panel { margin-top: 20px; }
   .settings-workspace .form-actions, .diagnostics-workspace .form-actions { align-items: stretch; flex-direction: column; }
   .settings-workspace .form-actions .btn, .diagnostics-workspace .form-actions .btn { width: 100%; }
   .settings-workspace dialog { padding: 20px 16px; }
+}
+
+/* Frozen native-resolution samples use the existing employee enrollment flow. */
+.camera-sample { grid-column: 1 / -1; min-width: 0; }
+.camera-sample [hidden] { display: none !important; }
+.camera-sample p { max-width: 85ch; }
+.camera-sample .btn { white-space: normal; max-width: 100%; }
+.camera-sample .setup-check { white-space: normal; line-height: 1.5; }
+.sample-stage { position: relative; max-width: 100%; touch-action: none; cursor: crosshair; }
+.sample-stage img { display: block; width: 100%; height: auto; user-select: none; }
+.sample-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.sample-stage rect { fill: none; stroke: var(--md-primary); stroke-width: .003; }
+.sample-bounds { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+.sample-bounds input, .camera-sample select { min-width: 0; width: 100%; }
+.sample-result { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin-block: 16px; }
+.sample-result canvas { max-width: 256px; max-height: 256px; width: auto; height: auto; border: 1px solid var(--md-outline-variant); }
+@media (max-width: 650px) {
+  .sample-bounds { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .camera-sample .form-actions { flex-wrap: wrap; }
 }

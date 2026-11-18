@@ -79,6 +79,44 @@
       </form>
       <p id="camera-controls-message" class="form-status" role="status" aria-live="polite"></p>
     </section>
+    <section id="camera-sample" class="panel calibration-panel camera-sample" aria-labelledby="sample-heading">
+      <h2 id="sample-heading">Фото сотрудника из кадра</h2>
+      <p class="muted">Добавьте чёткое фото лица для будущих распознаваний. Это не назначает человека текущему треку и не изменяет уже учтённые часы.</p>
+      <form id="sample-form">
+        <div class="form-actions">
+          <button id="sample-freeze" class="btn" type="button">Зафиксировать кадр</button>
+          <button id="sample-cancel" class="btn" type="button" disabled>Убрать кадр</button>
+        </div>
+        <div id="sample-frame" hidden>
+          <p id="sample-frame-info" class="muted"></p>
+          <p id="sample-crop-help">Выделите одно лицо перетаскиванием на снимке или задайте границы от 0 до 1 ниже. Лицо в исходном кадре должно быть не меньше 80 пикселей.</p>
+          <div id="sample-stage" class="sample-stage" aria-describedby="sample-crop-help">
+            <img id="sample-image" alt="Зафиксированный кадр для выбора лица" draggable="false">
+            <svg viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
+              <rect id="sample-selection" x="0" y="0" width="0" height="0"></rect>
+            </svg>
+          </div>
+          <div class="sample-bounds">
+            <label class="field">Левая граница<input id="sample-x1" type="number" min="0" max="1" step="any" inputmode="decimal"></label>
+            <label class="field">Верхняя граница<input id="sample-y1" type="number" min="0" max="1" step="any" inputmode="decimal"></label>
+            <label class="field">Правая граница<input id="sample-x2" type="number" min="0" max="1" step="any" inputmode="decimal"></label>
+            <label class="field">Нижняя граница<input id="sample-y2" type="number" min="0" max="1" step="any" inputmode="decimal"></label>
+          </div>
+          <div class="sample-result">
+            <canvas id="sample-preview" aria-label="Выбранный фрагмент"></canvas>
+            <p id="sample-crop-info" class="muted"></p>
+          </div>
+        </div>
+        <label class="field">Сотрудник<select id="sample-employee"><option value="">Выберите сотрудника</option></select></label>
+        <p id="sample-employee-info" class="muted"></p>
+        <label class="setup-check"><input id="sample-confirm" type="checkbox"> Подтверждаю: на выбранном фрагменте лицо этого сотрудника.</label>
+        <div class="form-actions">
+          <button id="sample-reload-employee" class="btn" type="button" hidden>Обновить данные сотрудника</button>
+          <button id="sample-save" class="btn primary" type="submit" disabled>Добавить фото</button>
+        </div>
+      </form>
+      <p id="sample-status" class="message" role="status" aria-live="polite"></p>
+    </section>
     </div>
 
     <div id="recording" class="camera-tab-panel" role="tabpanel" aria-labelledby="camera-tab-recording" hidden>
@@ -265,6 +303,7 @@
   <script src="/static/js/camera_setup.js"></script>
   <script src="/static/js/camera_overlay.js"></script>
   <script src="/static/js/camera.js"></script>
+  <script src="/static/js/camera_sample.js"></script>
   <script src="/static/js/door3d.js"></script>
   <script src="/static/js/scene_editor.js"></script>
   <script src="/static/js/camera_recording.js"></script>

@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const context = { window: {}, document: { getElementById: () => null }, console };
+vm.runInNewContext(fs.readFileSync(new URL('../../static/js/camera_sample.js', import.meta.url), 'utf8'), context);
+const crop = context.window.CameraCrop;
+const plain = (value) => value == null ? value : JSON.parse(JSON.stringify(value));
+assert.deepEqual(plain(crop.normalizeRect(.8, .9, .2, .1)), [.2, .1, .8, .9]);
+assert.deepEqual(plain(crop.normalizeRect(-1, -.5, 2, 3)), [0, 0, 1, 1]);
+assert.equal(crop.normalizeRect(.5, .1, .5, .9), null);
+assert.equal(crop.normalizeRect(NaN, 0, 1, 1), null);
+assert.deepEqual(plain(crop.nativeCrop([.25, .25, .75, .75], 1920, 1080)), { x: 480, y: 270, width: 960, height: 540 });
+assert.deepEqual(plain(crop.nativeCrop([.1, .2, .2001, .3001], 100, 100)), { x: 10, y: 20, width: 11, height: 11 });
+assert.equal(crop.nativeCrop([0, 0, 1, 1], 0, 0), null);
+const point = crop.pointInImage(260, 160, { left: 20, top: 25, width: 480, height: 270 });
+assert.deepEqual(plain(point), [.5, .5]);
+assert.deepEqual(plain(crop.pointInImage(-10, 500, { left: 20, top: 25, width: 480, height: 270 })), [0, 1]);
+console.log('Camera sample reversed/clamped/native-resolution crop checks passed.');
