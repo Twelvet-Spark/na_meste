@@ -25,13 +25,14 @@ EDITABLE = (
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",
-    "attendance_face_det_score", "attendance_face_blur_min", "attendance_evidence_keep_days",
+    "attendance_face_det_score", "attendance_face_blur_min",
+    "attendance_live_gap_minutes", "attendance_day_gap_minutes",
     "telegram_enabled", "telegram_bot_token", "telegram_chat_id", "telegram_notify_presence",
     "telegram_notify_global_transition", "telegram_notify_global_new",
     "recording_retention_days", "recording_max_bytes", "mc_debug",
 )
 # Keys that older documents may still carry; dropped on read, so the next save rewrites without them.
-RETIRED_KEYS = frozenset({"ai_cameras"})
+RETIRED_KEYS = frozenset({"ai_cameras", "attendance_evidence_keep_days"})
 SECRET = "telegram_bot_token"
 # One writer across service instances in this single-worker deployment. Read/CAS/
 # validate/replace all hold this lock; no separate read-then-write race.

@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.database.database import immediate_session
 from app.database.models import (
-    AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, CameraArchive, CameraProfile,
-    GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSession,
+    AttendanceCamera, Camera, CameraArchive, CameraProfile,
+    DoorCrossing, GlobalEvent, GlobalObservation, GlobalPerson, OperatorRequest, PresenceSegment,
     HumanVisit, HumanJournalGap, Workplace,
 )
 from app.rtsp.source import CONNECTION_FIELDS, ArchiveSource, CameraDeletion, CameraSource
@@ -266,7 +266,8 @@ def profiles_by_camera(db: Session, ids) -> dict[int, dict]:
     return {profile.camera_id: {
         "profile": {"workplace_id": profile.workplace_id, "workplace_name": workplace_name,
                     "workplace_active": workplace_active, "zone": profile.zone,
-                    "ai_enabled": profile.ai_enabled, "ai_fps": profile.ai_fps, "revision": profile.revision},
+                    "ai_enabled": profile.ai_enabled, "ai_fps": profile.ai_fps,
+                    "time_tracking": profile.time_tracking, "revision": profile.revision},
         "attendance": {"enabled": bool(enabled), "role": role}}
         for profile, workplace_name, workplace_active, enabled, role in rows}
 
@@ -290,10 +291,11 @@ class CameraProfileUpdate(BaseModel):
     zone: Literal["INTERIOR", "ENTRANCE"] | None = None
     ai_enabled: StrictBool | None = None
     ai_fps: float | None = Field(default=None, gt=0, le=30, allow_inf_nan=False)
+    time_tracking: StrictBool | None = None
 
     @model_validator(mode="after")
     def validate_update(self):
-        for name in ("zone", "ai_enabled"):
+        for name in ("zone", "ai_enabled", "time_tracking"):
             if name in self.model_fields_set and getattr(self, name) is None:
                 raise ValueError(f"{name} не может быть null")
         return self
@@ -325,14 +327,11 @@ def update_profile(db: Session, camera_id: int, data: CameraProfileUpdate, *,
                     raise HTTPException(422, "Рабочее место не найдено")
                 if not workplace.active and workplace_id != row.workplace_id:
                     raise HTTPException(422, "Выберите активное рабочее место")
-            config = writer.get(AttendanceCamera, camera_id)
-            if config is not None and config.enabled:
-                # Only a change into an invalid state is refused, so a camera left invalid by the
-                # legacy AI_CAMERAS upgrade can still be saved and repaired.
-                if row.zone == "ENTRANCE" and changes.get("zone", row.zone) != "ENTRANCE":
-                    raise HTTPException(409, "Сначала отключите учёт на этой камере")
-                if row.ai_enabled and not changes.get("ai_enabled", row.ai_enabled):
-                    raise HTTPException(409, "Камера учёта требует AI; сначала отключите учёт")
+            # Time tracking needs AI; the two switches never contradict each other.
+            if changes.get("time_tracking") is True:
+                changes["ai_enabled"] = True
+            if changes.get("ai_enabled") is False:
+                changes["time_tracking"] = False
             changed = False
             for name, value in changes.items():
                 if getattr(row, name) != value:
@@ -376,7 +375,8 @@ def _create_camera(writer: Session, data: CameraCreate) -> CameraSource:
     config = AttendanceCamera(camera_id=camera.id)
     archive = CameraArchive(camera_id=camera.id, **data.archive.model_dump()) if data.archive else None
     writer.add(config)
-    writer.add(CameraProfile(camera_id=camera.id, zone="INTERIOR", ai_enabled=True, revision=0))
+    writer.add(CameraProfile(camera_id=camera.id, zone="INTERIOR", ai_enabled=True, time_tracking=False,
+                             revision=0))
     if archive is not None:
         writer.add(archive)
     writer.flush()
@@ -454,13 +454,9 @@ def update_camera(db: Session, camera: Camera, data: CameraUpdate) -> tuple[Came
                     setattr(current, field, value)
                     changed.add(field)
             if changed & CONNECTION_FIELDS:
-                runtime = writer.get(AttendanceRuntime, 1)
-                if runtime is None:
-                    raise HTTPException(503, "Attendance configuration unavailable")
                 config.source_revision += 1
                 config.revision += 1
                 config.enabled = False
-                runtime.commission_id = None
             if "archive" in data.model_fields_set:
                 actual_revision = archive.revision if archive is not None else None
                 if data.expected_archive_revision != actual_revision:
@@ -504,12 +500,12 @@ def delete_camera(db: Session, camera: Camera | CameraSource, *, has_pending=Non
             # Transition endpoints are still used to name historical cameras.
             payload = case((func.json_valid(GlobalEvent.payload), GlobalEvent.payload), else_="{}")
             history = (
-                writer.query(PresenceSession.id).filter_by(camera_id=camera_id).first()
+                writer.query(PresenceSegment.id).filter_by(camera_id=camera_id).first()
                 or writer.query(HumanVisit.id).filter_by(camera_id=camera_id).first()
                 or writer.query(HumanJournalGap.id).filter_by(camera_id=camera_id).first()
                 or writer.query(RecordingSession.id).filter_by(camera_id=camera_id).first()
                 or writer.query(RecordingSegment.id).filter_by(camera_id=camera_id).first()
-                or writer.query(AttendanceEvent.id).filter_by(camera_id=camera_id).first()
+                or writer.query(DoorCrossing.id).filter_by(camera_id=camera_id).first()
                 or writer.query(GlobalPerson.id).filter_by(last_camera_id=camera_id).first()
                 or writer.query(GlobalObservation.id).filter_by(camera_id=camera_id).first()
                 or writer.query(GlobalEvent.id).filter(or_(

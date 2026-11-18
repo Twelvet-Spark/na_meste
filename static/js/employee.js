@@ -146,67 +146,47 @@ $('places-retry').addEventListener('click', async () => {
   finally { setBusy(false); }
 });
 
-// Work views use the server's explicit workplace offset, never browser-local time.
-const workOffsets = { work: 0, presence: 0 };
-const historySequence = { work: 0, presence: 0 };
-function fmtTime(iso) { return iso ? iso.replace('T', ' ') : '—'; }
+// Work history is the last 30 days of the work-time report, in the workplace offset
+// the server reports; the browser's own time zone is never used.
+let historySequence = 0;
 function workDuration(ms) {
   const seconds = Math.floor(Math.max(0, ms || 0) / 1000);
   return `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
 }
-function historyPager(name, page) {
-  const target = $(`${name}-pager`);
-  target.replaceChildren();
-  for (const [title, value, disabled] of [
-    ['Назад', Math.max(0, page.offset - page.limit), page.offset === 0],
-    ['Далее', page.offset + page.limit, page.offset + page.items.length >= page.total],
-  ]) {
-    const button = document.createElement('button');
-    button.type = 'button'; button.className = 'btn'; button.textContent = title;
-    button.disabled = disabled;
-    button.onclick = () => { workOffsets[name] = value; loadHistory(name); };
-    target.append(button);
-  }
-  const count = document.createElement('span');
-  count.textContent = `Всего: ${page.total}`;
-  target.append(count);
+function isoDay(date, shiftDays = 0) {
+  const day = new Date(`${date}T00:00:00Z`);
+  day.setUTCDate(day.getUTCDate() + shiftDays);
+  return day.toISOString().slice(0, 10);
 }
-async function loadHistory(name) {
-  const sequence = ++historySequence[name];
+async function loadHistory() {
+  const sequence = ++historySequence;
   try {
-    const path = name === 'work' ? '/api/attendance/sessions' : '/api/presence/legacy';
-    const page = await api(`${path}?employee_id=${employeeId}&limit=50&offset=${workOffsets[name]}`);
-    if (sequence !== historySequence[name]) return;
-    const target = $(`${name}-table`).querySelector('tbody');
+    const today = (await api('/api/attendance/status')).as_of.slice(0, 10);
+    const params = new URLSearchParams({ employee_id: employeeId, from_date: isoDay(today, -30), to_date: today });
+    const report = await api(`/api/attendance/report?${params}`);
+    if (sequence !== historySequence) return;
+    const target = $('work-table').querySelector('tbody');
     target.replaceChildren();
-    $(`${name}-empty`).hidden = page.items.length > 0;
-    $(`${name}-error`).hidden = true;
-    for (const item of page.items) {
-      const values = name === 'work'
-        ? [fmtTime(item.started_at), item.ended_at ? fmtTime(item.ended_at) : 'Нет подтверждённого выхода',
-           workDuration(item.confirmed_ms), workDuration(item.running_ms), workDuration(item.review_ms),
-           `${{ OPEN: 'Открыт — предварительно', CLOSED: 'Закрыт', REVIEW: 'На проверке' }[item.status] || item.status}: ${item.reason_codes.join('; ') || 'без конфликтов'}`]
-        : [item.camera_name || '—', fmtTime(item.started_at), fmtTime(item.last_seen_at),
-           item.ended_at ? fmtTime(item.ended_at) : 'Историческое незакрытое наблюдение',
-           item.confidence != null ? item.confidence.toFixed(3) : '—'];
+    $('work-empty').hidden = report.rows.length > 0;
+    $('work-error').hidden = true;
+    for (const item of report.rows) {
+      const values = [item.date, workDuration(item.worked_ms), item.first_seen_at.slice(11, 16), item.last_seen_at.slice(11, 16),
+        item.method === 'FINAL' ? 'Итог дня' : 'День идёт'];
       const tr = document.createElement('tr');
       for (const value of values) { const td = document.createElement('td'); td.textContent = value; tr.append(td); }
       target.append(tr);
     }
-    historyPager(name, page);
   } catch (error) {
-    if (sequence !== historySequence[name]) return;
-    const message = $(`${name}-error`);
-    message.textContent = `Не удалось загрузить историю. Повторите: ${error.message}`;
+    if (sequence !== historySequence) return;
+    const message = $('work-error');
+    message.textContent = `Не удалось загрузить рабочее время. Повторите: ${error.message}`;
     message.hidden = false;
     const retry = document.createElement('button');
     retry.type = 'button'; retry.className = 'btn'; retry.textContent = 'Повторить';
-    retry.onclick = () => loadHistory(name); message.append(retry);
+    retry.onclick = () => loadHistory(); message.append(retry);
   }
 }
 $('employee-report').href = `/presence?employee_id=${employeeId}#report`;
-$('employee-events').href = `/presence?employee_id=${employeeId}#events`;
 loadEmployee();
 // Employee forms are never replaced by polling; only explicit conflict reloads rebase drafts.
-loadHistory('work');
-loadHistory('presence');
+loadHistory();

@@ -488,7 +488,8 @@ def test_stop_at_59_seconds_finalizes_partial_video_without_attendance_writes():
         assert utc(stopped["available_to"]) == BASE + timedelta(seconds=59)
         assert not process.terminated, "Normal stop must send q before terminate"
         assert catalog(r.engine, ATTENDANCE_TABLES) == before
-        for table in ("attendance_events", "attendance_decisions", "work_sessions", "attendance_coverage_gaps"):
+        for table in ("attendance_presence_segments", "attendance_door_crossings",
+                      "attendance_manual_intervals", "attendance_exclusions"):
             assert rows(r.engine, table) == []
 
 

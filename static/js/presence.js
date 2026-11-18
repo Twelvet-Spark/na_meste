@@ -1,613 +1,358 @@
-// Work attendance: server-offset times, audited writes, no visibility-based hours.
+// Work time from every camera with «Учёт времени». All times are shown in the workplace
+// offset the server reports; the browser's own time zone is never used for display.
 'use strict';
 const $ = (id) => document.getElementById(id);
-const state = { tab: 'active', employees: [], status: null, event: null, gap: null,
-  offsets: { events: 0, review: 0, legacy: 0 }, selected: new Map(), imageUrls: [], eventLoad: 0,
-  eventReady: false, gapReady: false, commissionCameras: [] };
-const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принято', REVIEW: 'На проверке',
-  VISITOR: 'Посетитель', VOID: 'Аннулировано', OPEN: 'Открыт — предварительно', CLOSED: 'Закрыт',
-  FRAME_GAP: 'Пропуск кадров', STREAM_RESET: 'Переподключение потока', CLOCK_DISCONTINUITY: 'Скачок часов',
-  COMMISSIONING_REQUIRED: 'Нужен ввод в эксплуатацию', CAMERA_UNCONFIGURED: 'Камеры не покрывают вход и выход',
-  CAMERA_OFFLINE: 'Камера недоступна', AI_UNAVAILABLE: 'AI-модели недоступны', AI_EXCLUDED: 'Камера исключена из AI',
-  PERFORMANCE_WARMUP: 'Измеряется производительность', PERFORMANCE_DEGRADED: 'Недостаточная производительность',
-  PERSISTENCE_ERROR: 'Ошибка сохранения', COVERAGE_UNAVAILABLE: 'Нет надёжного наблюдения',
-  COVERAGE_UNRECONCILED: 'Сбой наблюдения ещё не сохранён и не сверён',
-  EVIDENCE_UNAVAILABLE: 'Не сохранено изображение', EVIDENCE_LOST: 'Потеряно доказательство прохода',
-  PROCESS_DOWNTIME: 'Перерыв работы сервера', NO_FACE: 'Нет подтверждённого лица', AMBIGUOUS_FACE: 'Неоднозначное лицо',
-  ASSOCIATION_UNCERTAIN: 'Неоднозначное сопровождение', INCOMPLETE_CROSSING: 'Неполный проход',
-  DUPLICATE_ENTRY: 'Повторный вход без выхода', MISSING_ENTRY: 'Выход без входа', SIMULTANEOUS_EVENTS: 'Одновременные события',
-  GALLERY_CHANGED: 'Изменена база лиц', SOURCE_CHANGED: 'Изменён источник', CALIBRATION_CHANGED: 'Изменена калибровка',
-  EMPLOYEE_INACTIVE: 'Сотрудник неактивен', LOW_FACE_SCORE: 'Недостаточное сходство', BLURRY_FACE: 'Размытое лицо',
-  BAD_ALIGNMENT: 'Лицо не выровнено', FACE_TOO_SMALL: 'Лицо слишком мало', LOW_FACE_DETECTION: 'Низкое качество детекции',
-  UNMONITORED: 'Период до начала наблюдения', FUTURE_DATE: 'Будущая дата — наблюдение ещё не завершено',
-  SESSION_REVIEW: 'Спорный рабочий интервал', RUNNING: 'Предварительно', CONFIRMED: 'Подтверждено' };
-const label = (value) => labels[value] || value || '—';
-function roleLabel(role) {
-  return ({ BOTH: 'вход и выход', ENTRY: 'только вход', EXIT: 'только выход' })[role] || 'не настроен';
-}
-function coversDirections(configs) {
-  return ['ENTRY', 'EXIT'].every((direction) => configs.some((item) => item.role === 'BOTH' || item.role === direction));
-}
-const reasons = (values) => (values || []).map(label).join('; ') || '—';
-const time = (iso) => iso ? iso.replace('T', ' ') : '—';
-const hms = (ms) => { const s = Math.floor(Math.max(0, ms || 0) / 1000); return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
-const inputTime = (iso) => iso ? iso.replace(/(?:Z|[+-]\d{2}:\d{2})$/, '').replace(/(\.\d{3})\d+$/, '$1') : '';
-function offset() { const minutes = state.status?.utc_offset_minutes ?? 300; return `${minutes < 0 ? '-' : '+'}${String(Math.floor(Math.abs(minutes) / 60)).padStart(2, '0')}:${String(Math.abs(minutes) % 60).padStart(2, '0')}`; }
-function timestamp(input) { if (!input.value) return null; return input.value + offset(); }
+const UI = window.OperatorUI;
+const api = UI.api;
+const state = { tab: null, employees: [], status: null, reportLoaded: false, warnings: '', activeLoad: 0, reportLoad: 0, correctionsLoad: 0 };
+const sourceLabels = { FACE: 'по лицу', REID: 'по внешности', MANUAL: 'вручную', DOOR: 'проход' };
+const directionLabels = { ENTRY: 'Вход', EXIT: 'Выход' };
+
 function el(tag, text, className) { const node = document.createElement(tag); if (text != null) node.textContent = String(text); if (className) node.className = className; return node; }
 function button(text, action, className = 'btn') { const node = el('button', text, className); node.type = 'button'; node.onclick = action; return node; }
 function link(text, href) { const node = el('a', text); node.href = href; return node; }
 function row(values) { const tr = el('tr'); for (const value of values) { const td = el('td'); if (value instanceof Node) td.append(value); else td.textContent = value ?? '—'; tr.append(td); } return tr; }
-function badge(value) { return el('span', label(value), `status ${value === 'REVIEW' ? 'connecting' : ['ACCEPTED', 'CLOSED'].includes(value) ? 'online' : 'offline'}`); }
-function employeeLink(item) { return item.employee_id ? link(item.employee_name || `#${item.employee_id}`, `/employees/${item.employee_id}`) : el('span', 'Не установлен'); }
-function recordingLink(item) {
-  if (item.source !== 'CAMERA' || item.camera_id == null) return null;
-  const params = new URLSearchParams({ camera_id: String(item.camera_id), at: item.occurred_at });
-  const node = link('Видео камеры в это время', `/recordings?${params}`);
-  node.className = 'back-link';
-  return node;
-}
-function requestId() { const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128; const hex = Array.from(bytes, (v) => v.toString(16).padStart(2, '0')).join(''); return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`; }
-async function api(path, options = {}) {
-  let response;
-  const headers = new Headers(options.headers);
-  if (options.method && !['GET', 'HEAD'].includes(options.method.toUpperCase())) headers.set('X-Operator-Request', '1');
-  try { response = await fetch(path, { cache: 'no-store', ...options, headers }); }
-  catch (cause) { const error = new Error('Нет связи с сервером. Поля сохранены: повторите тот же запрос.'); error.status = 0; throw error; }
-  if (!response.ok) {
-    let detail = '';
-    try { const data = await response.json(); detail = Array.isArray(data.detail) ? data.detail.map((item) => `${item.loc?.join('.') || ''}: ${item.msg}`).join('; ') : data.detail || ''; } catch (_) { /* Non-JSON network/proxy errors still have a status. */ }
-    const error = new Error(response.status === 409 ? 'Данные уже изменены. Обновите версию, сравните изменения и повторно примените решение.' : response.status === 503 ? 'Сохранение или чтение недоступно (503). Поля сохранены; повторите запрос после восстановления.' : detail || `Ошибка ${response.status}`);
-    error.status = response.status; throw error;
-  }
-  return response.json();
-}
+function employeeLink(item) { return link(item.employee_name || `#${item.employee_id}`, `/employees/${item.employee_id}`); }
 function showError(id, error) { $(id).hidden = !error; $(id).textContent = error?.message || ''; }
-function fields(form) { return form.elements; }
-function human(form) { return { actor: fields(form).actor.value.trim(), reason: fields(form).reason.value.trim() }; }
-async function write(form, path, payload) {
-  // A retry of an unchanged form keeps its UUID, including after an unknown
-  // network outcome. Editing the payload creates a distinct operator request.
-  const signature = JSON.stringify({ path, payload });
-  if (form.pendingWrite?.signature !== signature) form.pendingWrite = { signature, request_id: requestId() };
-  const submits = [...form.querySelectorAll('[type="submit"]')];
-  submits.forEach((item) => { item.disabled = true; }); form.setAttribute('aria-busy', 'true');
-  try {
-    const result = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, request_id: form.pendingWrite.request_id }) });
-    form.pendingWrite = null; return result;
-  } finally { submits.forEach((item) => { item.disabled = false; }); form.removeAttribute('aria-busy'); }
+
+// Server timestamps already carry the workplace offset; slice, never reparse.
+const clock = (iso) => iso ? iso.slice(11, 16) : '—';
+const stamp = (iso) => iso ? `${iso.slice(0, 10)} ${iso.slice(11, 16)}` : '—';
+const span = (start, end) => start.slice(0, 10) === end.slice(0, 10) ? `${stamp(start)}–${clock(end)}` : `${stamp(start)} – ${stamp(end)}`;
+function hm(ms) { const minutes = Math.floor(Math.max(0, ms || 0) / 60000); return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}`; }
+function offset() {
+  const minutes = state.status.utc_offset_minutes;
+  return `${minutes < 0 ? '-' : '+'}${String(Math.floor(Math.abs(minutes) / 60)).padStart(2, '0')}:${String(Math.abs(minutes) % 60).padStart(2, '0')}`;
 }
-function options(select, employees, all = false) {
-  const old = select.value; select.replaceChildren();
-  const placeholder = el('option', all ? 'Все сотрудники' : 'Выберите сотрудника');
-  placeholder.value = '';
-  select.append(placeholder);
-  for (const employee of employees) {
-    const option = el('option', employee.name + (employee.active ? '' : ' (неактивен)'));
-    option.value = employee.id;
-    select.append(option);
+function today() { return state.status ? state.status.as_of.slice(0, 10) : new Date().toISOString().slice(0, 10); }
+function nextDay(date) { const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10); }
+const methodLabel = (method) => (method === 'FINAL' ? 'Итог дня' : 'День идёт');
+
+// ---------- status ----------
+function explainer(status) {
+  return `Время считается по всем камерам с включённым «Учёт времени»: сотрудник на месте, пока его узнаёт хотя бы одна камера — по лицу или по внешности после узнавания по лицу в этот день. Пока день идёт, перерывы дольше ${status.live_gap_minutes} мин не считаются; после окончания дня считается время от первого до последнего появления за вычетом отсутствий дольше ${status.day_gap_minutes} мин. Выход через дверь и последующий вход не считаются рабочим временем.`;
+}
+function renderWarnings(status) {
+  const items = [];
+  const cameras = status.cameras.filter((item) => item.time_tracking);
+  if (!cameras.length) items.push(['alert', 'Включите «Учёт времени» на нужных камерах', true]);
+  if (!status.worker_alive) items.push(['alert', 'Распознавание не запущено — время не считается']);
+  if (!status.appearance_available) items.push(['muted', 'Узнавание по внешности недоступно — считается только узнавание по лицу']);
+  if (status.recorder.last_error) items.push(['alert', 'Ошибка записи наблюдений; данные хранятся в памяти и будут записаны повторно']);
+  // Rebuild only on change so a polled status does not re-announce an unchanged alert.
+  const key = JSON.stringify(items);
+  if (key === state.warnings) return;
+  state.warnings = key;
+  $('attendance-warnings').replaceChildren(...items.map(([kind, text, withLink]) => {
+    const node = el('p', text, kind === 'alert' ? 'test-result err' : 'muted');
+    if (kind === 'alert') node.setAttribute('role', 'alert');
+    if (withLink) { node.append(' '); node.append(link('Настроить камеры', '/')); }
+    return node;
+  }));
+}
+async function loadStatus() {
+  try {
+    const status = await api('/api/attendance/status');
+    state.status = status;
+    const cameras = status.cameras.filter((item) => item.time_tracking);
+    const online = cameras.filter((item) => item.status === 'ONLINE').length;
+    $('work-explainer').textContent = explainer(status);
+    $('time-status').textContent = `Камер с учётом времени: ${cameras.length}, онлайн: ${online}`;
+    $('workplace-zone').textContent = `UTC${offset()}`;
+    document.querySelectorAll('.zone-label').forEach((node) => { node.textContent = `UTC${offset()}`; });
+    renderWarnings(status);
+    showError('status-error', null);
+    return status;
+  } catch (error) {
+    showError('status-error', error);
+    return null;
   }
-  select.value = old; select.disabled = !employees.length;
+}
+
+// ---------- employees ----------
+function fillEmployees(select, placeholder) {
+  const old = select.value;
+  select.replaceChildren();
+  const first = el('option', placeholder); first.value = ''; select.append(first);
+  for (const employee of state.employees) {
+    const option = el('option', employee.name + (employee.active ? '' : ' (неактивен)'));
+    option.value = employee.id; select.append(option);
+  }
+  select.value = old; select.disabled = !state.employees.length;
 }
 async function loadEmployees() {
   try {
     state.employees = await api('/api/employees');
-    document.querySelectorAll('.attendance-employees').forEach((select) => options(select, state.employees, select.dataset.all === 'true'));
-    if (!state.employees.length) $('manual-result').textContent = 'Нет сотрудников. Создайте сотрудника на странице «Сотрудники»; проверка посетителей доступна без регистрации сотрудников.';
-  } catch (error) { showError('manual-error', error); }
+    fillEmployees($('report-filter').elements.employee_id, 'Все');
+    fillEmployees($('correction-form').elements.employee_id, 'Выберите сотрудника');
+  } catch (error) { showError('report-error', error); }
 }
-function commissionVersions() {
-  if (!state.status) return;
-  state.commissionCameras = state.status.configuration.filter((item) => item.enabled)
-    .map(({ camera_id, revision }) => ({ camera_id, revision }));
-  $('commission-form').dataset.versionsSet = 'true';
-}
-async function loadStatus() {
-  try {
-    const status = await api('/api/attendance/status'); state.status = status;
-    showError('status-error', null);
-    $('technical-state').textContent = status.technical_ready ? 'Техника готова' : 'Техника не готова';
-    $('technical-state').className = `status ${status.technical_ready ? 'online' : 'connecting'}`;
-    $('automatic-state').textContent = status.automatic_ready ? 'Автоматический учёт разрешён' : 'Автоматический учёт заблокирован';
-    $('automatic-state').className = `status ${status.automatic_ready ? 'online' : 'connecting'}`;
-    $('readiness-reasons').textContent = `${reasons(status.reasons)} · технически здоровых секунд: ${Math.floor(status.technically_healthy_seconds)} · в очереди записей: ${status.pending_write_count}, уведомлений о сбоях: ${status.pending_fault_count}`;
-    document.querySelectorAll('.zone-label').forEach((node) => { node.textContent = `UTC${offset()}`; }); $('workplace-zone').textContent = `UTC${offset()} · фиксированный часовой пояс`;
-    const alerts = $('attendance-alerts'); alerts.replaceChildren();
-    alerts.append(link(`Неопознанных/нерешённых проходов: ${status.unresolved_crossings}`, '/presence?kind=event#review'), document.createTextNode(' · '), link(`Потерь наблюдения: ${status.unreviewed_gaps}`, '/presence?kind=gap#review'), document.createTextNode(` · Конфликтов порядка: ${status.projection_conflicts}`));
-    const configs = status.configuration.filter((item) => item.enabled);
-    $('configuration-state').textContent = coversDirections(configs)
-      ? configs.map((item) => `Камера #${item.camera_id} — ${roleLabel(item.role)}, калибровка ${item.revision}, источник ${item.source_revision}`).join(' · ')
-      : 'Камеры учёта не покрывают и вход, и выход. Настройте проходы и направления учёта; ручная работа и проверка остаются доступны.';
-    const metrics = $('role-metrics'); metrics.replaceChildren();
-    for (const data of status.cameras) {
-      metrics.append(row([`${roleLabel(data.role)} / #${data.camera_id}`, data.processed_fps?.toFixed(1) ?? '—',
-        data.frame_age_seconds?.toFixed(3) ?? '—',
-        `${data.processing_age_p95_seconds?.toFixed(3) ?? '—'} / ${data.completion_age_p95_seconds?.toFixed(3) ?? '—'}`, reasons(data.reasons)]));
-    }
-    const providers = $('provider-list'); providers.replaceChildren(); for (const [name, values] of Object.entries(status.providers)) providers.append(el('dt', name), el('dd', values.length ? values.join(', ') : 'Не загружен'));
-    $('commission-state').textContent = status.commission ? `Последнее подтверждение #${status.commission.id}: ${time(status.commission.created_at)}, ${status.commission.actor}. ${status.commissioning_required ? 'Текущая конфигурация не подтверждена.' : 'Текущая конфигурация подтверждена.'}` : 'Испытания не подтверждены: автоматические проходы сохраняются на проверку.';
-    if (!$('commission-form').dataset.versionsSet) commissionVersions();
-    return status;
-  } catch (error) {
-    showError('status-error', error);
-    $('automatic-state').textContent = 'Готовность неизвестна: нет актуальных данных';
-    $('automatic-state').className = 'status error';
-    $('technical-state').textContent = 'Техническая готовность неизвестна';
-    $('technical-state').className = 'status error';
-    return null;
-  }
-}
+
+// ---------- tab: now ----------
 async function loadActive() {
+  const load = ++state.activeLoad;
   try {
-    const data = await api('/api/attendance/active'); showError('active-error', null);
-    const tbody = $('active-rows'); tbody.replaceChildren(); $('active-empty').hidden = data.items.length > 0;
-    $('active-summary').textContent = `${data.total} незакрытых · на ${time(data.as_of)}`;
-    for (const item of data.items) { const status = el('div'); status.append(badge(item.status), el('p', reasons(item.reason_codes), 'muted small')); tbody.append(row([employeeLink(item), time(item.started_at), hms(item.running_ms), hms(item.review_ms), status])); }
-  } catch (error) { showError('active-error', error); }
-}
-function query(form) { const params = new URLSearchParams(); for (const [key, value] of new FormData(form)) if (value) params.set(key, value); return params; }
-function pager(name, data) {
-  const container = $(`${name}-pager`); container.replaceChildren();
-  const previous = button('Назад', () => { state.offsets[name] = Math.max(0, data.offset - data.limit); loadPage(name); }); previous.disabled = data.offset === 0;
-  const next = button('Далее', () => { state.offsets[name] = data.offset + data.limit; loadPage(name); }); next.disabled = data.offset + data.items.length >= data.total;
-  container.append(previous, el('span', data.total ? `${data.offset + 1}–${data.offset + data.items.length} из ${data.total}` : 'Всего: 0', 'muted'), next);
-}
-async function loadPage(name) {
-  const params = query($(`${name}-filter`)); params.set('limit', '50'); params.set('offset', state.offsets[name]);
-  const path = name === 'legacy' ? '/api/presence/legacy' : `/api/attendance/${name}`;
-  try {
-    const data = await api(`${path}?${params}`); showError(`${name}-error`, null);
-    const tbody = $(`${name}-rows`); tbody.replaceChildren(); $(`${name}-empty`).hidden = data.items.length > 0;
-    for (const item of data.items) {
-      if (name === 'events') {
-        const status = el('div'); status.append(badge(item.status), el('p', reasons([...item.reason_codes, ...item.projection_reasons]), 'muted small'));
-        const videoLink = recordingLink(item); if (videoLink) status.append(videoLink);
-        tbody.append(row([time(item.occurred_at), employeeLink(item), label(item.direction), item.source === 'MANUAL' ? 'Ручное событие' : item.camera_name || `Камера #${item.camera_id}`, status, button('Открыть', () => openEvent(item.id))]));
-      } else if (name === 'review') {
-        if (item.kind === 'event') {
-          const event = item.event; const box = el('input'); box.type = 'checkbox'; box.setAttribute('aria-label', `Посетитель: ${time(event.occurred_at)}`); box.disabled = event.status !== 'REVIEW' || event.employee_id != null; box.checked = state.selected.has(event.id);
-          box.onchange = () => { if (box.checked && state.selected.size >= 100) { box.checked = false; showError('bulk-error', new Error('В одном запросе можно выбрать не более 100 проходов.')); return; } if (box.checked) state.selected.set(event.id, event.revision); else state.selected.delete(event.id); selectionCount(); };
-          tbody.append(row([box, time(event.occurred_at), employeeLink(event), reasons([...event.reason_codes, ...event.projection_reasons]), button('Проверить проход', () => openEvent(event.id))]));
-        } else { const gap = item.gap; tbody.append(row(['—', `${time(gap.started_at)} — ${gap.ended_at ? time(gap.ended_at) : 'ещё открыт'}`, 'Потеря наблюдения', reasons(gap.reason_codes), button('Сверить период', () => openGap(gap))])); }
-      } else tbody.append(row([`${item.employee_name || '—'} / ${item.camera_name || '—'}`, time(item.started_at), time(item.last_seen_at), item.ended_at ? time(item.ended_at) : 'Историческое незакрытое наблюдение', item.confidence?.toFixed(3) ?? '—']));
-    }
-    pager(name, data);
-  } catch (error) { showError(`${name}-error`, error); }
-}
-function selectionCount() { $('bulk-count').textContent = `Выбрано: ${state.selected.size} (включая другие страницы)`; }
-function tabChanged(name) {
-  state.tab = name;
-  if (name === 'active') loadActive(); else if (name && name !== 'report') loadPage(name);
-}
-for (const name of ['events', 'review', 'legacy']) $(`${name}-filter`).onsubmit = (event) => { event.preventDefault(); state.offsets[name] = 0; if (name === 'review') { state.selected.clear(); selectionCount(); } loadPage(name); };
-function beginEditor(kind) {
-  state.eventReady = false;
-  state.gapReady = false;
-  $('event-editor').hidden = kind !== 'event';
-  $('gap-editor').hidden = kind !== 'gap';
-  $(`${kind}-content`).hidden = true;
-  $(`${kind}-content`).inert = true;
-  $(`${kind}-loading`).hidden = false;
-  $(`${kind}-loading`).textContent = kind === 'event' ? 'Загрузка выбранного события…' : 'Загрузка выбранного периода…';
-  $(`${kind}-load-retry`).hidden = true;
-}
-function finishEditor(kind) {
-  state[`${kind}Ready`] = true;
-  $(`${kind}-loading`).hidden = true;
-  $(`${kind}-content`).inert = false;
-  $(`${kind}-content`).hidden = false;
-}
-function editorLoadError(kind, error, retry) {
-  $(`${kind}-loading`).textContent = `Данные не загружены. ${error.message}`;
-  $(`${kind}-load-retry`).onclick = retry;
-  $(`${kind}-load-retry`).hidden = false;
-}
-function savedGateOverlay(event, kind, image, frame, generation) {
-  if (event.source !== 'CAMERA' || !['before', 'after'].includes(kind)) return null;
-  const raw = event.raw;
-  const calibration = raw.calibration;
-  const crop = raw[`${kind}_crop`];
-  const point = (value) => Array.isArray(value) && value.length === 2
-    && value.every((coordinate) => Number.isFinite(coordinate) && coordinate >= 0 && coordinate <= 1);
-  const a = calibration?.line_start, b = calibration?.line_end, inside = calibration?.inside_point;
-  if (!point(a) || !point(b) || !point(inside) || !Array.isArray(crop) || crop.length !== 4
-      || !crop.every((value) => Number.isFinite(value) && value >= 0 && value <= 1)
-      || crop[2] <= crop[0] || crop[3] <= crop[1]) return null;
-  const dx = b[0] - a[0], dy = b[1] - a[1], length = Math.hypot(dx, dy);
-  const interiorSide = (inside[0] - a[0]) * -dy + (inside[1] - a[1]) * dx;
-  if (length < 1e-9 || Math.abs(interiorSide) < 1e-9) return null;
-  const width = image.naturalWidth, height = image.naturalHeight;
-  const project = ([x, y]) => [(x - crop[0]) / (crop[2] - crop[0]) * width,
-    (y - crop[1]) / (crop[3] - crop[1]) * height];
-  const svgNode = (name, attributes = {}) => {
-    const node = document.createElementNS('http://www.w3.org/2000/svg', name);
-    for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
-    return node;
-  };
-  const svg = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: 'xMidYMid meet',
-    'aria-hidden': 'true', focusable: 'false', class: 'attendance-evidence-overlay' });
-  const clipId = `attendance-crop-${generation}-${kind}`;
-  const definitions = svgNode('defs');
-  const clip = svgNode('clipPath', { id: clipId });
-  clip.append(svgNode('rect', { width, height }));
-  definitions.append(clip);
-  const drawing = svgNode('g', { 'clip-path': `url(#${clipId})` });
-  const stroke = (path) => {
-    for (const name of ['attendance-gate-outline', 'attendance-gate-line']) {
-      drawing.append(svgNode('path', { d: path, class: name, fill: 'none',
-        'vector-effect': 'non-scaling-stroke', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
-    }
-  };
-  const from = project(a), to = project(b);
-  stroke(`M ${from.join(' ')} L ${to.join(' ')}`);
-  // Clip the finite segment in full-frame coordinates, so a cropped view can
-  // place its direction arrow on the visible gate rather than off the image.
-  let first = 0, last = 1;
-  for (const [position, delta, lower, upper] of [[a[0], dx, crop[0], crop[2]], [a[1], dy, crop[1], crop[3]]]) {
-    if (Math.abs(delta) < 1e-12) {
-      if (position < lower || position > upper) { last = -1; break; }
-    } else {
-      const entry = (lower - position) / delta, exit = (upper - position) / delta;
-      first = Math.max(first, Math.min(entry, exit));
-      last = Math.min(last, Math.max(entry, exit));
-    }
-  }
-  // The historical image/crop is the only coordinate reference here. Compute
-  // the normal after projection: normalized-image normals are not pixel normals.
-  if (first <= last) {
-    const midpoint = (first + last) / 2;
-    const center = project([a[0] + dx * midpoint, a[1] + dy * midpoint]);
-    const interior = project(inside);
-    const px = to[0] - from[0], py = to[1] - from[1], pixelLength = Math.hypot(px, py);
-    const sign = Math.sign((interior[0] - center[0]) * -py + (interior[1] - center[1]) * px);
-    const reach = Math.min(40, width / 8, height / 8);
-    const nx = -py / pixelLength * sign * reach, ny = px / pixelLength * sign * reach;
-    const tail = [center[0] - nx, center[1] - ny];
-    const tip = [center[0] + nx, center[1] + ny];
-    const angle = Math.atan2(tip[1] - tail[1], tip[0] - tail[0]);
-    const head = Math.min(14, Math.hypot(tip[0] - tail[0], tip[1] - tail[1]) / 3);
-    const left = [tip[0] - head * Math.cos(angle - .45), tip[1] - head * Math.sin(angle - .45)];
-    const right = [tip[0] - head * Math.cos(angle + .45), tip[1] - head * Math.sin(angle + .45)];
-    stroke(`M ${tail.join(' ')} L ${tip.join(' ')} M ${left.join(' ')} L ${tip.join(' ')} L ${right.join(' ')}`);
-    const caption = svgNode('text', { x: center[0] + 6, y: center[1] - reach - 8,
-      fill: 'var(--vid-warn)', stroke: 'var(--md-inverse-surface)', 'stroke-width': 3,
-      'paint-order': 'stroke', 'font-size': 13 });
-    caption.textContent = 'Снаружи → внутрь';
-    drawing.append(caption);
-  }
-  svg.append(definitions, drawing);
-  frame.append(svg);
-  const coordinates = (values) => values.map((value) => value.toFixed(3)).join(', ');
-  const description = el('p', null, 'attendance-geometry muted');
-  description.textContent = `Сохранённая линия: (${coordinates(a)}) — (${coordinates(b)}); фрагмент: (${coordinates(crop)}). Калибровка ${calibration.revision}, источник ${calibration.source_revision}. ${first > last ? 'Линия вне этого фрагмента. ' : 'Стрелка: Снаружи → внутрь (внутренняя сторона сохранённой линии). '}${['ENTRY', 'EXIT'].includes(raw.direction) ? `Исходное направление прохода: ${label(raw.direction)}.` : 'Направление прохода не установлено.'} Роль камеры при записи: ${label(calibration.role)}.`;
-  return description;
-}
-function clearImages() { for (const url of state.imageUrls) URL.revokeObjectURL(url); state.imageUrls = []; }
-async function evidenceImage(event, kind, name, target, generation) {
-  const figure = el('figure'); const caption = el('figcaption', name); const message = el('p', event.evidence.purged ? 'Срок хранения изображения истёк' : !event.evidence[kind] ? 'Изображение не сохранено' : 'Загрузка изображения…', 'muted'); figure.append(caption, message); target.append(figure);
-  if (event.evidence.purged || !event.evidence[kind]) return;
-  try {
-    const response = await fetch(`/api/attendance/events/${encodeURIComponent(event.id)}/evidence/${kind}`, { cache: 'no-store' });
-    if (generation !== state.eventLoad) return;
-    if (!response.ok) { message.textContent = response.status === 410 ? 'Срок хранения изображения истёк' : response.status === 404 ? 'Изображение отсутствует' : 'Изображение временно недоступно — откройте событие повторно'; return; }
-    const blob = await response.blob(); if (generation !== state.eventLoad) return;
-    const url = URL.createObjectURL(blob);
-    state.imageUrls.push(url);
-    const image = el('img');
-    const frame = el('div', null, 'attendance-evidence-image');
-    image.alt = `${name}: событие ${time(event.occurred_at)}`;
-    image.onload = () => {
-      if (generation !== state.eventLoad) return;
-      const description = savedGateOverlay(event, kind, image, frame, generation);
-      if (description) figure.append(description);
-      else if (event.source === 'CAMERA' && kind !== 'face') {
-        figure.append(el('p', 'Для этого снимка нет пригодной сохранённой геометрии; текущая калибровка не подставляется.', 'attendance-geometry muted'));
-      }
-    };
-    image.onerror = () => {
-      if (generation === state.eventLoad) frame.replaceWith(el('p', 'Сохранённое изображение не удалось прочитать. Откройте событие повторно.', 'muted'));
-    };
-    frame.append(image);
-    message.replaceWith(frame);
-    image.src = url;
-  } catch (_) { if (generation === state.eventLoad) message.textContent = 'Нет связи: изображение не загружено. Откройте событие повторно.'; }
-}
-async function openEvent(identifier, preserve = false) {
-  preserve = preserve && state.event?.id === identifier;
-  const generation = ++state.eventLoad;
-  beginEditor('event');
-  clearImages();
-  if (!preserve) {
-    $('event-editor').scrollIntoView({ behavior: 'auto', block: 'start' });
-    $('event-title').focus();
-  }
-  try {
-    const data = await api(`/api/attendance/events/${encodeURIComponent(identifier)}`);
-    if (generation !== state.eventLoad) return;
-    state.event = data;
-    $('event-effective').textContent = `${time(data.occurred_at)} · ${label(data.direction)} · ${data.employee_name || 'Сотрудник не установлен'} · ${label(data.status)} · версия ${data.revision}. Причины: ${reasons([...data.reason_codes, ...data.projection_reasons])}`;
-    const images = $('event-images'); images.replaceChildren(); for (const [kind, name] of [['before', 'До прохода'], ['after', 'После прохода'], ['face', 'Лицо']]) evidenceImage(data, kind, name, images, generation);
-    const videoLink = recordingLink(data);
-    if (videoLink) images.append(videoLink, el('p', 'Видео может отсутствовать. Сохранённые изображения события остаются доступны независимо от архива.', 'muted small'));
-    const candidates = $('event-candidates'); candidates.replaceChildren(el('h3', 'Кандидаты и качество лица'));
-    const observations = data.raw.face_evidence || [];
-    if (!observations.length) candidates.append(el('p', 'В исходной записи нет наблюдений лица. Ручное событие не содержит вымышленных изображений или оценок.', 'muted'));
-    for (const face of observations) { const p = el('p'); p.textContent = `Кадр ${face.frame_seq} · кандидат: ${face.candidate_employee_name || face.candidate_employee_id || 'нет'} · сходство: ${face.score ?? face.candidate_score ?? '—'} · второй: ${face.runner_up_employee_name || face.runner_up_employee_id || 'нет'} (${face.runner_up_score ?? '—'}) · разница: ${face.margin ?? '—'} · качество: ${JSON.stringify(face.quality || {})}`; candidates.append(p); }
-    candidates.append(el('p', `Пригодность до эксплуатационного допуска: ${data.raw.would_auto_accept ? 'да' : 'нет'}. Это не вероятность и не разрешение начислять часы.`, 'muted'));
-    $('event-raw').textContent = JSON.stringify(data.raw, null, 2);
-    const history = $('decision-history'); history.replaceChildren();
-    for (const decision of data.decisions) { const item = el('li'); item.append(el('p', `Версия ${decision.revision} · ${time(decision.created_at)} · ${decision.actor}: ${decision.reason}`)); const changes = el('details'); changes.append(el('summary', 'До и после решения'), el('pre', JSON.stringify({ before: decision.before, after: decision.after }, null, 2))); item.append(changes); history.append(item); }
-    if (!data.decisions.length) history.append(el('li', 'Решений оператора ещё нет.'));
-    const f = fields($('decision-form')); f.expected_revision.value = data.revision;
-    if (!preserve) { f.action.value = 'ACCEPT'; f.employee_id.value = data.employee_id || ''; f.direction.value = data.direction || ''; f.occurred_at.value = inputTime(data.occurred_at); f.reason.value = ''; $('decision-result').textContent = ''; $('decision-form').pendingWrite = null; }
-    showError('decision-error', null); $('decision-rebase').hidden = true; decisionFields();
-    finishEditor('event');
-    if (preserve) $('decision-result').textContent = 'Загружена актуальная версия. Ваши поля сохранены: сравните их с текущим состоянием выше, затем явно сохраните решение.';
+    const data = await api('/api/attendance/active');
+    if (load !== state.activeLoad) return;
+    showError('active-error', null);
+    $('active-summary').textContent = `Обновлено ${clock(data.as_of)}`;
+    $('active-rows').replaceChildren(...data.items.map((item) => row([
+      employeeLink(item), clock(item.since), clock(item.last_seen_at), item.last_camera_name || `#${item.last_camera_id}`,
+      hm(item.today_ms), sourceLabels[item.source] || '—'])));
+    $('active-empty').hidden = data.items.length > 0;
   } catch (error) {
-    if (generation === state.eventLoad) editorLoadError('event', error, () => openEvent(identifier, preserve));
+    if (load === state.activeLoad) showError('active-error', error);
   }
 }
-function decisionFields() { const f = fields($('decision-form')); const accept = f.action.value === 'ACCEPT'; for (const name of ['employee_id', 'direction', 'occurred_at']) { f[name].required = accept; f[name].disabled = !accept || (name === 'employee_id' && !state.employees.length); } }
-fields($('decision-form')).action.onchange = decisionFields;
-$('event-close').onclick = () => { $('event-editor').hidden = true; state.eventReady = false; state.eventLoad++; clearImages(); };
-$('decision-rebase').onclick = () => openEvent(state.event.id, true);
-$('decision-form').onsubmit = async (event) => {
-  event.preventDefault();
-  if (!state.eventReady) return;
-  const identifier = state.event.id, generation = state.eventLoad;
-  const form = event.currentTarget, f = fields(form);
-  const data = { ...human(form), expected_revision: Number(f.expected_revision.value), action: f.action.value };
-  if (data.action === 'ACCEPT') Object.assign(data, { employee_id: Number(f.employee_id.value), direction: f.direction.value, occurred_at: timestamp(f.occurred_at) });
-  try {
-    const result = await write(form, `/api/attendance/events/${encodeURIComponent(identifier)}/decision`, data);
-    loadActive(); loadStatus();
-    if (['events', 'review'].includes(state.tab)) loadPage(state.tab);
-    if (generation !== state.eventLoad) return;
-    await openEvent(result.id, true);
-    if (state.eventReady && state.event.id === result.id) {
-      $('decision-result').textContent = 'Решение сохранено. Рабочие интервалы пересчитаны; исходные данные не изменены.';
-    }
-  } catch (error) {
-    if (generation !== state.eventLoad) return;
-    showError('decision-error', error);
-    $('decision-rebase').hidden = error.status !== 409;
-  }
-};
-async function openGap(gap, preserve = false) {
-  preserve = preserve && state.gap?.id === gap.id;
-  const generation = ++state.eventLoad;
-  beginEditor('gap');
-  clearImages();
-  if (!preserve) {
-    $('gap-editor').scrollIntoView({ block: 'start' });
-    $('gap-title').focus();
-  }
-  const form = $('gap-form');
-  form.querySelector('[type="submit"]').disabled = true;
-  try {
-    const current = await api(`/api/attendance/gaps/${gap.id}`);
-    if (generation !== state.eventLoad) return;
-    state.gap = current;
-    $('gap-description').textContent = `${time(current.started_at)} — ${current.ended_at ? time(current.ended_at) : 'период ещё открыт; дождитесь восстановления'}. ${reasons(current.reason_codes)}. Версия ${current.revision}. ${current.reviewed ? 'Период уже проверен.' : ''}`;
-    fields(form).expected_revision.value = current.revision;
-    form.querySelector('[type="submit"]').disabled = !current.ended_at;
-    if (!preserve) {
-      fields(form).reason.value = '';
-      fields(form).reconciled.checked = false;
-      form.pendingWrite = null;
-      $('gap-result').textContent = '';
-    }
-    const history = $('gap-history');
-    history.replaceChildren();
-    for (const decision of current.decisions) {
-      const item = el('li');
-      item.append(el('p', `Версия ${decision.revision} · ${time(decision.created_at)} · ${decision.actor}: ${decision.reason}`));
-      const changes = el('details');
-      changes.append(el('summary', 'До и после сверки'), el('pre', JSON.stringify({ before: decision.before, after: decision.after }, null, 2)));
-      item.append(changes);
-      history.append(item);
-    }
-    if (!current.decisions.length) history.append(el('li', 'Сверок оператора ещё нет.'));
-    showError('gap-error', null);
-    $('gap-rebase').hidden = true;
-    finishEditor('gap');
-  } catch (error) {
-    if (generation === state.eventLoad) editorLoadError('gap', error, () => openGap(gap, preserve));
-  }
+
+// ---------- tab: report ----------
+function reportParams() {
+  const form = $('report-filter');
+  const params = new URLSearchParams();
+  for (const name of ['from_date', 'to_date', 'employee_id']) if (form.elements[name].value) params.set(name, form.elements[name].value);
+  return params;
 }
-$('gap-close').onclick = () => { $('gap-editor').hidden = true; state.gapReady = false; state.eventLoad++; };
-$('gap-rebase').onclick = async () => {
-  await openGap(state.gap, true);
-  $('gap-result').textContent = 'Ваши поля сохранены. Сравните новую версию и повторно сверьте период перед подтверждением.';
-};
-$('gap-form').onsubmit = async (event) => {
-  event.preventDefault();
-  if (!state.gapReady || !state.gap.ended_at) return;
-  const identifier = state.gap.id, generation = state.eventLoad;
-  const form = event.currentTarget;
-  try {
-    const result = await write(form, `/api/attendance/gaps/${identifier}/review`, {
-      ...human(form), expected_revision: Number(fields(form).expected_revision.value),
-    });
-    loadActive(); loadStatus(); loadPage('review');
-    if (generation !== state.eventLoad) return;
-    await openGap(result, true);
-    if (state.gapReady && state.gap.id === result.id) {
-      $('gap-result').textContent = 'Сверка сохранена. История потери наблюдения остаётся в журнале.';
-    }
-  } catch (error) {
-    if (generation !== state.eventLoad) return;
-    showError('gap-error', error);
-    $('gap-rebase').hidden = error.status !== 409;
-  }
-};
-$('manual-details').ontoggle = () => {
-  if ($('manual-details').open && !fields($('manual-form')).occurred_at.value) {
-    fields($('manual-form')).occurred_at.value = inputTime(state.status?.as_of);
-  }
-};
-$('manual-form').onsubmit = async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const f = fields(form);
-  try {
-    const result = await write(form, '/api/attendance/manual', {
-      ...human(form), employee_id: Number(f.employee_id.value), direction: f.direction.value,
-      occurred_at: timestamp(f.occurred_at),
-    });
-    showError('manual-error', null);
-    $('manual-result').replaceChildren(document.createTextNode('Событие сохранено. '),
-      button('Открыть запись', () => openEvent(result.id), 'btn ghost'));
-    f.reason.value = '';
-    loadActive(); loadStatus();
-  } catch (error) { showError('manual-error', error); }
-};
-$('bulk-form').onsubmit = async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  if (!state.selected.size) {
-    showError('bulk-error', new Error('Сначала выберите проверенные неопознанные проходы в таблице.'));
-    return;
-  }
-  if (!confirm(`Отметить ${state.selected.size} выбранных проходов посетителями? Они не будут создавать рабочее время.`)) return;
-  const items = [...state.selected].map(([event_id, expected_revision]) => ({ event_id, expected_revision }))
-    .sort((a, b) => a.event_id.localeCompare(b.event_id));
-  try {
-    await write(form, '/api/attendance/visitors', { ...human(form), items });
-    state.selected.clear(); selectionCount();
-    showError('bulk-error', null);
-    fields(form).reason.value = '';
-    loadPage('review'); loadActive(); loadStatus();
-  } catch (error) {
-    showError('bulk-error', error);
-    $('bulk-rebase').hidden = error.status !== 409;
-  }
-};
-$('bulk-rebase').onclick = () => {
-  state.selected.clear(); selectionCount();
-  $('bulk-form').pendingWrite = null;
-  $('bulk-rebase').hidden = true;
-  loadPage('review');
-};
-$('commission-details').ontoggle = () => {
-  if ($('commission-details').open && !$('commission-form').dataset.versionsSet) commissionVersions();
-};
-$('commission-rebase').onclick = async () => {
-  if (!await loadStatus()) return;
-  commissionVersions();
-  $('commission-rebase').hidden = true;
-  $('commission-result').textContent = 'Версии обновлены. Убедитесь, что испытания относятся к текущей конфигурации.';
-};
-$('commission-form').onsubmit = async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const f = fields(form);
-  const acceptance_record = {};
-  for (const name of ['entry_trials', 'exit_trials', 'employee_count', 'visitor_trials', 'retreat_trials',
-    'wrong_employee', 'duplicate_trips', 'missed_unflagged', 'frontal_trials', 'frontal_eligible', 'performance_minutes']) {
-    acceptance_record[name] = Number(f[name].value);
-  }
-  acceptance_record.site_confirmed = f.site_confirmed.checked;
-  if (!state.commissionCameras.length) {
-    showError('commission-error', new Error('Настройте камеры учёта'));
-    return;
-  }
-  try {
-    const result = await write(form, '/api/attendance/commission', {
-      ...human(form), expected_cameras: state.commissionCameras, acceptance_record,
-    });
-    showError('commission-error', null);
-    $('commission-result').textContent = `Подтверждение #${result.commission_id} сохранено. Прежние пробные события остаются на проверке; аннулируйте испытательные записи с явным основанием.`;
-    loadStatus();
-  } catch (error) {
-    showError('commission-error', error);
-    $('commission-rebase').hidden = error.status !== 409;
-  }
-};
-function reportTable(headers, items, render) {
+function table(headers, bodyRows) {
   const wrap = el('div', null, 'table-wrap');
-  const table = el('table', null, 'table');
-  const head = el('thead');
-  const tr = el('tr');
-  for (const title of headers) tr.append(el('th', title));
-  head.append(tr);
-  const body = el('tbody');
-  for (const item of items) body.append(row(render(item)));
-  table.append(head, body); wrap.append(table);
+  const tbl = el('table', null, 'table');
+  const head = el('tr');
+  for (const title of headers) head.append(el('th', title));
+  const thead = el('thead'); thead.append(head);
+  const tbody = el('tbody'); tbody.append(...bodyRows);
+  tbl.append(thead, tbody); wrap.append(tbl);
   return wrap;
 }
-$('report-filter').onsubmit = async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
+function notes(item) {
+  const values = [];
+  if (item.has_manual) values.push('вручную');
+  else if (!item.face_seen) values.push('только по внешности');
+  return values.join(', ');
+}
+async function loadReport() {
+  const form = $('report-filter');
   if (form.getAttribute('aria-busy') === 'true') return;
-  const params = query(form);
-  const submit = form.querySelector('[type="submit"]');
-  form.setAttribute('aria-busy', 'true'); submit.disabled = true;
+  const load = ++state.reportLoad;
+  const params = reportParams();
+  UI.setBusy(form, true);
   $('report-csv').hidden = true;
-  $('report-results').replaceChildren(); $('report-warnings').replaceChildren();
-  $('report-summary').textContent = 'Загрузка отчёта за выбранный период…';
+  $('report-results').replaceChildren();
+  $('report-summary').textContent = 'Загрузка отчёта…';
   showError('report-error', null);
   try {
     const data = await api(`/api/attendance/report?${params}`);
-    showError('report-error', null);
-    $('report-summary').textContent = `${data.from_date} — ${data.to_date} · на ${time(data.as_of)} · ${data.finalizable ? 'Полные завершённые дни, можно использовать итог' : 'Неокончательный отчёт: есть открытые интервалы или неполнота наблюдения'}`;
-    // Earlier unresolved crossings can block this period. Do not hide them
-    // behind a from_date filter when taking the operator directly to review.
-    const reviewUrl = (kind) => `/presence?${new URLSearchParams({ kind, to_date: data.as_of.slice(0, 10) })}#review`;
-    $('report-warnings').replaceChildren(
-      link(`Нерешённых проходов: ${data.unresolved_crossings}`, reviewUrl('event')),
-      document.createTextNode(' · '), link(`Потерь наблюдения: ${data.unreviewed_gaps}`, reviewUrl('gap')));
+    if (load !== state.reportLoad) return;
+    state.reportLoaded = true;
+    $('report-summary').textContent = `${data.from_date} — ${data.to_date} · на ${stamp(data.as_of)}`;
     const results = $('report-results');
-    results.replaceChildren(el('h3', 'По дням'));
-    results.append(reportTable(
-      ['Дата', 'Сотрудник', 'Подтверждено', 'Текущее', 'На проверке', 'Визитов', 'Первый вход', 'Последний выход', 'Нерешено', 'Состояние / покрытие'],
-      data.rows, (item) => [item.date, item.employee_name, hms(item.confirmed_ms), hms(item.running_ms),
-        hms(item.review_ms), item.visit_count, time(item.first_entry), time(item.last_exit), item.pending_count,
-        `${label(item.status)} · ${reasons(item.coverage_reasons)}`]));
-    results.append(el('h3', 'Итоги за период по сотрудникам'), reportTable(
-      ['Сотрудник', 'Подтверждено', 'Текущее', 'На проверке', 'Нерешено'], data.totals,
-      (item) => [item.employee_name, hms(item.confirmed_ms), hms(item.running_ms), hms(item.review_ms), item.pending_count]));
-    if (!data.rows.length) results.append(el('p', 'Нет сотрудников или рабочих записей за выбранный период.', 'empty'));
+    results.replaceChildren(table(
+      ['Дата', 'Сотрудник', 'Отработано', 'Первое', 'Последнее', 'Сессий', 'Расчёт', 'Примечания'],
+      data.rows.map(reportRow)));
+    if (!data.rows.length) results.append(el('p', 'За выбранный период данных нет.', 'empty'));
+    else results.append(el('h3', 'Итого за период'), table(
+      ['Сотрудник', 'Отработано', 'Дней'],
+      data.totals.map((item) => row([employeeLink(item), hm(item.worked_ms), item.days]))));
     $('report-csv').href = `/api/attendance/report.csv?${params}`;
     $('report-csv').hidden = false;
   } catch (error) {
-    if (error.status === 404) error.message = 'Сотрудник не найден. Обновите список сотрудников и повторите выбор.';
-    $('report-summary').textContent = 'Отчёт не загружен. Проверьте условия и нажмите «Показать отчёт» повторно.';
+    if (load !== state.reportLoad) return;
+    state.reportLoaded = false;
+    $('report-summary').textContent = 'Отчёт не загружен. Проверьте условия и нажмите «Сформировать».';
     showError('report-error', error);
   } finally {
-    form.removeAttribute('aria-busy'); submit.disabled = false;
+    if (load === state.reportLoad) UI.setBusy(form, false);
+  }
+}
+function reportRow(item) {
+  const toggle = button(item.date, () => toggleTimeline(tr, toggle, item), 'btn ghost');
+  toggle.setAttribute('aria-expanded', 'false');
+  const tr = row([toggle, employeeLink(item), hm(item.worked_ms), clock(item.first_seen_at), clock(item.last_seen_at),
+    item.sessions, methodLabel(item.method), notes(item)]);
+  return tr;
+}
+async function toggleTimeline(tr, toggle, item) {
+  if (tr.nextElementSibling?.dataset.detailFor === `${item.employee_id}:${item.date}`) {
+    tr.nextElementSibling.remove(); toggle.setAttribute('aria-expanded', 'false'); return;
+  }
+  const detail = el('tr'); detail.dataset.detailFor = `${item.employee_id}:${item.date}`;
+  const cell = el('td'); cell.colSpan = 8; cell.append(el('p', 'Загрузка…', 'muted'));
+  detail.append(cell); tr.after(detail); toggle.setAttribute('aria-expanded', 'true');
+  try {
+    const data = await api(`/api/attendance/timeline?${new URLSearchParams({ employee_id: item.employee_id, date: item.date })}`);
+    cell.replaceChildren(...timelineNodes(data));
+  } catch (error) {
+    cell.replaceChildren(el('p', error.status === 404 ? 'Сотрудник не найден.' : `Не удалось загрузить день: ${error.message}`, 'test-result err'));
+  }
+}
+// Minutes since local midnight of `date`; a timestamp on a later date is the end of the bar.
+function dayMinutes(iso, date) {
+  const day = iso.slice(0, 10);
+  if (day > date) return 1440;
+  if (day < date) return 0;
+  return Number(iso.slice(11, 13)) * 60 + Number(iso.slice(14, 16)) + Number(iso.slice(17, 19) || 0) / 60;
+}
+function dayBar(date, sessions, gaps) {
+  const bar = el('div');
+  bar.setAttribute('role', 'img');
+  bar.setAttribute('aria-label', sessions.length ? `Рабочие сессии: ${sessions.map((s) => `${clock(s.started_at)}–${clock(s.ended_at)}`).join(', ')}` : 'Рабочих сессий нет');
+  bar.style.cssText = 'position:relative;height:22px;border-radius:6px;overflow:hidden;background:var(--md-surface-container-high)';
+  const block = (item, css, title) => {
+    const from = dayMinutes(item.started_at, date), to = dayMinutes(item.ended_at, date);
+    const node = el('div');
+    node.style.cssText = `position:absolute;top:0;bottom:0;left:${from / 14.4}%;width:${Math.max(0.3, (to - from) / 14.4)}%;${css}`;
+    node.title = `${title} ${clock(item.started_at)}–${clock(item.ended_at)}`;
+    return node;
+  };
+  bar.append(
+    ...gaps.map((gap) => block(gap, 'background:repeating-linear-gradient(45deg,var(--md-error) 0 3px,transparent 3px 6px)', 'Проход, не считается')),
+    ...sessions.map((session) => block(session, 'background:var(--md-primary)', 'Работа')));
+  const ticks = el('div', null, 'muted');
+  ticks.style.cssText = 'display:flex;justify-content:space-between;font-size:12px';
+  for (const hour of [0, 6, 12, 18, 24]) ticks.append(el('span', hour));
+  const wrap = el('div'); wrap.append(bar, ticks);
+  return wrap;
+}
+function list(title, items, render) {
+  const nodes = [el('h4', title)];
+  if (!items.length) { nodes.push(el('p', 'Нет', 'muted')); return nodes; }
+  const ul = el('ul');
+  for (const item of items) {
+    const li = el('li', render(item));
+    if (item.excluded) { li.style.textDecoration = 'line-through'; li.title = 'Исключено корректировкой'; }
+    ul.append(li);
+  }
+  nodes.push(ul);
+  return nodes;
+}
+function timelineNodes(data) {
+  const correction = (kind) => (item) => `${kind} ${span(item.started_at, item.ended_at)} · ${item.actor}: ${item.reason}`;
+  return [
+    el('p', `${methodLabel(data.method)} · отработано ${hm(data.worked_ms)}`),
+    dayBar(data.date, data.sessions, data.door_gaps),
+    ...list('Сессии', data.sessions, (s) => `${clock(s.started_at)}–${clock(s.ended_at)} (${hm(Date.parse(s.ended_at) - Date.parse(s.started_at))})`),
+    ...list('Выход и вход через дверь — не считается', data.door_gaps, (g) => `${clock(g.started_at)}–${clock(g.ended_at)}`),
+    ...list('Наблюдения', data.segments, (s) => `${s.camera_name} · ${clock(s.started_at)}–${clock(s.last_seen_at)} · ${s.face_seen ? 'по лицу' : 'по внешности'}${s.excluded ? ' (исключено)' : ''}`),
+    ...list('Проходы', data.crossings, (c) => `${directionLabels[c.direction] || c.direction} · ${c.camera_name} · ${stamp(c.occurred_at)}${c.excluded ? ' (исключено)' : ''}`),
+    ...list('Корректировки', [...data.manual.map((item) => ({ ...item, text: correction('Добавлено')(item) })), ...data.exclusions.map((item) => ({ ...item, text: correction('Исключено')(item) }))], (item) => item.text),
+  ];
+}
+$('report-filter').onsubmit = (event) => { event.preventDefault(); loadReport(); };
+
+// ---------- tab: corrections ----------
+function correctionRange() {
+  const form = $('report-filter').elements;
+  return { from: form.from_date.value, to: form.to_date.value };
+}
+async function loadCorrections() {
+  const load = ++state.correctionsLoad;
+  const { from, to } = correctionRange();
+  $('corrections-range').textContent = `${from} — ${to}`;
+  try {
+    const data = await api(`/api/attendance/corrections?${new URLSearchParams({ from_date: from, to_date: to })}`);
+    if (load !== state.correctionsLoad) return;
+    showError('corrections-error', null);
+    $('corrections-rows').replaceChildren(...data.items.map(correctionRow));
+    $('corrections-empty').hidden = data.items.length > 0;
+  } catch (error) {
+    if (load === state.correctionsLoad) showError('corrections-error', error);
+  }
+}
+function correctionRow(item) {
+  const revoked = Boolean(item.revoked_at);
+  const status = revoked ? `Отменено ${stamp(item.revoked_at)}: ${item.revoked_by}, ${item.revoke_reason}` : 'Действует';
+  const action = el('td');
+  if (!revoked) action.append(button('Отменить', () => openRevoke(action, item)));
+  const tr = row([item.kind === 'MANUAL' ? 'Добавлено время' : 'Исключено время', employeeLink(item),
+    span(item.started_at, item.ended_at), item.actor, item.reason, stamp(item.created_at), status]);
+  tr.append(action);
+  return tr;
+}
+function openRevoke(cell, item) {
+  const form = el('form', null, 'attendance-form');
+  const actor = el('input'); actor.name = 'actor'; actor.maxLength = 100; actor.required = true; actor.placeholder = 'Оператор'; actor.setAttribute('aria-label', 'Оператор');
+  actor.value = $('correction-form').elements.actor.value;
+  const reason = el('input'); reason.name = 'reason'; reason.maxLength = 1000; reason.required = true; reason.placeholder = 'Причина отмены'; reason.setAttribute('aria-label', 'Причина отмены');
+  const submit = el('button', 'Отменить корректировку', 'btn primary'); submit.type = 'submit';
+  const error = el('p', null, 'test-result err'); error.setAttribute('role', 'alert'); error.hidden = true;
+  form.append(actor, reason, submit, button('Не отменять', () => { form.remove(); cell.querySelector('button')?.focus(); }), error);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    UI.setBusy(form, true);
+    try {
+      await api(`/api/attendance/corrections/${item.kind.toLowerCase()}/${item.id}/revoke`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actor: actor.value.trim(), reason: reason.value.trim() }),
+      });
+      await refreshAfterCorrection();
+    } catch (failure) {
+      UI.setBusy(form, false);
+      error.textContent = failure.status === 409 ? 'Корректировка уже отменена. Обновите список.' : failure.message; error.hidden = false;
+    }
+  };
+  cell.append(form);
+  actor.value ? reason.focus() : actor.focus();
+}
+async function refreshAfterCorrection() {
+  await loadCorrections();
+  if (state.reportLoaded) await loadReport();
+}
+const correctionForm = $('correction-form');
+correctionForm.onsubmit = async (event) => {
+  event.preventDefault();
+  if (correctionForm.getAttribute('aria-busy') === 'true') return;
+  const f = correctionForm.elements;
+  showError('correction-error', null);
+  $('correction-result').textContent = '';
+  if (!state.status) { showError('correction-error', new Error('Часовой пояс рабочего места не загружен. Обновите страницу.')); return; }
+  const seconds = (value) => (value.length === 5 ? `${value}:00` : value);
+  const endDate = f.time_to.value <= f.time_from.value ? nextDay(f.date.value) : f.date.value;
+  const kind = f.kind.value;
+  const payload = {
+    employee_id: Number(f.employee_id.value),
+    started_at: `${f.date.value}T${seconds(f.time_from.value)}${offset()}`,
+    ended_at: `${endDate}T${seconds(f.time_to.value)}${offset()}`,
+    actor: f.actor.value.trim(), reason: f.reason.value.trim(),
+  };
+  // A retry of an unchanged form keeps its UUID, so a lost response replays safely.
+  const signature = JSON.stringify({ kind, payload });
+  if (correctionForm.pendingWrite?.signature !== signature) correctionForm.pendingWrite = { signature, request_id: UI.newRequestId() };
+  UI.setBusy(correctionForm, true);
+  try {
+    await api(`/api/attendance/corrections/${kind}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, request_id: correctionForm.pendingWrite.request_id }),
+    });
+    correctionForm.pendingWrite = null;
+    f.reason.value = '';
+    $('correction-result').textContent = kind === 'manual' ? 'Время добавлено.' : 'Время исключено.';
+    await refreshAfterCorrection();
+  } catch (error) {
+    showError('correction-error', error);
+  } finally {
+    UI.setBusy(correctionForm, false);
   }
 };
-$('refresh-all').onclick = () => {
-  loadEmployees(); loadStatus(); loadActive();
-  if (['events', 'review', 'legacy'].includes(state.tab)) loadPage(state.tab);
-};
+
+// ---------- tabs and startup ----------
+function tabChanged(name) {
+  state.tab = name;
+  if (name === 'now') loadActive();
+  else if (name === 'report' && !state.reportLoaded) loadReport();
+  else if (name === 'corrections') loadCorrections();
+}
 async function start() {
-  await loadEmployees();
-  const status = await loadStatus();
-  if (status) {
-    const report = fields($('report-filter'));
-    report.from_date.value = status.as_of.slice(0, 10);
-    report.to_date.value = status.as_of.slice(0, 10);
-  }
+  await Promise.all([loadEmployees(), loadStatus()]);
+  const report = $('report-filter').elements;
   const params = new URLSearchParams(location.search);
-  if (params.get('employee_id')) {
-    for (const form of ['events-filter', 'review-filter', 'legacy-filter', 'report-filter']) {
-      fields($(form)).employee_id.value = params.get('employee_id');
-    }
-  }
-  for (const name of ['from_date', 'to_date']) {
-    if (params.get(name)) {
-      for (const form of ['events-filter', 'review-filter', 'legacy-filter', 'report-filter']) {
-        fields($(form))[name].value = params.get(name);
-      }
-    }
-  }
-  if (params.get('kind')) fields($('review-filter')).kind.value = params.get('kind');
-  window.OperatorUI.tabs(document.querySelector('[role="tablist"]'), { onChange: tabChanged });
-  if (params.get('event_id')) openEvent(params.get('event_id'));
+  report.from_date.value = params.get('from_date') || `${today().slice(0, 8)}01`;
+  report.to_date.value = params.get('to_date') || today();
+  if (params.get('employee_id')) report.employee_id.value = params.get('employee_id');
+  correctionForm.elements.date.value = today();
+  UI.tabs(document.querySelector('[role="tablist"]'), { onChange: tabChanged });
 }
 start();
-// Poll only read-only summaries. Never replace review/manual/commission fields,
-// selected visitor rows, audit editors or report results while the operator types.
-setInterval(() => { loadStatus(); loadActive(); }, 5000);
+// Poll only read-only summaries, and only while visible; forms and report results are never replaced.
+setInterval(() => {
+  if (document.visibilityState !== 'visible') return;
+  loadStatus();
+  if (state.tab === 'now') loadActive();
+}, 10000);

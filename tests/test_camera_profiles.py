@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import FastAPI
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api import cameras as cameras_api
@@ -95,12 +96,13 @@ def camera_responses_carry_profile_and_attendance_state():
         assert [c["id"] for c in cameras] == [1, 2, 3]
         assert cameras[0]["profile"] == dict(
             workplace_id=None, workplace_name=None, workplace_active=None, zone="INTERIOR",
-            ai_enabled=True, ai_fps=None, revision=0)
+            ai_enabled=True, ai_fps=None, time_tracking=False, revision=0)
         assert cameras[0]["attendance"] == dict(enabled=False, role=None)
         saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
             expected_revision=0, workplace_id=1, zone="ENTRANCE", ai_fps=2.5))
         assert saved["profile"] == dict(workplace_id=1, workplace_name="Касса", workplace_active=True,
-                                        zone="ENTRANCE", ai_enabled=True, ai_fps=2.5, revision=1)
+                                        zone="ENTRANCE", ai_enabled=True, ai_fps=2.5, time_tracking=False,
+                                        revision=1)
 
 
 @test
@@ -114,7 +116,7 @@ def profile_save_is_compare_and_set_and_validates_every_field():
         f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=1, ai_enabled=False))
         assert profile(f, 1)["revision"] == 1
         for bad in (dict(ai_fps=0), dict(ai_fps=30.5), dict(zone="OUTSIDE"), dict(ai_enabled="yes"),
-                    dict(workplace_id=0), dict(extra=1)):
+                    dict(time_tracking="yes"), dict(time_tracking=None), dict(workplace_id=0), dict(extra=1)):
             f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=1, **bad), status=422)
         f.client.json("PUT", "/api/cameras/1/profile", dict(zone="ENTRANCE"), status=422)
         f.client.json("PUT", "/api/cameras/999/profile", dict(expected_revision=0, zone="ENTRANCE"), status=404)
@@ -138,7 +140,7 @@ def workplace_must_exist_and_be_active_unless_it_is_already_assigned():
 
 
 @test
-def enabled_attendance_blocks_leaving_entrances_or_switching_ai_off():
+def a_door_gate_never_locks_the_zone_or_ai_of_its_camera():
     with fixture() as f:
         f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=0, zone="ENTRANCE"))
         with Session(f.engine) as db:
@@ -147,31 +149,55 @@ def enabled_attendance_blocks_leaving_entrances_or_switching_ai_off():
             row.line_start, row.line_end, row.inside_point = [.2, .5], [.8, .5], [.5, .8]
             row.door_top, row.reference_width, row.reference_height = [[.2, .1], [.8, .1]], 640, 480
             db.commit()
-        for change in (dict(zone="INTERIOR"), dict(ai_enabled=False)):
-            f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=1, **change), status=409)
-        assert profile(f, 1)["revision"] == 1
+        saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
+            expected_revision=1, zone="INTERIOR", ai_enabled=False))["profile"]
+        assert (saved["zone"], saved["ai_enabled"], saved["revision"]) == ("INTERIOR", False, 2)
         assert f.client.json("GET", "/api/cameras/1")["attendance"] == dict(enabled=True, role="BOTH")
-        # Everything else stays editable.
-        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=1, workplace_id=1, ai_fps=4))
 
 
 @test
-def a_migrated_counting_camera_without_ai_can_still_be_saved_and_switched_on():
+def time_tracking_forces_ai_on_and_ai_off_forces_time_tracking_off():
     with fixture() as f:
-        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=0, zone="ENTRANCE", ai_enabled=False))
-        with Session(f.engine) as db:
-            row = db.get(AttendanceCamera, 1)
-            row.role, row.enabled, row.door_kind = "BOTH", True, "DOOR"
-            row.line_start, row.line_end, row.inside_point = [.2, .5], [.8, .5], [.5, .8]
-            row.door_top, row.reference_width, row.reference_height = [[.2, .1], [.8, .1]], 640, 480
-            db.commit()
-        # The legacy AI_CAMERAS upgrade can leave this state; unchanged fields must not block unrelated edits.
-        saved = f.client.json("PUT", "/api/cameras/1/profile", dict(
-            expected_revision=1, zone="ENTRANCE", ai_enabled=False, workplace_id=1))["profile"]
-        assert saved["workplace_id"] == 1 and saved["ai_enabled"] is False
-        assert f.client.json("PUT", "/api/cameras/1/profile", dict(
-            expected_revision=2, ai_enabled=True))["profile"]["ai_enabled"] is True
-        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=3, ai_enabled=False), status=409)
+        assert profile(f, 1)["time_tracking"] is False, "A new camera must be switched on explicitly"
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=0, ai_enabled=False))
+        on = f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=1, time_tracking=True))["profile"]
+        assert (on["ai_enabled"], on["time_tracking"], on["revision"]) == (True, True, 2)
+        # Repeating the same switch is not a change.
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=2, time_tracking=True))
+        assert profile(f, 1)["revision"] == 2
+        # One save, one revision, both switches.
+        off = f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=2, ai_enabled=False))["profile"]
+        assert (off["ai_enabled"], off["time_tracking"], off["revision"]) == (False, False, 3)
+        # Turning only time tracking off leaves AI running.
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=3, time_tracking=True))
+        kept = f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=4, time_tracking=False))["profile"]
+        assert (kept["ai_enabled"], kept["time_tracking"], kept["revision"]) == (True, False, 5)
+        # Unrelated edits keep the switch.
+        f.client.json("PUT", "/api/cameras/1/profile", dict(expected_revision=5, time_tracking=True))
+        other = f.client.json("PUT", "/api/cameras/1/profile", dict(
+            expected_revision=6, workplace_id=1, ai_fps=4))["profile"]
+        assert (other["time_tracking"], other["ai_enabled"], other["workplace_id"]) == (True, True, 1)
+        assert profile(f, 2)["time_tracking"] is False, "Only the saved camera changes"
+
+
+@test
+def the_database_refuses_time_tracking_without_ai():
+    with fixture() as f:
+        with f.engine.begin() as connection:
+            connection.exec_driver_sql("UPDATE camera_profiles SET time_tracking=1 WHERE camera_id=1")
+            connection.exec_driver_sql("UPDATE camera_profiles SET ai_enabled=0 WHERE camera_id=2")
+        for statement in ("UPDATE camera_profiles SET ai_enabled=0 WHERE camera_id=1",
+                          "UPDATE camera_profiles SET time_tracking=1 WHERE camera_id=2",
+                          "UPDATE camera_profiles SET time_tracking=2 WHERE camera_id=3"):
+            try:
+                with f.engine.begin() as connection:
+                    connection.exec_driver_sql(statement)
+            except IntegrityError:
+                pass
+            else:
+                raise AssertionError(f"Accepted: {statement}")
+        assert [(p["ai_enabled"], p["time_tracking"]) for p in map(lambda i: profile(f, i), (1, 2, 3))] == [
+            (True, True), (False, False), (True, False)]
 
 
 @test
@@ -218,12 +244,30 @@ def bulk_enable_and_disable_use_the_camera_update_path():
 
 
 @test
+def bulk_time_actions_follow_the_profile_rules_for_every_camera():
+    with fixture() as f:
+        f.client.json("POST", "/api/cameras/bulk", dict(camera_ids=[1], action="AI_OFF"))
+        result = f.client.json("POST", "/api/cameras/bulk", dict(camera_ids=[1, 2, 999], action="TIME_ON"))
+        assert [(r["camera_id"], r["ok"]) for r in result["results"]] == [(1, True), (2, True), (999, False)]
+        assert [(profile(f, i)["time_tracking"], profile(f, i)["ai_enabled"]) for i in (1, 2)] == [
+            (True, True), (True, True)]
+        f.client.json("POST", "/api/cameras/bulk", dict(camera_ids=[2], action="AI_OFF"))
+        assert (profile(f, 2)["ai_enabled"], profile(f, 2)["time_tracking"]) == (False, False)
+        f.client.json("POST", "/api/cameras/bulk", dict(camera_ids=[1, 3], action="TIME_OFF"))
+        assert (profile(f, 1)["time_tracking"], profile(f, 1)["ai_enabled"]) == (False, True)
+        assert profile(f, 3)["revision"] == 0, "Switching an already-off camera off is not a change"
+        listed = {c["id"]: c["profile"]["time_tracking"] for c in f.client.json("GET", "/api/cameras")}
+        assert listed == {1: False, 2: False, 3: False}
+
+
+@test
 def bulk_request_is_bounded_and_strictly_validated():
     with fixture() as f:
         for bad in (dict(camera_ids=[], action="AI_ON"), dict(camera_ids=[1, 1], action="AI_ON"),
                     dict(camera_ids=[0], action="AI_ON"), dict(camera_ids=list(range(1, 202)), action="AI_ON"),
                     dict(camera_ids=[1], action="DELETE"), dict(camera_ids=[1], action="ASSIGN_WORKPLACE"),
-                    dict(camera_ids=[1], action="AI_ON", workplace_id=1), dict(camera_ids=[1], action="AI_ON", extra=1)):
+                    dict(camera_ids=[1], action="AI_ON", workplace_id=1), dict(camera_ids=[1], action="AI_ON", extra=1),
+                    dict(camera_ids=[1], action="TIME_ON", workplace_id=1), dict(camera_ids=[1], action="TIME_OFF", extra=1)):
             f.client.json("POST", "/api/cameras/bulk", bad, status=422)
 
 

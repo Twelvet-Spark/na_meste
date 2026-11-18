@@ -34,7 +34,7 @@ PROJECTIONS = {
     "faces": (EmployeeFace, ("id", "employee_id", "embedding", "thumbnail", "created_at", "face_model_id", "alignment_id"), 150000),
     "assignments": (EmployeeWorkplace, ("employee_id", "workplace_id"), 100000),
     "scenes": (CameraScene, ("camera_id", "reference_width", "reference_height", "geometry"), 10000),
-    "profiles": (CameraProfile, ("camera_id", "workplace_id", "zone", "ai_enabled", "ai_fps"), 10000),
+    "profiles": (CameraProfile, ("camera_id", "workplace_id", "zone", "ai_enabled", "ai_fps", "time_tracking"), 10000),
 }
 
 
@@ -88,7 +88,7 @@ def _empty(connection):
 
 
 def _warnings(document, preparation):
-    warnings = ["TRANSFER_NO_HISTORY_OR_VIDEO", "TRANSFER_RECOMMISSION_REQUIRED"]
+    warnings = ["TRANSFER_NO_HISTORY_OR_VIDEO"]
     counts = {}
     for face in document.faces:
         counts[face.employee_id] = counts.get(face.employee_id, 0) + 1
@@ -201,7 +201,7 @@ class SetupTransferService:
 
     def export(self, password: str) -> bytes:
         try:
-            payload = {"transfer_version": 3, "exported_at": datetime.now(timezone.utc).isoformat(),
+            payload = {"transfer_version": 4, "exported_at": datetime.now(timezone.utc).isoformat(),
                        "attendance_schema_version": attendance_schema.SCHEMA_VERSION,
                        "operator_schema_version": operator_schema.VERSION,
                        "face_model_id": self.face_model_id, "embedding_encoding": "float32-le-512"}
@@ -285,9 +285,14 @@ class SetupTransferService:
                 profiles = {row.camera_id: row for row in getattr(document, "profiles", [])}
                 for row in document.cameras:
                     profile = profiles.get(row.id)
-                    values = profile.model_dump() if profile else dict(
-                        camera_id=row.id, workplace_id=None, ai_fps=None, ai_enabled=True,
-                        zone="ENTRANCE" if by_camera.get(row.id) and by_camera[row.id].role else "INTERIOR")
+                    if profile is not None:
+                        values = profile.model_dump()
+                        # Version 3 had no time tracking: every AI camera starts tracking time.
+                        values.setdefault("time_tracking", values["ai_enabled"])
+                    else:
+                        values = dict(
+                            camera_id=row.id, workplace_id=None, ai_fps=None, ai_enabled=True, time_tracking=True,
+                            zone="ENTRANCE" if by_camera.get(row.id) and by_camera[row.id].role else "INTERIOR")
                     db.add(CameraProfile(**values, revision=0))
                 for row in document.archives:
                     db.add(CameraArchive(**row.model_dump(), revision=0))

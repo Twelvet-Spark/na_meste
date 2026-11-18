@@ -11,8 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import AttendanceCamera, Camera, CameraProfile
-from test_attendance_lifecycle import Clock, FRAME, BufferedReader, worker_for
-from test_attendance_service import database
+from attendance_test_support import Clock, FRAME, BufferedReader, database, worker_for
 from test_multi_camera_worker import contexts, publish
 
 
@@ -22,7 +21,8 @@ def add_camera(engine, manager, camera_id):
                       username="test", password="test", channel=camera_id))
         db.flush()
         db.add_all([AttendanceCamera(camera_id=camera_id),
-                    CameraProfile(camera_id=camera_id, zone="INTERIOR", ai_enabled=True, revision=0)])
+                    CameraProfile(camera_id=camera_id, zone="INTERIOR", ai_enabled=True,
+                                  time_tracking=False, revision=0)])
     reader = BufferedReader()
     reader.source_revision = 1
     manager.readers[camera_id] = reader
@@ -31,7 +31,7 @@ def add_camera(engine, manager, camera_id):
 def test_repeated_failed_batches_cannot_restart_capacity_hysteresis():
     with database() as (engine, service):
         clock = Clock()
-        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        worker, manager, observations = worker_for(engine, service, clock)
         observations.y = .3
         a, b = contexts(clock)
         with a, b:
@@ -54,7 +54,7 @@ def test_repeated_failed_batches_cannot_restart_capacity_hysteresis():
 def test_reconnect_keeps_both_windows_until_expiry_but_analysis_removal_retires_them():
     with database() as (engine, service):
         clock = Clock()
-        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        worker, manager, observations = worker_for(engine, service, clock)
         observations.y = .3
         original = worker.service.process_batch
         slow_once = True
@@ -94,7 +94,7 @@ def test_reconnect_keeps_both_windows_until_expiry_but_analysis_removal_retires_
 def test_offline_and_cooldown_do_not_force_tight_polling_or_block_healthy_camera():
     with database() as (engine, service):
         clock = Clock()
-        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        worker, manager, observations = worker_for(engine, service, clock)
         add_camera(engine, manager, 3)
         observations.y = .3
         batches = []
@@ -127,7 +127,7 @@ def test_offline_and_cooldown_do_not_force_tight_polling_or_block_healthy_camera
 def test_source_frame_skips_are_not_missed_deadlines_and_restart_never_inflates_them():
     with database() as (engine, service):
         clock = Clock()
-        worker, manager, observations, _queue = worker_for(engine, service, clock)
+        worker, manager, observations = worker_for(engine, service, clock)
         with immediate_session(engine) as db:
             db.get(AttendanceCamera, 1).enabled = False
         observations.y = .3
@@ -154,7 +154,7 @@ def test_ten_and_thirty_cameras_with_nonzero_batch_cost_keep_due_service_fair():
         with database() as (engine, service):
             clock = Clock()
             with patch.object(settings, "ai_batch_size", 4):
-                worker, manager, observations, _queue = worker_for(engine, service, clock)
+                worker, manager, observations = worker_for(engine, service, clock)
             for camera_id in range(3, camera_count + 1):
                 add_camera(engine, manager, camera_id)
             observations.y = .3

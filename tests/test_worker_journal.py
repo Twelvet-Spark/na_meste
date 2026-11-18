@@ -16,13 +16,11 @@ from app.ai.global_tracker import GlobalIdentityManager
 from app.api import cameras
 from app.database.database import immediate_session
 from app.database.models import (
-    AttendanceCamera, AttendanceEvent, AttendanceRuntime, Camera, EmployeeFace,
-    FaceModelMetadata, GlobalPerson, HumanVisit, HumanVisitEvent, HumanJournalGap, WorkSession,
+    AttendanceCamera, AttendanceRuntime, Camera, DoorCrossing, EmployeeFace,
+    FaceModelMetadata, GlobalPerson, HumanVisit, HumanVisitEvent, HumanJournalGap,
 )
-from app.services.attendance_monitor import AttendanceMonitor
 from app.services.human_journal import HumanJournal
-from test_attendance_lifecycle import Clock, FRAME, worker_for
-from test_attendance_service import database
+from attendance_test_support import Clock, FRAME, database, worker_for
 from test_human_journal import idle
 from test_multi_camera_worker import contexts, publish
 from test_runtime_recovery import add_camera
@@ -50,7 +48,7 @@ class Body:
 def fixture(*, body=None, journal_options=None):
     with database() as (engine, attendance):
         clock = Clock()
-        worker, manager, detector, _queue = worker_for(engine, attendance, clock)
+        worker, manager, detector = worker_for(engine, attendance, clock)
         add_camera(engine, manager, 3)
         journal = HumanJournal(engine, now=clock.utcnow, monotonic=clock.monotonic,
                                **(journal_options or {}))
@@ -251,7 +249,6 @@ def test_saturated_generation_gap_recovers_once_before_new_tracking_admission():
             worker.step()
             generation = worker._journal_generations[3]
             assert journal.health_snapshot()['state'] == 'JOURNAL_DEGRADED'
-            assert any('JOURNAL_GAP' in fault.reason_codes for fault in attendance.health.pending_faults())
         idle(journal)
         worker.step()
         assert 3 not in worker._journal_generations
@@ -264,7 +261,7 @@ def test_saturated_generation_gap_recovers_once_before_new_tracking_admission():
         assert worker._journal_generations[3] != generation
 
 
-def test_monitor_purges_expired_visit_images_even_without_live_ai_worker():
+def test_journal_tick_purges_expired_visit_images_after_the_worker_flushed():
     with fixture() as (engine, attendance, clock, worker, manager, _detector, journal):
         publish(manager, clock, 3)
         worker.step()
@@ -272,8 +269,7 @@ def test_monitor_purges_expired_visit_images_even_without_live_ai_worker():
         worker.flush('AI_UNAVAILABLE')
         idle(journal)
         clock.advance(31 * 86400)
-        monitor = AttendanceMonitor(attendance, journal=journal, now=clock.utcnow, monotonic=clock.monotonic)
-        monitor.tick()
+        journal.tick(clock.utcnow())
         idle(journal)
         with Session(engine) as db:
             row = db.query(HumanVisit).one()
@@ -503,14 +499,18 @@ def face_failure_preserves_worker_journal(stage, *, warmup):
             assert view["people_count"] == 1, (
                 stage, camera_id, "optional face failure discarded a real person", view)
             track = view["tracks"][0]
-            assert track["employee_id"] is None and track["employee_name"] is None
+            # A face that was confirmed before the failure keeps naming its track; nobody else is named.
+            known = warmup == 3 and camera_id in previous
+            assert track["employee_id"] == (1 if known else None)
+            assert track["employee_name"] == ("Employee 1" if known else None)
             assert track["state"] == "unknown"
             assert "FACE_MODEL_UNAVAILABLE" in track["identity_reason_codes"]
             assert track["visit_id"] is not None
             baseline[camera_id] = (view["tracking_generation"], track["visit_id"])
             if camera_id in previous:
                 assert baseline[camera_id] == previous[camera_id], "Face failure reset person continuity"
-        assert "FACE_MODEL_UNAVAILABLE" in worker.health.snapshot()["technical_reasons"]
+        assert all("FACE_MODEL_UNAVAILABLE" in worker.state.camera(camera_id)["tracks"][0]["identity_reason_codes"]
+                   for camera_id in all_cameras)
         measurements = worker.inference_snapshot()
         assert all("AI_UNAVAILABLE" not in measurements[camera_id]["reason_codes"]
                    and measurements[camera_id]["processed_fps_10s"] > 0
@@ -529,7 +529,7 @@ def face_failure_preserves_worker_journal(stage, *, warmup):
         submit(all_cameras, advance=.1)
         assert (faces.failed_detection_calls, faces.failed_embedding_calls) == attempts
         for camera_id in (1, 2):
-            assert worker.state.camera(camera_id)["tracks"][0]["employee_id"] is None
+            assert worker.state.camera(camera_id)["tracks"][0]["employee_id"] == (1 if warmup == 3 else None)
 
         if warmup == 3:
             # The failure precedes the line while the previous confirmation is
@@ -538,12 +538,11 @@ def face_failure_preserves_worker_journal(stage, *, warmup):
             submit(all_cameras, advance=.2, y=.55)
             for _ in range(8):
                 submit(all_cameras, advance=.3, y=.65)
+            worker.presence.flush()
             with Session(engine) as db:
-                crossings = db.query(AttendanceEvent).filter_by(camera_id=1, direction="ENTRY").all()
-                assert crossings, "Anonymous person geometry disappeared with the face session"
-                assert all(row.status == "REVIEW" and row.raw["would_auto_accept"] is False
-                           for row in crossings), "Failed face work credited stale crossing proof"
-                assert db.query(WorkSession).count() == 0
+                crossings = db.query(DoorCrossing).filter_by(camera_id=1, direction="ENTRY").all()
+                assert [row.employee_id for row in crossings] == [1], (
+                    "The door crossing of the still-tracked person is credited to the track identity")
                 visits = db.query(HumanVisit).all()
                 assert len(visits) == 4
                 assert all(row.employee_id is None and row.ended_at is None
@@ -559,7 +558,8 @@ def face_failure_preserves_worker_journal(stage, *, warmup):
                 view = worker.state.camera(camera_id)
                 track = view["tracks"][0]
                 assert (view["tracking_generation"], track["visit_id"]) == baseline[camera_id]
-                assert track["employee_id"] == (1 if observation == 3 else None)
+                known = warmup == 3 and camera_id in previous
+                assert track["employee_id"] == (1 if known or observation == 3 else None)
                 assert "FACE_MODEL_UNAVAILABLE" not in track["identity_reason_codes"]
             with Session(engine) as db:
                 visits = db.query(HumanVisit).all()
@@ -572,7 +572,8 @@ def face_failure_preserves_worker_journal(stage, *, warmup):
                            for row in newly_unknown)
                 if observation < 3:
                     assert all(row.employee_id is None for row in visits)
-        assert "FACE_MODEL_UNAVAILABLE" not in worker.health.snapshot()["technical_reasons"]
+        assert all("FACE_MODEL_UNAVAILABLE" not in worker.state.camera(camera_id)["tracks"][0]["identity_reason_codes"]
+                   for camera_id in all_cameras)
         assert journal.health_snapshot()["state"] == "OK"
 
 

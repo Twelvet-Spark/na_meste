@@ -30,7 +30,7 @@ class ProductionReplayTests(unittest.TestCase):
         from app.ai.worker import AIWorker, DetectionState
         from app.database.attendance_schema import initialize_attendance_schema
         from app.database.models import Employee, FaceModelMetadata
-        from app.services.attendance_service import AttendanceService
+        from app.services.presence_recorder import PresenceRecorder
         from app.services.human_journal import HumanJournal
 
         checker = (np.indices((112, 112)).sum(axis=0) % 2 * 255).astype(np.uint8)
@@ -113,7 +113,7 @@ class ProductionReplayTests(unittest.TestCase):
             cleanup.callback(journal.close)
             state = DetectionState()
             runner.instrument_pipeline(service, state, journal, None, accounting)
-            worker = AIWorker(manager, service, AttendanceService(engine), state, journal=journal)
+            worker = AIWorker(manager, service, PresenceRecorder(engine), state, journal=journal)
             cleanup.callback(worker.stop)
             frame = np.zeros((200, 200, 3), np.uint8)
             frame.flags.writeable = False
@@ -145,8 +145,8 @@ class ProductionReplayTests(unittest.TestCase):
         from app.ai.worker import AIWorker, DetectionState
         from app.ai.global_tracker import GlobalIdentityManager
         from app.database.database import engine, init_db, SessionLocal
-        from app.database.models import HumanVisit, WorkSession
-        from app.services.attendance_service import AttendanceService
+        from app.database.models import DoorCrossing, HumanVisit, PresenceSegment
+        from app.services.presence_recorder import PresenceRecorder
         from app.services.human_journal import HumanJournal
 
         class Detector:
@@ -179,7 +179,8 @@ class ProductionReplayTests(unittest.TestCase):
         journal = HumanJournal(engine)
         body = Body()
         runner.instrument_pipeline(service, state, journal, body, accounting)
-        worker = AIWorker(manager, service, AttendanceService(engine), state, journal=journal,
+        presence = PresenceRecorder(engine)
+        worker = AIWorker(manager, service, presence, state, journal=journal,
                           reid=body, global_manager=GlobalIdentityManager())
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
         frame.flags.writeable = False
@@ -228,7 +229,9 @@ class ProductionReplayTests(unittest.TestCase):
                 visits = db.query(HumanVisit).all()
                 self.assertEqual(len(visits), 4)
                 self.assertTrue(all(visit.employee_id is None and visit.status == "CLOSED" for visit in visits))
-                self.assertEqual(db.query(WorkSession).count(), 0)
+                presence.flush()
+                self.assertEqual((db.query(PresenceSegment).count(), db.query(DoorCrossing).count()), (0, 0),
+                                 "Unidentified people must never become work time")
             with closing(sqlite3.connect(engine.url.database)) as db:
                 integrity = runner.journal_integrity(db, accounting.expected)
             self.assertEqual(integrity["status"], "PASS", integrity)

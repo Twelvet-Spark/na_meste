@@ -21,9 +21,9 @@ from app.ai.face_recognition import EmbeddingStore, normalized_embedding, stored
 from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
-    AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, Employee,
-    EmployeeFace, EmployeeWorkplace, GlobalPerson, OperatorRequest, PresenceSession,
-    WorkSession, Workplace, HumanVisit, HumanVisitEvent, FaceModelMetadata,
+    AttendanceRuntime, DoorCrossing, Employee, EmployeeFace, EmployeeWorkplace, GlobalPerson,
+    ManualPresenceInterval, OperatorRequest, PresenceExclusion, PresenceSegment,
+    Workplace, HumanVisit, HumanVisitEvent, FaceModelMetadata,
 )
 from app.services.attendance_evidence import encode_evidence
 from app.services.workplace_service import WorkplaceOut, replace_assignments, validate_assignments
@@ -239,7 +239,7 @@ def committed_request(db, request_id, digest, *, operation):
 
 def advance_gallery(db):
     db.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
-        gallery_revision=AttendanceRuntime.gallery_revision + 1, commission_id=None))
+        gallery_revision=AttendanceRuntime.gallery_revision + 1))
 
 
 def check_prepared_faces(db, employee_id, prepared_faces, model_id):
@@ -375,10 +375,10 @@ def delete_employee(db: Session, employee: Employee, *, has_pending=None):
             # this check and the durable-history query.
             if has_pending is not None and has_pending(employee_id):
                 raise HTTPException(409, "У сотрудника есть история; отключите активность вместо удаления")
-            history = (writer.query(PresenceSession.id).filter_by(employee_id=employee_id).first()
-                       or writer.query(AttendanceEmployeeReference.event_id).filter_by(employee_id=employee_id).first()
-                       or writer.query(WorkSession.entry_event_id).filter_by(employee_id=employee_id).first()
-                       or writer.query(AttendanceEvent.id).filter_by(employee_id=employee_id).first()
+            history = (writer.query(PresenceSegment.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(DoorCrossing.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(ManualPresenceInterval.id).filter_by(employee_id=employee_id).first()
+                       or writer.query(PresenceExclusion.id).filter_by(employee_id=employee_id).first()
                        or writer.query(HumanVisit.id).filter_by(employee_id=employee_id).first()
                        or writer.query(HumanVisitEvent.id).filter(
                            HumanVisitEvent.type == "IDENTIFIED",

@@ -28,8 +28,8 @@ def document():
     image = io.BytesIO()
     Image.new("RGB", (112, 112), "navy").save(image, "JPEG")
     return {
-        "transfer_version": 3, "exported_at": "2026-11-16T10:00:00+00:00",
-        "attendance_schema_version": 2, "operator_schema_version": 5,
+        "transfer_version": 4, "exported_at": "2026-11-16T10:00:00+00:00",
+        "attendance_schema_version": 3, "operator_schema_version": 6,
         "face_model_id": MODEL_ID, "embedding_encoding": "float32-le-512",
         "cameras": [{"id": 7, "name": "Магазин", "nvr_host": "127.0.0.1", "rtsp_port": 554,
                      "username": "viewer", "password": "sentinel-device-password", "channel": 2,
@@ -56,8 +56,17 @@ def document():
                                             "kind": "DOOR",
                                             "quad": [[0.4, 0.8], [0.6, 0.8], [0.6, 0.2], [0.4, 0.2]]}],
                                  "metric": None}}],
-        "profiles": [{"camera_id": 7, "workplace_id": 9, "zone": "ENTRANCE", "ai_enabled": True, "ai_fps": 2.5}],
+        "profiles": [{"camera_id": 7, "workplace_id": 9, "zone": "ENTRANCE", "ai_enabled": True,
+                      "ai_fps": 2.5, "time_tracking": True}],
     }
+
+
+def v3_document():
+    """The previous contract: profiles without time tracking."""
+    data = document()
+    data.update(transfer_version=3, attendance_schema_version=2, operator_schema_version=5)
+    del data["profiles"][0]["time_tracking"]
+    return data
 
 
 def v2_document():
@@ -134,7 +143,7 @@ def password_and_corruption_are_authenticated():
 
 @test
 def schema_model_and_unknown_fields_fail_closed():
-    for key, value in (("transfer_version", 4), ("operator_schema_version", 999),
+    for key, value in (("transfer_version", 5), ("operator_schema_version", 999),
                        ("attendance_schema_version", 999), ("face_model_id", "2" * 64),
                        ("embedding_encoding", "pickle"), ("videos", [])):
         data = document()
@@ -313,6 +322,37 @@ def v2_documents_keep_their_contract_and_have_no_profiles():
     data = v2_document()
     data["profiles"] = []
     refused(lambda: parse(data), "TRANSFER_INVALID")
+
+
+def refuses(data, code):
+    """Unlike refused(), accepting the document is a failure."""
+    try:
+        parse(data)
+    except transfer.TransferError as exc:
+        assert exc.code == code, exc.code
+        return
+    raise AssertionError("document was accepted")
+
+
+@test
+def v3_documents_keep_their_contract_and_time_tracking_is_required_from_v4():
+    restored = parse(v3_document())
+    assert restored.transfer_version == 3 and restored.counts().profiles == 1
+    assert not hasattr(restored.profiles[0], "time_tracking")
+    data = v3_document()
+    data["profiles"][0]["time_tracking"] = True
+    refuses(data, "TRANSFER_INVALID")
+    data = v3_document()
+    data.update(operator_schema_version=6)
+    refuses(data, "TRANSFER_INCOMPATIBLE")
+    data = document()
+    data["profiles"][0].pop("time_tracking")
+    refuses(data, "TRANSFER_INVALID")
+    data = document()
+    data["profiles"][0].update(ai_enabled=False)  # time tracking without AI is impossible
+    refuses(data, "TRANSFER_INVALID")
+    data["profiles"][0].update(time_tracking=False)
+    assert parse(data).profiles[0].time_tracking is False
 
 
 @test

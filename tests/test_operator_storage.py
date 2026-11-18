@@ -1,8 +1,10 @@
-"""Additive operator-v1/v2/v3/v4 storage contracts; isolated databases only.
+"""Additive operator-v1..v6 storage contracts; isolated databases only.
 
 Run: .venv/Scripts/python.exe tests/test_operator_storage.py
 All databases and backups are temporary. Legacy employees use pinned old DDL,
-never the expanded Employee ORM table. Attendance fixtures retain exact v1 DDL.
+never the expanded Employee ORM table. Attendance fixtures are built from the frozen
+v1/v2 DDL (`attendance_schema_frozen`), never from the live ORM, so an upgrade is
+always validated against the deployed predecessor.
 """
 import sqlite3
 import sys
@@ -20,11 +22,9 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.database import attendance_schema as schema
+from app.database import attendance_schema_frozen as frozen
 from app.database import operator_schema
 from app.database.database import Base
-from app.database.models import (
-    AttendanceEmployeeReference, AttendanceEvent, AttendanceRuntime, WorkSession,
-)
 
 TESTS = []
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
@@ -36,18 +36,40 @@ LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     updated_at DATETIME NOT NULL,
     PRIMARY KEY (id)
 )"""
+# ORM tables the pre-operator database already had; presence_sessions is pinned separately below.
 BASE_TABLES = frozenset({
-    "cameras", "employee_faces", "presence_sessions", "global_persons",
-    "global_observations", "global_events",
+    "cameras", "employee_faces", "global_persons", "global_observations", "global_events",
 })
+LEGACY_PRESENCE_DDL = (
+    """CREATE TABLE presence_sessions (
+    id INTEGER NOT NULL,
+    employee_id INTEGER NOT NULL,
+    camera_id INTEGER NOT NULL,
+    started_at DATETIME NOT NULL,
+    last_seen_at DATETIME NOT NULL,
+    ended_at DATETIME,
+    confidence FLOAT,
+    PRIMARY KEY (id),
+    FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE CASCADE,
+    FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE CASCADE
+)""",
+    "CREATE INDEX ix_presence_emp_cam_end ON presence_sessions (employee_id, camera_id, ended_at)",
+    "CREATE INDEX ix_presence_sessions_employee_id ON presence_sessions (employee_id)",
+    "CREATE INDEX ix_presence_sessions_camera_id ON presence_sessions (camera_id)",
+)
+# The CURRENT (v3) attendance tables. test_recordings snapshots exactly these.
 ATTENDANCE_TABLES = frozenset({
-    "attendance_cameras", "attendance_events", "attendance_evidence",
-    "attendance_decisions", "work_sessions", "attendance_coverage_gaps",
-    "attendance_runtime", "attendance_employee_references",
+    "attendance_cameras", "attendance_runtime", "attendance_presence_segments",
+    "attendance_door_crossings", "attendance_manual_intervals", "attendance_exclusions",
+})
+# History the v1/v2 -> v3 upgrade deletes (pinned independently of the implementation).
+DROPPED_TABLES = frozenset({
+    "presence_sessions", "attendance_events", "attendance_evidence", "attendance_decisions",
+    "work_sessions", "attendance_coverage_gaps", "attendance_employee_references",
     "attendance_commissions", "attendance_requests",
 })
-# Rebuilt by the attendance v1 -> v2 upgrade; every other attendance object must survive untouched.
-UNCHANGED_ATTENDANCE_TABLES = ATTENDANCE_TABLES - {"attendance_cameras", "attendance_runtime"}
+# Tables of a deployed attendance v1/v2 install.
+ATTENDANCE_V2_TABLES = (DROPPED_TABLES - {"presence_sessions"}) | {"attendance_cameras", "attendance_runtime"}
 OPERATOR_V1_TABLES = {"operator_schema", "workplaces", "employee_workplaces", "operator_requests"}
 OPERATOR_V2_TABLES = OPERATOR_V1_TABLES | {"camera_archives"}
 MEDIA_TABLES = {"recording_sessions", "recording_segments", "recording_connections", "recording_gaps"}
@@ -127,23 +149,55 @@ def database():
             engine.dispose()
 
 
-def legacy(engine, *, attendance=False, populated=True):
+def old_history(connection):
+    """Every kind of attendance v1/v2 history row, linked as deployed (commission <- runtime, decision -> event)."""
+    connection.exec_driver_sql(
+        "INSERT INTO attendance_commissions (id,request_id,actor,reason,created_at,"
+        "configuration_fingerprint,acceptance_record) "
+        "VALUES (1,'old-commission','Оператор','Приёмка',?,'{}','{}')", (STAMP,))
+    connection.exec_driver_sql("UPDATE attendance_runtime SET commission_id=1")
+    connection.exec_driver_sql(
+        "INSERT INTO attendance_requests (id,operation,payload,result,created_at) "
+        "VALUES ('old-decision','DECISION','{}','{}',?)", (STAMP,))
+    for identifier, status in (("old-entry", "ACCEPTED"), ("old-review", "REVIEW")):
+        connection.exec_driver_sql(
+            "INSERT INTO attendance_events (id,source_key,source,camera_id,camera_name,recorded_at,raw,"
+            "employee_id,employee_name,direction,occurred_at,status,revision,reason_codes,projection_reasons) "
+            "VALUES (?,?,'CAMERA',12,'Old door',?,'{\"version\":1,\"candidate_employee_ids\":[]}',41,"
+            "'Снимок события','ENTRY',?,?,0,'[]','[]')", (identifier, identifier, STAMP, STAMP, status))
+    connection.exec_driver_sql(
+        "INSERT INTO attendance_employee_references (event_id,employee_id,employee_name) "
+        "VALUES ('old-entry',41,'Снимок ссылки')")
+    connection.exec_driver_sql(
+        "INSERT INTO attendance_evidence (event_id,before_jpeg,expires_at) VALUES ('old-entry',x'ff',?)", (STAMP,))
+    connection.exec_driver_sql(
+        "INSERT INTO work_sessions (entry_event_id,employee_id,employee_name,started_at,status,reason_codes) "
+        "VALUES ('old-entry',41,'Снимок интервала',?,'OPEN','[]')", (STAMP,))
+    connection.exec_driver_sql(
+        "INSERT INTO attendance_coverage_gaps (id,singleton,started_at,reason_codes,source_fault_ids,"
+        "reviewed,revision) VALUES (1,1,?,'[\"FRAME_GAP\"]','[]',0,0)", (STAMP,))
+    connection.exec_driver_sql(
+        'INSERT INTO attendance_decisions (request_id,event_id,revision,actor,reason,"before","after",'
+        "created_at) VALUES ('old-decision','old-review',1,'Оператор','Посетитель','{}','{}',?)", (STAMP,))
+
+
+def legacy(engine, *, attendance=False, populated=True, attendance_version=1):
+    """Pre-operator database. `attendance` adds the frozen attendance v1 (or v2) catalog with history rows."""
     with engine.begin() as connection:
         connection.exec_driver_sql(LEGACY_EMPLOYEE_DDL)
         connection.exec_driver_sql("CREATE INDEX ix_employees_external_id ON employees (external_id)")
-        names = BASE_TABLES | (ATTENDANCE_TABLES if attendance else frozenset())
         Base.metadata.create_all(connection, tables=[table for table in Base.metadata.sorted_tables
-                                                     if table.name in names])
+                                                     if table.name in BASE_TABLES])
+        for ddl in LEGACY_PRESENCE_DDL:
+            connection.exec_driver_sql(ddl)
         if attendance:
-            # Metadata creates the current tables; deployed v1 had different cameras/runtime DDL.
-            for name in ("attendance_cameras", "attendance_runtime"):
-                connection.exec_driver_sql(f"DROP TABLE {name}")
-            connection.exec_driver_sql(schema._V1_ATTENDANCE_CAMERAS_DDL)
-            connection.exec_driver_sql(schema._V1_ROLE_INDEX_DDL)
-            connection.exec_driver_sql(schema._V1_ATTENDANCE_RUNTIME_DDL)
-            connection.exec_driver_sql(schema._ROLE_TRIGGER)
+            tables, indexes = ((frozen.V1_TABLES, frozen.V1_INDEXES) if attendance_version == 1
+                               else (frozen.V2_TABLES, frozen.V2_INDEXES))
+            for ddl in (*tables.values(), *indexes.values(), schema._ROLE_TRIGGER):
+                connection.exec_driver_sql(ddl)
             connection.exec_driver_sql(
-                "INSERT INTO attendance_runtime (id, schema_version, gallery_revision) VALUES (1, 1, 7)")
+                "INSERT INTO attendance_runtime (id, schema_version, gallery_revision) VALUES (1, ?, 7)",
+                (attendance_version,))
         if populated:
             connection.exec_driver_sql(
                 "INSERT INTO employees (id, name, external_id, active, created_at, updated_at) "
@@ -155,18 +209,8 @@ def legacy(engine, *, attendance=False, populated=True):
             connection.exec_driver_sql(
                 "INSERT INTO presence_sessions (id,employee_id,camera_id,started_at,last_seen_at) "
                 "VALUES (19,41,12,?,?)", (STAMP, STAMP))
-    if attendance and populated:
-        with Session(engine) as db:
-            db.add(AttendanceEvent(id="old-entry", source_key="old-entry", source="MANUAL",
-                                   employee_id=41, employee_name="Снимок события", direction="ENTRY",
-                                   occurred_at=STAMP, recorded_at=STAMP, status="ACCEPTED",
-                                   raw={"version": 1, "candidate_employee_ids": []}))
-            db.flush()
-            db.add(AttendanceEmployeeReference(event_id="old-entry", employee_id=41,
-                                               employee_name="Снимок ссылки"))
-            db.add(WorkSession(entry_event_id="old-entry", employee_id=41,
-                               employee_name="Снимок интервала", started_at=STAMP, status="OPEN"))
-            db.commit()
+            if attendance:
+                old_history(connection)
 
 
 def committed_v1(engine, *, populated=True):
@@ -282,8 +326,10 @@ def assert_operator_current(engine):
     tables = set(inspect(engine).get_table_names())
     assert OPERATOR_TABLES <= tables, f"Missing additive operator tables: {OPERATOR_TABLES - tables}"
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 5)]
-        assert connection.exec_driver_sql("SELECT schema_version FROM attendance_runtime").scalar_one() == 2
+        assert connection.exec_driver_sql("SELECT id,version FROM operator_schema").all() == [(1, 6)]
+        assert connection.exec_driver_sql("SELECT schema_version FROM attendance_runtime").scalar_one() == 3
+    assert ATTENDANCE_TABLES <= tables, f"Missing attendance tables: {ATTENDANCE_TABLES - tables}"
+    assert not DROPPED_TABLES & tables, f"Old history tables survived: {DROPPED_TABLES & tables}"
     columns = {column["name"]: column for column in inspect(engine).get_columns("employees")}
     assert {"first_name", "last_name", "revision"} <= columns.keys()
     assert columns["first_name"]["nullable"] and columns["last_name"]["nullable"]
@@ -316,13 +362,13 @@ def test_populated_legacy_upgrade_backs_up_once_and_preserves_ids_and_names():
         with closing(sqlite3.connect(backups[0])) as backup:
             assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             assert tuple(backup.iterdump()) == before
+            assert backup.execute("SELECT id,employee_id,camera_id FROM presence_sessions").fetchall() == [(19, 41, 12)]
         with engine.connect() as connection:
             assert connection.exec_driver_sql(
                 "SELECT id,name,external_id,first_name,last_name,revision FROM employees").all() == [
                     (41, "Не разбивать старое имя", "old-id", None, None, 0)]
             assert connection.exec_driver_sql(
-                "SELECT id,employee_id,camera_id,ended_at FROM presence_sessions").all() == [(19, 41, 12, None)]
-            assert connection.exec_driver_sql("SELECT count(*) FROM work_sessions").scalar_one() == 0
+                "SELECT id,schema_version,gallery_revision FROM attendance_runtime").all() == [(1, 3, 0)]
         installed = dump(engine)
         schema.initialize_attendance_schema(engine)
         assert dump(engine) == installed
@@ -330,37 +376,43 @@ def test_populated_legacy_upgrade_backs_up_once_and_preserves_ids_and_names():
 
 
 @test
-def test_attendance_v1_upgrade_preserves_exact_ddl_and_all_historical_snapshots():
+def test_attendance_v1_upgrade_drops_history_keeps_gallery_and_leaves_it_only_in_the_backup():
     with database() as (engine, root):
         legacy(engine, attendance=True)
-        attendance_sql = catalog(engine, UNCHANGED_ATTENDANCE_TABLES)
         before = dump(engine)
         schema.initialize_attendance_schema(engine)
         assert_operator_current(engine)
-        assert catalog(engine, UNCHANGED_ATTENDANCE_TABLES) == attendance_sql
-        with Session(engine) as db:
-            assert db.get(AttendanceEvent, "old-entry").employee_name == "Снимок события"
-            assert db.get(AttendanceEmployeeReference, ("old-entry", 41)).employee_name == "Снимок ссылки"
-            assert db.get(WorkSession, "old-entry").employee_name == "Снимок интервала"
-            assert db.get(AttendanceRuntime, 1).gallery_revision == 7
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT id,schema_version,gallery_revision FROM attendance_runtime").all() == [(1, 3, 7)]
+        assert [column["name"] for column in inspect(engine).get_columns("attendance_runtime")] == [
+            "id", "schema_version", "gallery_revision"], "Commission/monitor columns must not survive"
         backups = list((root / "backups").glob("*.db"))
-        assert len(backups) == 1, "Already installed attendance still needs a backup before operator DDL"
+        assert len(backups) == 1, "Already installed attendance still needs a backup before any DDL"
         with closing(sqlite3.connect(backups[0])) as backup:
             assert tuple(backup.iterdump()) == before
+            # The deleted history exists nowhere but in this backup.
+            assert backup.execute("SELECT employee_name FROM attendance_events WHERE id='old-entry'"
+                                  ).fetchall() == [("Снимок события",)]
+            assert backup.execute("SELECT employee_name FROM work_sessions").fetchall() == [("Снимок интервала",)]
 
 
 @test
-def test_fresh_and_legacy_installations_converge_on_version_four():
-    with database() as (fresh, root), database() as (upgraded, _other):
+def test_fresh_and_upgraded_installations_converge_on_the_current_versions():
+    with database() as (fresh, root), database() as (upgraded, _other), database() as (from_v5, _third):
         schema.initialize_attendance_schema(fresh)
         assert_operator_current(fresh)
         assert not list((root / "backups").glob("*.db"))
         legacy(upgraded, attendance=True, populated=False)
         schema.initialize_attendance_schema(upgraded)
         assert_operator_current(upgraded)
+        committed_v5(from_v5, populated=False)
+        schema.initialize_attendance_schema(from_v5)
+        assert_operator_current(from_v5)
         normalized = lambda engine: tuple((kind, name, table, schema._sql_key(sql or ""))
                                           for kind, name, table, sql in catalog(engine))
         assert normalized(fresh) == normalized(upgraded), "Fresh install must take the same pinned employee ALTER path"
+        assert normalized(fresh) == normalized(from_v5)
         before = dump(fresh)
         schema.initialize_attendance_schema(fresh)
         assert dump(fresh) == before
@@ -494,7 +546,7 @@ def test_bad_attendance_preflight_never_installs_operator_objects():
 def test_genuine_committed_v1_upgrades_only_additions_after_verified_backup():
     with database() as (engine, root):
         committed_v1(engine)
-        before, attendance_sql = dump(engine), catalog(engine, UNCHANGED_ATTENDANCE_TABLES)
+        before = dump(engine)
         v1_sql = catalog(engine, OPERATOR_V1_TABLES | {"employees"})
         attempted = []
 
@@ -514,7 +566,7 @@ def test_genuine_committed_v1_upgrades_only_additions_after_verified_backup():
             event.remove(engine, "before_cursor_execute", observe_archive_ddl)
         assert attempted, "Committed v1 must be explicitly migrated, not silently treated as latest"
         assert_operator_current(engine)
-        assert catalog(engine, UNCHANGED_ATTENDANCE_TABLES) == attendance_sql
+        assert not DROPPED_TABLES & set(inspect(engine).get_table_names())
         assert catalog(engine, OPERATOR_V1_TABLES | {"employees"}) == v1_sql
         with engine.connect() as connection:
             assert connection.exec_driver_sql("SELECT * FROM employee_workplaces").all() == [(41, 7)]
@@ -604,7 +656,7 @@ def test_committed_v2_upgrades_media_after_backup_without_rewriting_predecessors
     with database() as (engine, root):
         committed_v2(engine)
         before = dump(engine)
-        old_sql = catalog(engine, UNCHANGED_ATTENDANCE_TABLES | OPERATOR_V2_TABLES | {"employees"})
+        old_sql = catalog(engine, OPERATOR_V2_TABLES | {"employees"})
         attempted = []
 
         def observe(connection, cursor, statement, parameters, context, executemany):
@@ -623,7 +675,7 @@ def test_committed_v2_upgrades_media_after_backup_without_rewriting_predecessors
             event.remove(engine, "before_cursor_execute", observe)
         assert_operator_current(engine)
         assert len(attempted) == 4
-        assert catalog(engine, UNCHANGED_ATTENDANCE_TABLES | OPERATOR_V2_TABLES | {"employees"}) == old_sql
+        assert catalog(engine, OPERATOR_V2_TABLES | {"employees"}) == old_sql
         with engine.connect() as connection:
             assert connection.exec_driver_sql(
                 "SELECT camera_id,http_scheme,http_port,utc_offset_minutes,revision FROM camera_archives"
@@ -708,11 +760,12 @@ def test_v3_upgrade_backs_up_before_v4_and_preserves_existing_ddl():
     with database() as (engine, root):
         committed_v3(engine)
         before = dump(engine)
-        rebuilt = V4_TABLES | {"attendance_cameras", "attendance_runtime"}
-        old_sql = tuple(row for row in catalog(engine) if row[2] not in rebuilt)
+        # Everything the work-time upgrade or the v4/v5/v6 operator steps rebuild, drop or add.
+        changed = V4_TABLES | ATTENDANCE_TABLES | ATTENDANCE_V2_TABLES | DROPPED_TABLES | {"camera_profiles"}
+        old_sql = tuple(row for row in catalog(engine) if row[2] not in changed)
         schema.initialize_attendance_schema(engine)
         assert_operator_current(engine)
-        assert tuple(row for row in catalog(engine) if row[2] not in rebuilt | {"camera_profiles"}) == old_sql
+        assert tuple(row for row in catalog(engine) if row[2] not in changed) == old_sql
         backups = list((root / "backups").glob("*.db"))
         assert len(backups) == 1
         with closing(sqlite3.connect(backups[0])) as backup:
@@ -849,16 +902,129 @@ def test_v4_upgrade_turns_retired_ai_cameras_into_profiles_and_upgrades_scenes()
             assert_operator_current(engine)
             with engine.connect() as connection:
                 rows = connection.exec_driver_sql(
-                    "SELECT camera_id, workplace_id, zone, ai_enabled, ai_fps, revision FROM camera_profiles "
-                    "ORDER BY camera_id").all()
-                assert rows == [(12, None, "ENTRANCE", expected[12], None, 0),
-                                (13, None, "INTERIOR", expected[13], None, 0),
-                                (14, None, "INTERIOR", expected[14], None, 0)], rows
+                    "SELECT camera_id, workplace_id, zone, ai_enabled, ai_fps, time_tracking, revision "
+                    "FROM camera_profiles ORDER BY camera_id").all()
+                # Cameras that already ran AI start tracking time.
+                assert rows == [(12, None, "ENTRANCE", expected[12], None, expected[12], 0),
+                                (13, None, "INTERIOR", expected[13], None, expected[13], 0),
+                                (14, None, "INTERIOR", expected[14], None, expected[14], 0)], rows
+                assert connection.exec_driver_sql(
+                    "SELECT camera_id, role FROM attendance_cameras WHERE camera_id=12").all() == [(12, "ENTRY")]
                 geometry = connection.exec_driver_sql("SELECT geometry FROM camera_scenes").scalar_one()
                 assert json.loads(geometry) == {"version": 2, "floor": None, "objects": [], "metric": None,
                                                 "doors": []}
                 assert connection.exec_driver_sql(
                     "SELECT revision, source_revision FROM camera_scenes").one() == (2, 1)
+
+
+def committed_v5(engine, *, populated=True):
+    """Operator v5 on attendance v2: the last deployed state before all-camera work-time tracking."""
+    legacy(engine, attendance=True, populated=populated, attendance_version=2)
+    with engine.begin() as connection:
+        for addition in COMMITTED_V1_ADDITIONS:
+            connection.exec_driver_sql(f"ALTER TABLE employees ADD COLUMN {addition}")
+        for ddl in (*operator_schema.V5_TABLES.values(), *operator_schema.V5_INDEXES.values()):
+            connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql("INSERT INTO operator_schema (id,version,updated_at) VALUES (1,5,?)", (STAMP,))
+        if populated:
+            connection.exec_driver_sql(
+                "INSERT INTO workplaces (id,name,name_key,active) VALUES (7,'Магазин','магазин',1)")
+            connection.exec_driver_sql(
+                "INSERT INTO cameras (id,name,nvr_host,rtsp_port,username,password,channel,"
+                "stream_type,enabled,created_at,updated_at) VALUES "
+                "(13,'Hall','unused',554,'user','secret',2,'main',1,?,?)", (STAMP, STAMP))
+            connection.exec_driver_sql(
+                "INSERT INTO attendance_cameras (camera_id,role,enabled,revision,source_revision,line_start,"
+                "line_end,inside_point,door_kind,door_top,reference_width,reference_height,updated_at) VALUES "
+                "(12,'BOTH',1,3,2,'[0.2, 0.8]','[0.6, 0.8]','[0.4, 0.95]','DOOR','[[0.2, 0.1], [0.6, 0.1]]',"
+                "1000,500,?), (13,NULL,0,0,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?)", (STAMP, STAMP))
+            connection.exec_driver_sql(
+                "INSERT INTO camera_profiles (camera_id,workplace_id,zone,ai_enabled,ai_fps,revision,updated_at) "
+                "VALUES (12,7,'ENTRANCE',1,2.5,3,?), (13,NULL,'INTERIOR',0,NULL,0,?)", (STAMP, STAMP))
+
+
+@test
+def test_committed_v5_upgrade_tracks_time_where_ai_ran_and_drops_history_after_verified_backup():
+    with database() as (engine, root):
+        committed_v5(engine)
+        before = dump(engine)
+        gates_sql = catalog(engine, {"attendance_cameras"})
+        with engine.connect() as connection:
+            gates = connection.exec_driver_sql("SELECT * FROM attendance_cameras ORDER BY camera_id").all()
+        checked = []
+
+        def observe(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith(("CREATE TABLE", "DROP TABLE")):
+                backups = list((root / "backups").glob("*.db"))
+                assert len(backups) == 1, "Backup must precede every upgrade DDL statement"
+                with closing(sqlite3.connect(backups[0])) as backup:
+                    assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                    assert tuple(backup.iterdump()) == before
+                checked.append(statement.lstrip().split("(")[0].strip())
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            schema.initialize_attendance_schema(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert "DROP TABLE attendance_events" in checked and "DROP TABLE attendance_commissions" in checked
+        assert_operator_current(engine)
+        # v2 -> v3 keeps the door gates byte for byte; only history and runtime columns change.
+        assert catalog(engine, {"attendance_cameras"}) == gates_sql
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT * FROM attendance_cameras ORDER BY camera_id").all() == gates
+            assert connection.exec_driver_sql(
+                "SELECT id,schema_version,gallery_revision FROM attendance_runtime").all() == [(1, 3, 7)]
+            assert connection.exec_driver_sql(
+                "SELECT camera_id,workplace_id,zone,ai_enabled,ai_fps,time_tracking,revision "
+                "FROM camera_profiles ORDER BY camera_id").all() == [
+                    (12, 7, "ENTRANCE", 1, 2.5, 1, 3), (13, None, "INTERIOR", 0, None, 0, 0)]
+            assert connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE name='ix_camera_profiles_workplace'").all() == [
+                    ("ix_camera_profiles_workplace",)]
+        backups = list((root / "backups").glob("*.db"))
+        with closing(sqlite3.connect(backups[0])) as backup:
+            assert backup.execute("SELECT count(*) FROM attendance_events").fetchone() == (2,)
+            assert backup.execute("SELECT count(*) FROM presence_sessions").fetchone() == (1,)
+        installed = dump(engine)
+        schema.initialize_attendance_schema(engine)
+        assert dump(engine) == installed and len(list((root / "backups").glob("*.db"))) == 1
+
+
+@test
+def test_work_time_upgrade_failure_rolls_back_dropped_history_and_retry_converges():
+    with database() as (engine, root):
+        committed_v5(engine)
+        before, attempted = dump(engine), []
+
+        def fail(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("DROP TABLE ATTENDANCE_COMMISSIONS"):
+                attempted.append(statement)
+                raise OperationalError(statement, parameters, RuntimeError("injected last-step failure"))
+
+        event.listen(engine, "before_cursor_execute", fail)
+        try:
+            try:
+                schema.initialize_attendance_schema(engine)
+            except OperationalError:
+                pass
+            else:
+                raise AssertionError("The upgrade never reached its last step")
+        finally:
+            event.remove(engine, "before_cursor_execute", fail)
+        assert attempted
+        assert dump(engine) == before, "History dropped before the failure must come back"
+        assert len(list((root / "backups").glob("*.db"))) == 1
+        schema.initialize_attendance_schema(engine)
+        assert_operator_current(engine)
+
+
+@test
+def test_committed_v5_failed_backup_refuses_before_any_history_is_dropped():
+    with database() as (engine, root):
+        committed_v5(engine)
+        (root / "backups").write_text("not a directory", encoding="utf-8")
+        refused_without_mutation(engine)
 
 
 if __name__ == "__main__":

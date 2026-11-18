@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
-from app.services.attendance_health import PROVIDER_KEYS
+from app.ai.providers import PROVIDER_KEYS
 
 SAFE_CODES = frozenset({
     "OPERATOR_SETTINGS_SAVED", "OPERATOR_EVENT", "RUNTIME_WARNING", "UNEXPECTED_ERROR",
@@ -21,7 +21,7 @@ SAFE_CODES = frozenset({
     "MEDIA_DATABASE_UNAVAILABLE", "MEDIA_LAUNCH_FAILED", "MEDIA_PROCESS_FAILED", "MEDIA_STOP_PENDING",
     "MEDIA_SHUTTING_DOWN", "MEDIA_STORAGE_CLOSED", "STORAGE_FULL", "SOURCE_CHANGED", "CAMERA_DISABLED",
     "CAMERA_NOT_FOUND", "CAMERA_OFFLINE", "CAMERA_UNCONFIGURED", "AI_UNAVAILABLE", "AI_EXCLUDED",
-    "COMMISSIONING_REQUIRED", "CLOCK_DISCONTINUITY", "FRAME_GAP", "PERFORMANCE_DEGRADED",
+    "FRAME_GAP", "PERFORMANCE_DEGRADED",
     "PERFORMANCE_WARMUP", "PERSISTENCE_ERROR", "APPLICATION_SHUTDOWN", "APPLICATION_RESTART",
     "DEVICE_AUTH_FAILED", "DEVICE_UNREACHABLE", "DEVICE_TIMEOUT", "DEVICE_TLS_FAILED",
     "DEVICE_PROTOCOL_ERROR", "ARCHIVE_UNSUPPORTED", "ARCHIVE_NOT_CONFIGURED", "SEARCH_LIMIT",
@@ -236,25 +236,30 @@ class DiagnosticsService:
         except Exception:
             return {**fallback, "error_code": "DIAGNOSTICS_UNAVAILABLE"}
 
-    def _attendance(self):
-        health = self.state.attendance.health.snapshot()
-        reasons = [safe_code(item) for item in health.get("reasons", [])]
-        cameras = []
-        for row in health.get("cameras", []):
-            if not isinstance(row, dict) or row.get("role") not in ("ENTRY", "EXIT", "BOTH"):
-                continue
-            item = {key: number(row.get(key)) for key in (
-                "camera_id", "source_revision", "processed_fps", "frame_age_seconds",
-                "processing_age_p95_seconds", "completion_age_p95_seconds")}
-            item["role"] = row["role"]
-            item["reasons"] = [safe_code(reason) for reason in row.get("reasons", [])]
-            cameras.append(item)
-        return {"technical_ready": health.get("technical_ready") is True,
-                "automatic_ready": health.get("automatic_ready") is True,
-                "reasons": reasons, "cameras": cameras,
-                "pending_fault_count": number(health.get("pending_fault_count"), integer=True),
-                "pending_write_count": number(health.get("pending_write_count"), integer=True),
-                "providers": provider_summary(health.get("providers")), "error_code": None}
+    def _time_tracking(self):
+        from sqlalchemy.orm import Session
+        from app.database.models import Camera, CameraProfile
+        with Session(self.engine) as db:
+            rows = db.query(Camera.id, CameraProfile.time_tracking).outerjoin(
+                CameraProfile, CameraProfile.camera_id == Camera.id).all()
+        manager = getattr(self.state, "manager", None)
+        tracked = [camera_id for camera_id, flag in rows if flag]
+        online = sum(1 for camera_id in tracked
+                     if manager is not None and manager.status(camera_id).get("status") == "ONLINE")
+        store = getattr(self.state, "embedding_store", None)
+        worker = getattr(self.state, "ai_worker", None)
+        presence = getattr(self.state, "presence", None)
+        raw = presence.snapshot() if presence is not None else {}
+        error = raw.get("last_error")
+        return {"cameras": len(rows), "time_tracking_cameras": len(tracked), "time_tracking_online": online,
+                "face_available": store is not None,
+                "appearance_available": worker is not None and getattr(worker, "reid", None) is not None,
+                "recorder": {"open_segments": number(raw.get("open_segments"), integer=True),
+                             "pending_crossings": number(raw.get("pending_crossings"), integer=True),
+                             "dropped_crossings": number(raw.get("dropped_crossings"), integer=True),
+                             "last_flush_at": timestamp(raw.get("last_flush_at")),
+                             "last_error": safe_code(error) if error else None},
+                "error_code": None}
 
     def _models(self):
         """Project startup state only: no paths, provenance URLs or biometrics."""
@@ -434,8 +439,12 @@ class DiagnosticsService:
         return result
 
     def status(self):
-        attendance = self._isolated(self._attendance, {"automatic_ready": False, "technical_ready": False,
-            "reasons": ["DIAGNOSTICS_UNAVAILABLE"], "providers": provider_summary({}), "cameras": []})
+        time_tracking = self._isolated(self._time_tracking, {
+            "cameras": 0, "time_tracking_cameras": 0, "time_tracking_online": 0, "face_available": False,
+            "appearance_available": False,
+            "recorder": {"open_segments": None, "pending_crossings": None, "dropped_crossings": None,
+                         "last_flush_at": None, "last_error": None}})
+        startup_error = getattr(self.state, "ai_startup_error", None)
         def tools():
             manager = self.state.manager
             return {"ffmpeg_available": bool(manager.ffmpeg), "ffprobe_available": bool(manager.ffprobe)}
@@ -448,12 +457,13 @@ class DiagnosticsService:
             archive = dict(self._archive)
         return {"updated_at": now_iso(),
                 "tools": self._isolated(tools, {"ffmpeg_available": False, "ffprobe_available": False}),
-                "ai": {"enabled": self.active.ai_enabled, "providers": attendance["providers"],
-                       "error_code": attendance.get("error_code")},
+                "ai": {"enabled": self.active.ai_enabled,
+                       "providers": provider_summary(getattr(self.state, "ai_providers", None)),
+                       "error_code": safe_code(startup_error) if startup_error else None},
                 "models": self._isolated(self._models, {"bundle_id": None, "face_model_id": None,
                     "alignment_id": None, "component_status": {}, "gallery_migration": None,
                     "legacy_model_settings_ignored": [], "legacy_model_settings_code": None}),
-                "attendance": attendance, "cameras": cameras, "camera_error": camera_error,
+                "time_tracking": time_tracking, "cameras": cameras, "camera_error": camera_error,
                 "journal": self._isolated(self._journal, {"state": "UNAVAILABLE", "error_code": "DIAGNOSTICS_UNAVAILABLE"}),
                 "scene": self._isolated(self._scene, {"model_available": False, "error_code": "DIAGNOSTICS_UNAVAILABLE"}),
                 "recordings": self._isolated(self._recordings, {"sessions": [], "storage": None}),

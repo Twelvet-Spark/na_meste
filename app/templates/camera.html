@@ -55,7 +55,7 @@
           <label><input type="radio" name="camera-stream" value="main" disabled>Основной</label>
           <label><input type="radio" name="camera-stream" value="sub" disabled>Дополнительный</label>
         </div>
-        <p class="muted small">Смена потока отключает учёт и требует новой разметки прохода.</p>
+        <p class="muted small">Смена потока отключает разметку прохода. Проверьте её заново; учёт появлений продолжается.</p>
       </fieldset>
       <form id="camera-profile-form">
         <div class="scene-edit-controls">
@@ -67,12 +67,12 @@
             </div>
           </fieldset>
         </div>
-        <p id="camera-zone-help" class="muted small"></p>
         <div class="scene-edit-controls">
           <label class="checkbox-field"><input id="camera-ai-enabled" type="checkbox" role="switch" disabled>AI-анализ</label>
+          <label class="checkbox-field"><input id="camera-time-tracking" type="checkbox" role="switch" aria-describedby="camera-time-help" disabled>Учёт времени</label>
           <label class="field">Частота AI, к/с<input id="camera-ai-fps" type="number" min="0.5" max="30" step="any" placeholder="по умолчанию" aria-describedby="camera-fps-help" disabled></label>
         </div>
-        <p id="camera-ai-help" class="muted small"></p>
+        <p id="camera-time-help" class="muted small">Сотрудники, которых узнаёт эта камера, считаются на месте. Включает AI.</p>
         <p id="camera-fps-help" class="muted small">Пустое поле — общая частота AI.</p>
         <button id="camera-profile-save" class="btn primary" type="submit" disabled>Сохранить настройки</button>
       </form>
@@ -126,9 +126,8 @@
       <p class="muted">Разметьте видимый пол, предметы и проходы на неподвижном кадре. Распознавание создаёт только черновик для проверки; скрытый за мебелью пол не восстанавливается.</p>
       <div id="mapping-mode-tabs" class="tabs" role="tablist" aria-label="Режим разметки">
         <button id="mapping-mode-scene" type="button" role="tab" data-tab="scene" aria-controls="mapping-scene-panel" aria-selected="true">Сцена</button>
-        <button id="mapping-mode-gate" type="button" role="tab" data-tab="gate" aria-controls="mapping-gate-panel" aria-selected="false" tabindex="-1" disabled>Проход учёта</button>
+        <button id="mapping-mode-gate" type="button" role="tab" data-tab="gate" aria-controls="mapping-gate-panel" aria-selected="false" tabindex="-1">Проход учёта</button>
       </div>
-      <p id="mapping-entrance-help" class="muted small">Отнесите камеру к входам на вкладке <a href="#overview">«Обзор»</a></p>
       <div class="calibration-actions">
         <button id="calibration-freeze" class="btn" type="button">Зафиксировать свежий кадр</button>
         <button id="scene-analysis" class="btn primary" type="button" aria-describedby="scene-analysis-help" disabled>Распознать сцену</button>
@@ -228,7 +227,7 @@
         <div class="calibration-actions"><button id="scene-save" class="btn primary" type="button" disabled>Сохранить сцену</button></div>
         <div id="scene-analysis-results" class="scene-analysis-results" aria-label="Результаты распознавания"></div>
       </div>
-      <p id="scene-draft-status" class="muted small" role="status">Сцена не изменена. Сохранение сцены не сохраняет проход учёта и не меняет наладку.</p>
+      <p id="scene-draft-status" class="muted small" role="status">Сцена не изменена. Сохранение сцены не сохраняет проход.</p>
       <p id="scene-message" class="test-result" role="status" aria-live="polite" hidden></p>
       <div id="mapping-gate-panel" role="tabpanel" aria-labelledby="mapping-mode-gate" hidden>
         <h3>Проход учёта</h3>
@@ -241,10 +240,10 @@
             <label class="field">Что считать<select id="calibration-role" required><option value="BOTH">Вход и выход</option><option value="ENTRY">Только вход</option><option value="EXIT">Только выход</option></select></label>
             <label class="field">Тип прохода<select id="calibration-kind"><option value="DOOR">Дверь</option><option value="PASSAGE">Открытый проход (лестница, коридор)</option></select></label>
             <label class="field">Взять из сцены<select id="calibration-scene-door"><option value="">Выберите дверь или проход</option></select></label>
-            <label class="checkbox-field"><input id="calibration-enabled" type="checkbox">Включить учёт по этой камере</label>
+            <label class="checkbox-field"><input id="calibration-enabled" type="checkbox">Учитывать проходы через эту дверь</label>
           </div>
           <div class="calibration-actions"><button id="calibration-flip" class="btn" type="button">Поменять «внутри» и «снаружи»</button></div>
-          <p class="muted small">Порог и расстояние от него до внутренней точки — не меньше 0,05. Ноги должны быть видны по обе стороны. Если камеру передвинули, выполните разметку и наладку заново.</p>
+          <p class="muted small">Порог и расстояние от него до внутренней точки — не меньше 0,05. Ноги должны быть видны по обе стороны. Если камеру передвинули, разметьте проход заново.</p>
           <div class="calibration-actions">
             <button id="calibration-save" class="btn primary" type="submit" disabled>Сохранить проход учёта</button>
             <button id="calibration-clear" class="btn" type="button" disabled>Разметить проход заново</button>
@@ -252,7 +251,7 @@
           </div>
         </form>
         <p id="calibration-message" class="test-result" role="status" aria-live="polite" hidden></p>
-        <p class="muted small">Один проход должен считать ровно один ракурс камеры. Две камеры на одном проходе создадут дубли событий для ручной проверки. Назначенную роль нельзя стереть, но можно менять между входом и выходом или отключить учёт. Разметка не заменяет наладку. <a href="/presence">История и ручная проверка</a>.</p>
+        <p class="muted small">Проходы уточняют рабочее время: выход и последующий вход через дверь не считаются рабочим временем. Время считается и без проходов — по всем камерам с «Учётом времени». Одну дверь должна размечать одна камера.</p>
       </div>
     </section>
     </div>

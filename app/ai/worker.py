@@ -1,17 +1,16 @@
-"""Single inference owner: recognition → doorway → durable attendance → optional Re-ID.
+"""Single inference owner: recognition → doorway → presence → optional Re-ID.
 
-Only this thread mutates local trajectories. The monitor consumes immutable FIFO
-records and health notifications, never trackers. Reader publication remains the
-transaction-captured CameraSource interface.
+Only this thread mutates local trajectories and track identities. Presence and door
+crossings go to the in-memory PresenceRecorder; the flusher thread owns the database.
+Reader publication remains the transaction-captured CameraSource interface.
 """
 import logging
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
-from uuid import uuid4
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +18,7 @@ from PIL import Image
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.doorway import DoorwayCalibration, DoorwayDetector
+from app.ai.employee_appearance import LEARN_FACE_SECONDS, REID_VOTES, EmployeeAppearanceGallery
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.model_bundle import ModelBundle
@@ -27,15 +27,13 @@ from app.ai.recognition_service import RecognitionInput, RecognitionService
 from app.ai.global_tracker import EmbeddingItem
 from app.ai.scheduler import DeadlineScheduler
 from app.ai.inference_metrics import InferenceMetrics
+from app.attendance_types import milliseconds
 from app.config import BASE_DIR, settings
-from app.database.database import publication_guard
+from app.database.database import publication_guard, read_snapshot
 from app.database.models import AttendanceCamera, AttendanceRuntime, Camera, CameraProfile
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus
-from app.services.attendance_health import CoverageFault
-from app.services.attendance_monitor import AttendanceWriteQueue
-from app.services.attendance_queries import read_snapshot
-from app.time_utils import utcnow
+from app.time_utils import local_date, utcnow
 
 logger = logging.getLogger("app.ai.worker")
 
@@ -47,21 +45,25 @@ class DetectionState:
         self._lock = threading.Lock()
         self._data: dict[int, dict] = {}
 
-    def update(self, camera_id: int, detections, *, packet=None, generation=None, configuration=None) -> None:
-        tracks = [
-            {
+    def update(self, camera_id: int, detections, *, packet=None, generation=None, configuration=None,
+               identities: dict[int, tuple[int, str, str | None]] | None = None) -> None:
+        """`identities` maps track_id to (employee_id, source, name) for tracks whose employee is known."""
+        identities = identities or {}
+        tracks = []
+        for d in detections:
+            employee_id, source, name = identities.get(d.track_id, (d.employee_id, None, d.employee_name))
+            tracks.append({
                 "track_id": d.track_id,
-                "employee_id": d.employee_id,
-                "employee_name": d.employee_name,
+                "employee_id": employee_id,
+                "employee_name": name,
+                "identity_source": source or None,
                 "confidence": d.confidence,
                 "bbox": list(d.bbox),
                 "state": d.state,
                 "global_id": d.global_id,
                 "identity_reason_codes": list(d.identity_reason_codes),
                 "visit_id": d.visit_id,
-            }
-            for d in detections
-        ]
+            })
         with self._lock:
             self._data[camera_id] = {
                 "camera_id": camera_id,
@@ -126,6 +128,8 @@ class _CameraConfiguration:
     ai_enabled: bool
     # Changing the AI rate must neither reset a camera nor discard in-flight frames.
     ai_fps: float | None = field(default=None, compare=False)
+    # Toggling time tracking must not reset a camera either.
+    time_tracking: bool = field(default=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -151,11 +155,40 @@ class _AppearanceWork:
     aspect: float
     crop_quality: float
     employee_id: int | None
+    learn_employee_id: int | None
     config: _CameraConfiguration
     epoch: int
     gallery_revision: int | None
     reader_token: int
     crop: np.ndarray
+
+
+@dataclass(slots=True)
+class _TrackIdentity:
+    """Employee a local track is known as: sticky face identity, else a same-day appearance match."""
+    employee_id: int | None = None
+    source: str | None = None  # "FACE" | "REID"
+    last_face_mono: float | None = None
+    last_face_day: date | None = None
+    reid_candidate: int | None = None
+    reid_votes: int = 0
+    reid_day: date | None = None
+
+    def clear(self) -> None:
+        self.employee_id = self.source = self.last_face_mono = self.reid_candidate = None
+        self.reid_votes = 0
+        self.last_face_day = self.reid_day = None
+
+    def roll_day(self, day: date) -> None:
+        if self.last_face_day != day:
+            self.last_face_mono = None
+        if self.reid_day != day:
+            if self.source == "REID":
+                self.clear()
+            self.reid_candidate, self.reid_votes, self.reid_day = None, 0, day
+
+
+_GALLERY_LOST = frozenset({"GALLERY_CHANGED", "GALLERY_UNAVAILABLE"})
 
 
 def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=None, scene_detector=None):
@@ -174,20 +207,20 @@ def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=
 
 
 class AIWorker(threading.Thread):
-    def __init__(self, manager, service, attendance, detection_state, global_manager=None,
-                 *, doorway=None, health=None, write_queue=None, journal=None, reid=None):
+    def __init__(self, manager, service, presence, detection_state, global_manager=None,
+                 *, doorway=None, journal=None, reid=None, appearance_gallery=None):
         super().__init__(name="ai-worker", daemon=True)
-        self.manager, self.service, self.attendance = manager, service, attendance
+        self.manager, self.service, self.presence = manager, service, presence
         self.state, self.global_manager = detection_state, global_manager
         self.journal, self.reid = journal, reid
+        self.appearance_gallery = appearance_gallery
         self._journal_generations = {}
         self._visit_bindings = OrderedDict()
+        self._identities = OrderedDict()
         self._appearance_pending = OrderedDict()
         self.doorway = doorway if doorway is not None else DoorwayDetector()
-        self.health = health if health is not None else attendance.health
-        self.write_queue = write_queue if write_queue is not None else AttendanceWriteQueue(attendance, self.health)
         self._stop_event = threading.Event()
-        self._last_seq, self._last_received, self._last_received_at = {}, {}, {}
+        self._last_seq, self._last_received = {}, {}
         self._streams, self._configurations = {}, {}
         self._reset_epochs, self._retry_after = {}, {}
         self._gallery_revision = service.store.revision if service.store is not None else None
@@ -228,14 +261,39 @@ class AIWorker(threading.Thread):
         return delay if delay > 0 else .001
 
 
-    def _persist(self, events):
-        for crossing in events:
-            self.write_queue.submit(crossing)
+    def _record_crossings(self, crossings, configurations=None):
+        """Fence admission against TIME_OFF commits, including delayed doorway expirations."""
+        if not crossings:
+            return
+        with publication_guard(self.presence.engine):
+            current = self._read_configurations() if configurations is None else configurations
+            for crossing in crossings:
+                if crossing.direction not in ("ENTRY", "EXIT"):
+                    continue
+                camera_id, stream, generation, track = crossing.track_key
+                config = current.get(camera_id)
+                if config is None or not config.time_tracking:
+                    continue
+                employee_id = crossing.confirmed_employee_id
+                if employee_id is None:
+                    identity = self._identities.get((camera_id, generation, track))
+                    employee_id = identity.employee_id if identity is not None else None
+                if employee_id is None:
+                    continue
+                self.presence.record_crossing(
+                    source_key=f"camera:{camera_id}:{stream}:{generation}:{track}:{crossing.crossing_index}",
+                    camera_id=camera_id, employee_id=employee_id, direction=crossing.direction,
+                    occurred_at=crossing.occurred_at)
+
+    def _invalidate_appearance(self):
+        if self.appearance_gallery is not None:
+            self.appearance_gallery.clear()
+        self._appearance_pending.clear()
 
     def flush(self, reason):
         for camera_id in list(self._configurations):
             self._reset_camera(camera_id, reason)
-        self._persist(self.doorway.expire(time.monotonic()))
+        self._record_crossings(self.doorway.expire(time.monotonic()))
 
     def inference_snapshot(self):
         result = self.metrics.snapshots(time.monotonic())
@@ -265,46 +323,40 @@ class AIWorker(threading.Thread):
 
     def step(self):
         now = time.monotonic()
-        if self.journal is not None:
-            self.journal.tick(utcnow())
-            self._journal_health()
         for key, binding in tuple(self._visit_bindings.items()):
             if now - binding.last_mono > settings.track_lost_timeout + 5.:
                 self._visit_bindings.pop(key)
                 self._appearance_pending.pop(binding.visit_id, None)
-        if not self.health.observe_clock(utcnow(), now):
-            for camera_id in list(self._configurations):
-                self._reset_camera(camera_id, "CLOCK_DISCONTINUITY")
         revision = self.service.store.revision if self.service.store is not None else None
         if revision != self._gallery_revision:
+            self._invalidate_appearance()
             for camera_id in list(self._configurations):
                 self._reset_camera(camera_id, "GALLERY_CHANGED")
             self._gallery_revision = revision
         try:
             packets = self._collect_frames()
-            self.health.transition("configuration", [])
             selected = self.scheduler.select(
                 (item[0] for item in packets), time.monotonic(),
                 attendance_ids=(camera_id for camera_id, _packet, config in packets if config.attendance))
             # Configuration is re-read at admission, not inferred from cached readers.
             configurations = self._read_configurations() if selected or self.journal is not None else {}
             if self.journal is not None:
-                with publication_guard(self.attendance.engine):
+                with publication_guard(self.presence.engine):
                     configurations = self._read_configurations()
                     self._drain_journal(configurations)
         except SQLAlchemyError:
             logger.exception("Attendance camera configuration unavailable")
-            self.health.transition("configuration", ["PERSISTENCE_ERROR"])
             for camera_id in list(self._configurations):
                 self._reset_camera(camera_id, "CONFIGURATION_UNAVAILABLE")
-            self._persist(self.doorway.expire(now))
+            self._record_crossings(self.doorway.expire(now))
             return False
         candidates = {camera_id: config for camera_id, _packet, config in packets}
         if selected and configurations:
             self.service.set_expected_gallery_revision(next(iter(configurations.values())).gallery_revision)
-            self.service.refresh_gallery(self.attendance.engine, now=now)
+            self.service.refresh_gallery(self.presence.engine, now=now)
             revision = self.service.store.revision if self.service.store is not None else None
             if revision != self._gallery_revision:
+                self._invalidate_appearance()
                 for camera_id in list(self._configurations):
                     self._reset_camera(camera_id, "GALLERY_CHANGED")
                 self._gallery_revision = revision
@@ -332,9 +384,8 @@ class AIWorker(threading.Thread):
             self.metrics.admit_packet(camera_id, packet, reader_token=id(reader))
         if not submissions:
             self._process_appearance()
-            self._persist(self.doorway.expire(time.monotonic()))
+            self._record_crossings(self.doorway.expire(time.monotonic()))
             self.metrics.snapshots(time.monotonic())
-            self.health.snapshot()
             return False
         started = time.monotonic()
         try:
@@ -357,22 +408,18 @@ class AIWorker(threading.Thread):
                 self.metrics.complete(camera_id, packet.received_mono, completed,
                                       skipped=skipped, error_code="AI_UNAVAILABLE", started_mono=started)
                 self.state.update(camera_id, [], packet=packet)
-                if config.attendance:
-                    self.health.transition(f"inference:{camera_id}", ["AI_UNAVAILABLE"],
-                                           at=packet.received_at, mono=packet.received_mono)
-            self._persist(self.doorway.expire(completed))
+            self._record_crossings(self.doorway.expire(completed))
             self.metrics.snapshots(completed)
             return True
         # Service coalesced ordinary-camera crops even in attendance-only batches.
         # One due native chunk, only after all completed crossings are enqueued.
         self._process_appearance()
-        self._persist(self.doorway.expire(time.monotonic()))
+        self._record_crossings(self.doorway.expire(time.monotonic()))
         self.metrics.snapshots(time.monotonic())
-        self.health.snapshot()
         return True
 
     def _publish_outcomes(self, submissions, outcomes, revision, started, completed):
-        with publication_guard(self.attendance.engine):
+        with publication_guard(self.presence.engine):
             configurations = self._read_configurations()
             self._drain_journal(configurations)
             for submission, outcome in zip(submissions, outcomes):
@@ -382,27 +429,25 @@ class AIWorker(threading.Thread):
                 if not self._is_current(camera_id, packet, config, reader, epoch, revision, configurations):
                     self._reset_camera(camera_id, "SOURCE_CHANGED")
                     continue
+                # The flag is deliberately excluded from trajectory-reset equality,
+                # but publication must use the switch that is committed now.
+                config = configurations[camera_id]
+                self._configurations[camera_id] = config
                 self._last_seq[camera_id] = packet.seq
                 self._last_received[camera_id] = packet.received_mono
-                self._last_received_at[camera_id] = packet.received_at
-                self.health.transition(
-                    f"inference:{camera_id}",
-                    ["FACE_MODEL_UNAVAILABLE"] if outcome.face_unavailable else [],
-                    at=packet.received_at, mono=packet.received_mono)
-                if config.calibration is not None:
-                    self._persist(self.doorway.process(packet, camera_id, outcome, config.calibration))
                 self._observe_journal(camera_id, packet, outcome)
+                identities = self._observe_presence(camera_id, packet, outcome, config)
+                if config.calibration is not None:
+                    self._record_crossings(
+                        self.doorway.process(packet, camera_id, outcome, config.calibration), configurations)
                 self.state.update(camera_id, outcome.detections, packet=packet,
-                                  generation=outcome.tracking_generation, configuration=config)
+                                  generation=outcome.tracking_generation, configuration=config,
+                                  identities=identities)
                 self._queue_appearance(submission, outcome, revision)
                 finished = time.monotonic()
                 self.metrics.complete(camera_id, packet.received_mono, finished, skipped=skipped,
                                       face_deferred=outcome.face_deferred, started_mono=started,
                                       stage_times_ms=outcome.stage_times_ms)
-                if config.calibration is not None:
-                    self.health.record_frame(camera_id, packet, tracking_generation=outcome.tracking_generation,
-                                             started_mono=started, completed_mono=finished)
-            self._journal_health()
 
     def _observe_journal(self, camera_id, packet, outcome):
         if self.journal is None:
@@ -440,12 +485,52 @@ class AIWorker(threading.Thread):
                     person.global_id = self.global_manager.global_id_for(binding.visit_id)
         self.metrics.record_stage(camera_id, "journal", (time.monotonic() - started) * 1000.)
 
+    def _observe_presence(self, camera_id, packet, outcome, config):
+        """Update sticky track identities and report presence; returns the overlay identity map."""
+        generation = outcome.tracking_generation
+        day = local_date(milliseconds(packet.received_at))
+        known = {}
+        for person in outcome.detections:
+            key = (camera_id, generation, person.track_id)
+            identity = self._identities.get(key)
+            if identity is None:
+                if len(self._identities) >= 4096:
+                    self._identities.popitem(last=False)
+                identity = self._identities[key] = _TrackIdentity()
+            else:
+                self._identities.move_to_end(key)
+            identity.roll_day(day)
+            if person.association_uncertain or not _GALLERY_LOST.isdisjoint(person.identity_reason_codes):
+                identity.clear()
+            else:
+                if person.employee_id is not None:
+                    if identity.employee_id != person.employee_id or identity.source != "FACE":
+                        if identity.employee_id != person.employee_id:
+                            identity.last_face_mono = None
+                        identity.employee_id, identity.source = person.employee_id, "FACE"
+                        identity.reid_candidate, identity.reid_votes = None, 0
+                    evidence = person.fresh_face_evidence
+                    if (evidence is not None and not evidence.reason_codes and evidence.frame_seq == packet.seq
+                            and evidence.confirmed_employee_id == person.employee_id):
+                        identity.last_face_mono = packet.received_mono
+                        identity.last_face_day = day
+                if identity.employee_id is not None and config.time_tracking:
+                    self.presence.observe(camera_id, identity.employee_id, identity.source, packet.received_at)
+            if identity.employee_id is not None:
+                name = (person.employee_name if person.employee_id == identity.employee_id
+                        else self.service.store.employee_name(identity.employee_id)
+                        if self.service.store is not None else None)
+                known[person.track_id] = (identity.employee_id, identity.source, name)
+        for transition in outcome.track_lifecycle:
+            if transition.state == "EXPIRED":
+                self._identities.pop((camera_id, generation, transition.track_id), None)
+        return known
+
     def _drain_journal(self, configurations):
         if self.journal is None:
             return
         for ack in self.journal.drain_acknowledgements():
             if ack.kind == "RESET_REQUIRED":
-                self.health.transition(f"journal:{ack.camera_id}:{ack.tracking_generation}", [])
                 if self._journal_generations.get(ack.camera_id) == ack.tracking_generation:
                     self._reset_camera(ack.camera_id, "JOURNAL_GAP")
                 continue
@@ -473,21 +558,12 @@ class AIWorker(threading.Thread):
                 if global_id is not None and binding.committed:
                     self.state.acknowledge(ack, global_id=global_id)
 
-    def _journal_health(self):
-        if self.journal is None:
-            return
-        now, mono = utcnow(), time.monotonic()
-        for camera_id, generation, started_at in self.journal.blocked_generations():
-            if started_at is not None:
-                self.health.transition(f"journal:{camera_id}:{generation}", ["JOURNAL_GAP"],
-                                       at=started_at, mono=mono - max(0., (now - started_at).total_seconds()))
-        self.health.transition("journal", ["JOURNAL_DEGRADED"]
-                               if self.journal.health_snapshot()["state"] != "OK" else [])
-
     def _queue_appearance(self, submission, outcome, revision):
-        if self.reid is None or self.global_manager is None or self.journal is None:
+        if self.reid is None or self.journal is None or (
+                self.global_manager is None and self.appearance_gallery is None):
             return
         camera_id, packet, config, reader, epoch = submission
+        day = local_date(milliseconds(packet.received_at))
         height, width = packet.frame.shape[:2]
         counts = {}
         for pending in self._appearance_pending.values():
@@ -524,11 +600,17 @@ class AIWorker(threading.Thread):
                            and evidence.confirmed_employee_id == person.employee_id
                            and evidence.store_revision == config.gallery_revision
                            else None)
+            identity = self._identities.get((camera_id, outcome.tracking_generation, person.track_id))
+            learn_employee_id = (
+                identity.employee_id if identity is not None and identity.source == "FACE"
+                and identity.last_face_mono is not None
+                and identity.last_face_day == day
+                and packet.received_mono - identity.last_face_mono <= LEARN_FACE_SECONDS else None)
             work = _AppearanceWork(
                 binding.visit_id, camera_id, outcome.tracking_generation, person.track_id,
                 packet.source_revision, packet.stream_id, packet.seq, packet.received_at,
                 packet.received_mono, person.bbox, (bottom - top) / (right - left),
-                min(1., max(0., float(person.person_score))), employee_id, config, epoch,
+                min(1., max(0., float(person.person_score))), employee_id, learn_employee_id, config, epoch,
                 revision, id(reader), resized)
             if work.visit_id not in self._appearance_pending:
                 counts[camera_id] = counts.get(camera_id, 0) + 1
@@ -554,8 +636,7 @@ class AIWorker(threading.Thread):
 
     def _process_appearance(self):
         now = time.monotonic()
-        if (not self._appearance_pending or now < self._appearance_retry_at
-                or self.reid is None or self.global_manager is None):
+        if not self._appearance_pending or now < self._appearance_retry_at or self.reid is None:
             return
         active = {camera_id for camera_id, receipt in self._last_received.items()
                   if now - receipt <= settings.attendance_max_frame_gap}
@@ -567,7 +648,7 @@ class AIWorker(threading.Thread):
         started = time.monotonic()
         batch = []
         try:
-            with publication_guard(self.attendance.engine):
+            with publication_guard(self.presence.engine):
                 configurations = self._read_configurations()
                 while self._appearance_pending and len(batch) < limit:
                     cameras = sorted({work.camera_id for work in self._appearance_pending.values()})
@@ -592,7 +673,7 @@ class AIWorker(threading.Thread):
             if len(vectors) != len(batch):
                 raise ValueError("Appearance batch omitted an observation")
             # Never hold the publication guard during a model call.
-            with publication_guard(self.attendance.engine):
+            with publication_guard(self.presence.engine):
                 configurations = self._read_configurations()
                 self._drain_journal(configurations)
                 items = []
@@ -604,13 +685,25 @@ class AIWorker(threading.Thread):
                     if binding is None:
                         continue
                     binding.last_appearance = work.received_mono
-                    items.append(EmbeddingItem(
-                        work.visit_id, work.camera_id, work.tracking_generation, work.track_id,
-                        work.source_revision, work.stream_id, work.seq, work.received_at,
-                        work.received_mono, work.bbox, work.aspect, work.crop_quality,
-                        vector, work.employee_id))
-                for proposal in self.global_manager.process_embeddings(items):
-                    self.journal.submit_link(proposal)
+                    store = self.service.store
+                    if (self.appearance_gallery is not None and store is not None
+                            and store.revision == work.config.gallery_revision):
+                        if work.learn_employee_id is not None and store.is_active(work.learn_employee_id):
+                            self.appearance_gallery.learn(work.learn_employee_id, vector, work.received_at)
+                        else:
+                            identity = self._identities.get(
+                                (work.camera_id, work.tracking_generation, work.track_id))
+                            if identity is not None and identity.source != "FACE":
+                                self._match_appearance(work, identity, vector)
+                    if self.global_manager is not None:
+                        items.append(EmbeddingItem(
+                            work.visit_id, work.camera_id, work.tracking_generation, work.track_id,
+                            work.source_revision, work.stream_id, work.seq, work.received_at,
+                            work.received_mono, work.bbox, work.aspect, work.crop_quality,
+                            vector, work.employee_id))
+                if self.global_manager is not None:
+                    for proposal in self.global_manager.process_embeddings(items):
+                        self.journal.submit_link(proposal)
             sample = (time.monotonic() - chunk_started) / len(batch)
             previous = self._appearance_seconds_per_crop or .02
             # Include matching/publication; react up immediately, down gradually.
@@ -623,6 +716,29 @@ class AIWorker(threading.Thread):
             for camera_id in {work.camera_id for work in batch}:
                 self.metrics.record_stage(camera_id, "appearance", elapsed_ms)
 
+    def _match_appearance(self, work, identity, vector):
+        """Two consecutive same-employee appearance matches name a faceless track."""
+        identity.roll_day(local_date(milliseconds(work.received_at)))
+        store = self.service.store
+        if store is None or store.revision != work.config.gallery_revision:
+            identity.clear()
+            return
+        matched = self.appearance_gallery.match(vector, work.received_at)
+        if matched is None or not store.is_active(matched):
+            identity.reid_candidate, identity.reid_votes = None, 0
+            return
+        if matched != identity.reid_candidate:
+            identity.reid_candidate, identity.reid_votes = matched, 1
+        else:
+            identity.reid_votes += 1
+        if identity.reid_votes < REID_VOTES:
+            return
+        # One person is on a camera once: a live track already holding this employee blocks the assignment.
+        if any(other is not identity and other.employee_id == matched
+               for key, other in self._identities.items() if key[0] == work.camera_id):
+            return
+        identity.employee_id, identity.source = matched, "REID"
+
     def _reset_camera(self, camera_id, reason="STREAM_RESET"):
         self._reset_epochs[camera_id] = self._reset_epochs.get(camera_id, 0) + 1
         generation = self._journal_generations.pop(camera_id, None)
@@ -631,23 +747,15 @@ class AIWorker(threading.Thread):
         for key in [key for key in self._visit_bindings if key[0] == camera_id]:
             binding = self._visit_bindings.pop(key)
             self._appearance_pending.pop(binding.visit_id, None)
-        if camera_id in self._last_received and reason in (
-                "FRAME_GAP", "STREAM_RESET", "SOURCE_CHANGED", "CALIBRATION_CHANGED",
-                "GALLERY_CHANGED", "AI_UNAVAILABLE", "CLOCK_DISCONTINUITY", "JOURNAL_GAP"):
-            config = self._configurations.get(camera_id)
-            if config is not None and config.attendance:
-                current = utcnow()
-                start = min(self._last_received_at[camera_id], current)
-                self.health.publish_fault(CoverageFault(str(uuid4()), start,
-                                                        self._last_received[camera_id],
-                                                        max(current, self._last_received_at[camera_id]), (reason,)))
-        self._persist(self.doorway.reset_camera(camera_id, reason))
+        self._record_crossings(self.doorway.reset_camera(camera_id, reason))
+        for key in [key for key in self._identities if key[0] == camera_id]:
+            self._identities.pop(key)
         self.service.reset_camera(camera_id)
         self.state.drop_camera(camera_id)
         self.metrics.clear_pending(camera_id)
         if self.global_manager is not None:
             self.global_manager.drop_camera(camera_id)
-        for mapping in (self._streams, self._last_seq, self._last_received, self._last_received_at, self._retry_after):
+        for mapping in (self._streams, self._last_seq, self._last_received, self._retry_after):
             mapping.pop(camera_id, None)
 
     def _read_configurations(self):
@@ -669,9 +777,9 @@ class AIWorker(threading.Thread):
                 result[config.camera_id] = _CameraConfiguration(
                     config.source_revision, config.revision, camera_enabled,
                     attendance, config.role, calibration, runtime.gallery_revision,
-                    profile.ai_enabled, profile.ai_fps)
+                    profile.ai_enabled, profile.ai_fps, profile.time_tracking)
             return result
-        return read_snapshot(self.attendance.engine, read)
+        return read_snapshot(self.presence.engine, read)
 
     def _collect_frames(self):
         self._runnable_ids.clear()
@@ -681,19 +789,9 @@ class AIWorker(threading.Thread):
         camera_ids = self._camera_ids(reader_ids, configurations)
         included = {key for key in camera_ids if configurations[key].enabled}
         self.scheduler.retain(included, now)
-        rows = []
-        for key, config in configurations.items():
-            if not (config.enabled and config.attendance):
-                continue
-            reader = self.manager.get(key)
-            online = (reader is not None and reader.is_alive() and reader.status() is CameraStatus.ONLINE
-                      and reader.source_revision == config.source_revision)
-            rows.append((key, config.role, config.source_revision, True, online, key in included))
-        self.health.configure_cameras(rows)
         for camera_id in set(self._configurations) - included:
             self._reset_camera(camera_id, "CAMERA_DISABLED")
             self.metrics.drop(camera_id)
-            self.health.transition(f"inference:{camera_id}", [])
             self._configurations.pop(camera_id, None)
         packets = []
         for camera_id in camera_ids:
@@ -771,8 +869,8 @@ def build_enroll_engine(bundle: ModelBundle | None) -> Optional[FaceEngine]:
 
 
 def build_ai_worker(
-    manager: ReaderManager, attendance, store: EmbeddingStore | None,
-    *, bundle: ModelBundle | None, session_factory, journal, notifier=None, enroll_engine=None,
+    manager: ReaderManager, presence, store: EmbeddingStore | None,
+    *, bundle: ModelBundle | None, session_factory, journal, notifier=None,
 ) -> Optional[AIWorker]:
     """Require people and journal storage, not face/gallery/appearance availability."""
     if bundle is None or session_factory is None:
@@ -809,9 +907,6 @@ def build_ai_worker(
             global_manager = GlobalIdentityManager(CameraTopology.load(str(topology_path)), notifier=notifier)
         except Exception as exc:
             logger.error("Optional appearance unavailable: %s", getattr(exc, "code", type(exc).__name__))
-    attendance.health.set_providers(loaded_providers(
-        detector=detector, live=face_engine, enroll=enroll_engine,
-        reid=reid))
     service = RecognitionService(
         detector, face_engine, store,
         min_confidence=settings.min_recognition_confidence,
@@ -821,8 +916,9 @@ def build_ai_worker(
         tracker_high_threshold=settings.tracker_new_track_threshold)
     state = DetectionState()
     logger.info("AI Provider: %s", provider_label(detector.session.get_providers()))
-    worker = AIWorker(manager, service, attendance, state, global_manager=global_manager,
-                      journal=journal, reid=reid)
+    worker = AIWorker(manager, service, presence, state, global_manager=global_manager,
+                      journal=journal, reid=reid,
+                      appearance_gallery=EmployeeAppearanceGallery() if reid is not None else None)
     worker.model_ids = {
         "bundle": bundle.bundle_id, "face": bundle.face_model_id,
         "person": bundle.metadata["components"]["person"]["files"][0]["sha256"],

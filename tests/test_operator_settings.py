@@ -60,7 +60,8 @@ EDITABLE = {
     "attendance_ai_fps", "attendance_frame_max_age", "attendance_max_frame_gap",
     "attendance_face_threshold", "attendance_face_margin", "attendance_face_confirmations",
     "attendance_face_window", "attendance_face_interval", "attendance_face_min_size",
-    "attendance_face_det_score", "attendance_face_blur_min", "attendance_evidence_keep_days",
+    "attendance_face_det_score", "attendance_face_blur_min",
+    "attendance_live_gap_minutes", "attendance_day_gap_minutes",
     "telegram_enabled", "telegram_bot_token", "telegram_chat_id", "telegram_notify_presence",
     "telegram_notify_global_transition", "telegram_notify_global_new",
     "recording_retention_days", "recording_max_bytes", "mc_debug",
@@ -271,7 +272,7 @@ def test_each_editable_field_accepts_valid_value_and_remains_pending():
         "attendance_face_margin": .12, "attendance_face_confirmations": 4,
         "attendance_face_window": 2., "attendance_face_interval": .5,
         "attendance_face_min_size": 90, "attendance_face_det_score": .85,
-        "attendance_face_blur_min": 25., "attendance_evidence_keep_days": 45,
+        "attendance_face_blur_min": 25., "attendance_live_gap_minutes": 30, "attendance_day_gap_minutes": 90,
         "telegram_enabled": False, "telegram_bot_token": TOKEN, "telegram_chat_id": "-100123456",
         "telegram_notify_presence": False, "telegram_notify_global_transition": False,
         "telegram_notify_global_new": True, "recording_retention_days": 365,
@@ -309,7 +310,8 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
         "attendance_face_confirmations": [0, 1.5], "attendance_face_window": [0, float("inf")],
         "attendance_face_interval": [0, float("nan")], "attendance_face_min_size": [0, 1.5],
         "attendance_face_det_score": [-.01, 1.01, float("inf")],
-        "attendance_face_blur_min": [-1, float("nan")], "attendance_evidence_keep_days": [0, 1.5],
+        "attendance_face_blur_min": [-1, float("nan")],
+        "attendance_live_gap_minutes": [0, 241, 1.5, True], "attendance_day_gap_minutes": [0, 721, 1.5, True],
         "recording_retention_days": [0, 366], "recording_max_bytes": [9999999999, 100000000000001],
         "ai_enabled": [None, "not-bool"], "telegram_enabled": [None], "mc_debug": [None],
     }
@@ -323,6 +325,10 @@ def test_all_numeric_bounds_nonfinite_values_and_crossfield_window_are_enforced(
         save(f, {"attendance_face_window": .1}, status=422)
         assert f.path.read_bytes() == before
         save(f, {"attendance_face_window": 2, "attendance_face_interval": 2})
+        # A finished day may never forgive less than a running day does.
+        save(f, {"attendance_live_gap_minutes": 60, "attendance_day_gap_minutes": 30}, status=422)
+        save(f, {"attendance_day_gap_minutes": 20}, status=422)  # below the default live gap of 35
+        save(f, {"attendance_live_gap_minutes": 20, "attendance_day_gap_minutes": 20})
 
 
 @test
@@ -335,6 +341,17 @@ def test_retired_ai_cameras_key_is_dropped_on_read_and_absent_after_save():
             "version": 1, "values": {"preview_fps": 9, "ai_fps": 4}}
         # The key is no longer editable either.
         save(f, {"ai_cameras": "1"}, status=422)
+
+
+@test
+def test_retired_evidence_keep_days_key_is_dropped_on_read_and_absent_after_save():
+    with api(overrides={"preview_fps": 9, "attendance_evidence_keep_days": 45}) as f:
+        assert get(f)["pending"].get("attendance_evidence_keep_days") is None
+        assert load(f.path, f.env_file).preview_fps == 9
+        save(f, {"ai_fps": 4})
+        assert json.loads(f.path.read_text(encoding="utf-8")) == {
+            "version": 1, "values": {"preview_fps": 9, "ai_fps": 4}}
+        save(f, {"attendance_evidence_keep_days": 30}, status=422)
 
 
 @test
@@ -512,11 +529,8 @@ def diagnostics():
     debug_api = feature("app.api.debug")
     with api(env={"AI_ENABLED": "false", "TELEGRAM_ENABLED": "false"}) as f, ExitStack() as stack:
         from app.rtsp.manager import ReaderManager
-        from app.services.attendance_service import AttendanceService
+        from app.services.presence_recorder import PresenceRecorder
         from app.services.recording_service import RecordingManager
-        from app.services import attendance_health, attendance_service
-        stack.enter_context(patch.object(attendance_health, "settings", f.active))
-        stack.enter_context(patch.object(attendance_service, "settings", f.active))
         # Tool resolution is an OS boundary; no child process is ever started.
         with patch("app.rtsp.manager.resolve_ffmpeg", return_value=(None, None)):
             manager = ReaderManager()
@@ -526,7 +540,7 @@ def diagnostics():
             db.commit()
         state = f.app.state
         state.manager, state.ai_worker, state.face_engine = manager, None, None
-        state.attendance = AttendanceService(f.engine, model_bundle=None)
+        state.presence = PresenceRecorder(f.engine)
         state.model_bundle, state.gallery_migration = None, None
         state.legacy_model_settings_ignored = ()
         state.recordings = RecordingManager(f.engine, f.root / "recordings", None, None)
@@ -565,15 +579,18 @@ def test_journal_scene_diagnostics_never_export_tokens_images_or_raw_failure_tex
 
 
 @test
-def test_diagnostics_reports_actual_ai_off_camera_off_and_no_false_commission():
+def test_diagnostics_reports_actual_ai_off_camera_off_and_time_tracking_state():
     with diagnostics() as f:
         view = f.client.json("GET", "/api/debug/status")
         assert view["tools"]["ffmpeg_available"] is False
         assert view["tools"]["ffprobe_available"] is False
         assert view["ai"]["enabled"] is False
         assert not any(view["ai"]["providers"].values())
-        assert view["attendance"]["automatic_ready"] is False
-        assert "COMMISSIONING_REQUIRED" in view["attendance"]["reasons"]
+        assert view["time_tracking"]["cameras"] == 1
+        assert view["time_tracking"]["time_tracking_cameras"] == 0
+        assert view["time_tracking"]["time_tracking_online"] == 0
+        assert view["time_tracking"]["recorder"]["pending_crossings"] == 0
+        assert view["time_tracking"]["recorder"]["last_error"] is None
         camera = next(row for row in view["cameras"] if row["id"] == 1)
         assert camera["status"] == "OFFLINE" and camera["reconnect_count"] == 0
         assert {"current_fps", "seconds_since_last_frame", "error"} <= camera.keys()
@@ -600,7 +617,7 @@ def test_diagnostics_reports_missing_models_without_constructing_sessions():
 
 @test
 def test_model_diagnostics_projects_only_safe_ids_codes_counts_and_ignored_setting_names():
-    from test_attendance_service import model_bundle_fixture
+    from attendance_test_support import model_bundle_fixture
     with diagnostics() as f:
         bundle = model_bundle_fixture()
         bundle.metadata["private_path"] = URL
@@ -669,18 +686,18 @@ def test_model_failure_codes_remain_static_in_support_events():
 def test_diagnostics_isolates_individual_failures_and_full_disk_remains_visible():
     with diagnostics() as f:
         state = f.app.state
-        with patch.object(state.attendance.health, "snapshot", side_effect=RuntimeError(URL + AUTH)), \
+        with patch.object(state.presence, "snapshot", side_effect=RuntimeError(URL + AUTH)), \
                 patch("app.media.storage.shutil.disk_usage", return_value=SimpleNamespace(free=0)):
             view = f.client.json("GET", "/api/debug/status")
-        assert view["attendance"]["error_code"] == "DIAGNOSTICS_UNAVAILABLE"
-        assert view["attendance"]["automatic_ready"] is False
+        assert view["time_tracking"]["error_code"] == "DIAGNOSTICS_UNAVAILABLE"
+        assert view["time_tracking"]["time_tracking_cameras"] == 0
         assert view["recordings"]["storage"]["free_bytes"] == 0
         assert view["cameras"][0]["status"] == "OFFLINE"
         no_secrets(view)
         with patch.object(state.recordings, "snapshot", side_effect=OSError(PASSWORD)):
             view = f.client.json("GET", "/api/debug/status")
         assert view["recordings"]["error_code"] == "DIAGNOSTICS_UNAVAILABLE"
-        assert "COMMISSIONING_REQUIRED" in view["attendance"]["reasons"]
+        assert view["time_tracking"]["time_tracking_cameras"] == 0
         no_secrets(view)
 
 
@@ -744,7 +761,7 @@ def test_export_allowlists_status_events_and_settings_without_secret_values():
         bundle = f.client.json("GET", "/api/debug/export")
         assert {"status", "events", "settings"} <= bundle.keys()
         assert bundle["settings"]["pending"]["has_telegram_bot_token"] is True
-        assert bundle["status"]["attendance"]["automatic_ready"] is False
+        assert bundle["status"]["time_tracking"]["recorder"]["open_segments"] == 0
         no_secrets(bundle)
         assert f.active.database_url not in json.dumps(bundle)
 
@@ -780,42 +797,6 @@ def test_reader_unexpected_network_error_and_server_logs_hide_complete_credentia
 
 
 @test
-def test_pending_threshold_does_not_change_commission_until_next_startup():
-    from uuid import uuid4
-    from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime
-    from app.services import attendance_service
-    from app.services.attendance_health import PROVIDER_KEYS
-    from test_attendance_service import model_bundle_fixture
-    with api() as f:
-        service = attendance_service.AttendanceService(f.engine, model_bundle=model_bundle_fixture())
-        providers = {key: ["CUDAExecutionProvider"] for key in PROVIDER_KEYS}
-        with patch.object(attendance_service, "settings", f.active), Session(f.engine) as db:
-            for ident, role in ((1, "ENTRY"), (2, "EXIT")):
-                db.add(Camera(id=ident, name=role, nvr_host="127.0.0.1", username=USERNAME,
-                              password=PASSWORD, channel=ident))
-                db.flush()
-                db.add(AttendanceCamera(camera_id=ident, role=role, enabled=True,
-                                        line_start=[.2, .5], line_end=[.8, .5], inside_point=[.5, .8],
-                                        door_kind="DOOR", door_top=[[.2, .1], [.8, .1]],
-                                        reference_width=640, reference_height=480))
-            db.flush()
-            commission = AttendanceCommission(request_id=str(uuid4()), actor="Fixture", reason="Fixture",
-                configuration_fingerprint=service.configuration_fingerprint(db, providers=providers),
-                acceptance_record={})
-            db.add(commission)
-            db.flush()
-            db.get(AttendanceRuntime, 1).commission_id = commission.id
-            db.commit()
-            assert service._commission_valid(db, invalidate=False, providers=providers) is True
-            save(f, {"attendance_face_threshold": .7})
-            assert service._commission_valid(db, invalidate=False, providers=providers) is True
-            restarted = load(f.path, f.env_file)
-            with patch.object(attendance_service, "settings", restarted):
-                assert service._commission_valid(db, invalidate=False, providers=providers) is False
-            assert db.get(AttendanceRuntime, 1).commission_id == commission.id
-
-
-@test
 def test_diagnostics_projects_scalar_allowlists_not_runtime_objects_or_raw_errors():
     from app.rtsp.reader import CameraStatus, RTSPReader
     with diagnostics() as f:
@@ -826,11 +807,11 @@ def test_diagnostics_projects_scalar_allowlists_not_runtime_objects_or_raw_error
         reader._set_status(CameraStatus.ERROR)
         reader.command_args = ["ffmpeg", "-i", URL]
         f.app.state.manager._readers[1] = reader
-        f.app.state.attendance.health.set_providers({
+        f.app.state.ai_providers = {
             "person_detection": ["CPUExecutionProvider", TOKEN],
             "scene_encoder": ["CPUExecutionProvider"], "scene_decoder": ["CPUExecutionProvider"],
             "reid": ["CPUExecutionProvider"],
-        })
+        }
         view = f.client.json("GET", "/api/debug/status")
         no_secrets(view)
         assert view["ai"]["providers"]["person_detection"] == ["CPUExecutionProvider"]

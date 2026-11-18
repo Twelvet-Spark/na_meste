@@ -292,7 +292,8 @@ class BulkCameraAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     camera_ids: list[StrictInt] = Field(min_length=1, max_length=200)
-    action: Literal["ENABLE", "DISABLE", "ASSIGN_WORKPLACE", "SET_ENTRANCE", "SET_INTERIOR", "AI_ON", "AI_OFF"]
+    action: Literal["ENABLE", "DISABLE", "ASSIGN_WORKPLACE", "SET_ENTRANCE", "SET_INTERIOR", "AI_ON", "AI_OFF",
+                    "TIME_ON", "TIME_OFF"]
     workplace_id: StrictInt | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
@@ -307,6 +308,7 @@ class BulkCameraAction(BaseModel):
 _BULK_PROFILE_CHANGES = {
     "SET_ENTRANCE": {"zone": "ENTRANCE"}, "SET_INTERIOR": {"zone": "INTERIOR"},
     "AI_ON": {"ai_enabled": True}, "AI_OFF": {"ai_enabled": False},
+    "TIME_ON": {"time_tracking": True}, "TIME_OFF": {"time_tracking": False},
 }
 
 
@@ -345,8 +347,13 @@ def api_delete_camera(
 ):
     camera = _camera_or_404(db, camera_id)
     journal = getattr(request.app.state, "human_journal", None) if request is not None else None
-    deletion = service.delete_camera(
-        db, camera, has_pending=journal.has_camera_work if journal is not None else None)
+    presence = getattr(request.app.state, "presence", None) if request is not None else None
+
+    def has_pending(key):
+        return ((journal is not None and journal.has_camera_work(key))
+                or (presence is not None and presence.has_camera_work(key)))
+
+    deletion = service.delete_camera(db, camera, has_pending=has_pending)
     if request is not None:
         _invalidate_analysis(request, camera_id)
         _setup(request).deleted(camera_id)

@@ -14,7 +14,7 @@
       <div><h1 id="emp-title">Сотрудник</h1><p id="employee-remediation" class="muted"></p></div>
     </div>
     <nav class="profile-sections" aria-label="Разделы карточки">
-      <a href="#data">Данные</a><a href="#photos">Фотографии</a><a href="#work">Рабочее время</a><a href="#history">История</a>
+      <a href="#data">Данные</a><a href="#photos">Фотографии</a><a href="#work">Рабочее время</a>
     </nav>
     <div id="profile-load-error" class="request-notice" hidden>
       <p id="profile-load-message" role="alert"></p>
@@ -73,21 +73,10 @@
 
     <section id="work" class="panel" aria-labelledby="work-title">
       <div class="panel-head"><h2 id="work-title">Рабочее время</h2><a id="employee-report" class="btn" href="/presence#report">Отчёт по сотруднику</a></div>
-      <p class="muted">Время входа и выхода в UTC+05:00. Открытое время предварительное; спорные интервалы не считаются подтверждёнными часами.</p>
+      <p class="muted">Последние 30 дней. Время показано по часам рабочего места. Для текущего дня расчёт предварительный.</p>
       <div id="work-error" class="test-result err" role="alert" hidden></div>
-      <div class="table-wrap"><table class="table" id="work-table"><thead><tr><th>Вход</th><th>Выход</th><th>Подтверждено</th><th>Текущее</th><th>На проверке</th><th>Состояние / причины</th></tr></thead><tbody></tbody></table></div>
-      <p id="work-empty" class="empty" hidden>Рабочих интервалов пока нет. Камерные наблюдения сами по себе не создают рабочее время.</p>
-      <div id="work-pager" class="attendance-actions"></div>
-      <a id="employee-events" href="/presence#events">Входы, выходы и исправления</a>
-    </section>
-    <section id="history" class="panel" aria-labelledby="history-title">
-      <div class="panel-head"><h2 id="history-title">История</h2></div>
-      <h3 class="section-subtitle">Архив наблюдений — не рабочее время</h3>
-      <p class="muted">Старая история видимости на камерах сохранена только для чтения и не включается в отчёты о часах.</p>
-      <div id="presence-error" class="test-result err" role="alert" hidden></div>
-      <div class="table-wrap"><table class="table" id="presence-table"><thead><tr><th>Камера</th><th>Начало</th><th>Последнее наблюдение</th><th>Окончание</th><th>Сходство</th></tr></thead><tbody></tbody></table></div>
-      <div id="presence-empty" class="empty" hidden>Архивных наблюдений нет.</div>
-      <div id="presence-pager" class="attendance-actions"></div>
+      <div class="table-wrap"><table class="table" id="work-table"><thead><tr><th>Дата</th><th>Отработано</th><th>Первое</th><th>Последнее</th><th>Расчёт</th></tr></thead><tbody></tbody></table></div>
+      <p id="work-empty" class="empty" hidden>За последние 30 дней данных нет.</p>
     </section>
   </main>
   <dialog id="workplace-dialog" class="modal" aria-labelledby="workplace-title">

@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from app.api.scenes import router
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import immediate_session
-from app.database.models import AttendanceCamera, AttendanceCommission, AttendanceRuntime, Camera, CameraScene
+from app.database.models import AttendanceCamera, Camera, CameraScene
 from app.rtsp.reader import CameraStatus, FrameBuffer
 from app.services.scene_service import SceneService
 from operator_test_support import Client
@@ -84,11 +84,6 @@ def api():
                 db.flush()
                 # Schema startup supplies rows for existing cameras only.
                 db.add_all([AttendanceCamera(camera_id=i, source_revision=1) for i in (1, 2, 3)])
-                commission = AttendanceCommission(request_id=str(uuid4()), actor='operator', reason='fixture',
-                                                 configuration_fingerprint={}, acceptance_record={})
-                db.add(commission)
-                db.flush()
-                db.get(AttendanceRuntime, 1).commission_id = commission.id
             clock = Clock()
             readers = {i: Reader(clock) for i in (1, 2, 3)}
             manager = SimpleNamespace(get=readers.get)
@@ -131,12 +126,10 @@ def rejected_snapshot(service, identifier, code, camera=1):
 
 
 @test
-def test_real_routes_freeze_native_save_reload_and_preserve_commission():
+def test_real_routes_freeze_native_save_reload():
     with api() as (client, engine, service, readers, _clock):
         unset = client.json('GET', '/api/cameras/1/scene')
         assert unset['status'] == 'UNSET' and unset['revision'] == 0 and unset['geometry'] is None
-        with Session(engine) as db:
-            original_commission = db.get(AttendanceRuntime, 1).commission_id
         snap = freeze(client)
         assert snap['width'] == 640 and snap['height'] == 360 and snap['expires_in_seconds'] == 300
         decoded = cv2.imdecode(np.frombuffer(base64.b64decode(snap['jpeg_base64']), np.uint8), cv2.IMREAD_COLOR)
@@ -152,7 +145,6 @@ def test_real_routes_freeze_native_save_reload_and_preserve_commission():
         assert saved['metric_transform']['rectified_width'] == 1280
         assert saved_scene(client) == saved
         with Session(engine) as db:
-            assert db.get(AttendanceRuntime, 1).commission_id == original_commission
             assert db.get(AttendanceCamera, 1).revision == 0
 
 

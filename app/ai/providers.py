@@ -125,3 +125,11 @@ def model_providers(providers: list[str]) -> list:
 
 def provider_label(providers: list[str]) -> str:
     return providers[0] if providers else "?"
+
+
+# Resident model sessions reported by loaded_providers() and shown in diagnostics.
+PROVIDER_KEYS = (
+    "person_detection", "live_face_detection", "live_face_recognition",
+    "enroll_face_detection", "enroll_face_recognition",
+    "reid", "scene_encoder", "scene_decoder", "scene_detector",
+)

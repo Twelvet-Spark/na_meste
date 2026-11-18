@@ -39,3 +39,8 @@ def day_bounds(day: date) -> tuple[datetime, datetime]:
         return start, start + timedelta(days=1)
     except OverflowError as exc:
         raise ValueError("Date has no representable UTC day bounds in the workplace offset") from exc
+
+
+def local_date(dt: datetime) -> date:
+    """Workplace calendar date of a naive-UTC instant."""
+    return (dt + timedelta(minutes=settings.attendance_utc_offset_minutes)).date()

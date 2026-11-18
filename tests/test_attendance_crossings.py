@@ -31,7 +31,6 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.ai.doorway import DoorwayCalibration, DoorwayDetector
-from app.attendance_roles import covered_directions
 from app.ai.face_quality import FaceQuality
 from app.ai.recognition_service import DetectionResult, FaceEvidence, FrameOutcome
 from app.ai.tracker import TrackLifecycle
@@ -39,7 +38,7 @@ from app.config import settings
 from app.database.attendance_schema import initialize_attendance_schema
 from app.database.database import get_db
 from app.database.models import (
-    AttendanceCamera, AttendanceCommission, AttendanceRuntime, Camera, CameraProfile,
+    AttendanceCamera, Camera, CameraProfile,
 )
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
@@ -243,14 +242,6 @@ def test_both_camera_emits_entry_and_exit_for_one_track_walking_both_ways():
     events = path.finish()
     assert [item.direction for item in events] == ["ENTRY", "EXIT"], events
     assert [item.crossing_index for item in events] == [1, 2]
-
-
-@test
-def test_role_covers_only_the_directions_it_counts():
-    assert covered_directions(["ENTRY"]) == {"ENTRY"}
-    assert covered_directions(["EXIT", "ENTRY"]) == {"ENTRY", "EXIT"}
-    assert covered_directions(["BOTH"]) == {"ENTRY", "EXIT"}
-    assert covered_directions([]) == frozenset()
 
 
 @test
@@ -823,7 +814,6 @@ def calibration_app():
         app.state.manager = manager
         app.state.detection_state = None
         app.state.ai_worker = None
-        app.state.attendance_health = None
 
         def isolated_db():
             with Session(engine) as db:
@@ -855,7 +845,7 @@ class SnapshotManager:
         with Session(self.engine) as db:
             config = db.get(AttendanceCamera, camera.id)
             self.published.append((camera.source_revision, config.source_revision, config.revision,
-                                   config.enabled, db.get(AttendanceRuntime, 1).commission_id))
+                                   config.enabled))
 
     def snapshot(self, camera_id=1, *, revision=1, stream="snapshot-stream", seq=9):
         reader = RTSPReader(camera_id, "Door", "rtsp://unused", source_revision=revision,
@@ -908,18 +898,6 @@ def save_payload(**changes):
     return payload
 
 
-def seed_commission(engine):
-    with Session(engine) as db:
-        row = AttendanceCommission(request_id="526dbfd5-e296-4ccc-9762-4d3e397404ab",
-                                   actor="Operator", reason="Measured site trial",
-                                   configuration_fingerprint={"version": 1}, acceptance_record={})
-        db.add(row)
-        db.flush()
-        db.get(AttendanceRuntime, 1).commission_id = row.id
-        db.commit()
-        return row.id
-
-
 @test
 def test_calibration_get_returns_seeded_unassigned_row_and_missing_camera_404():
     with calibration_app() as fixture:
@@ -944,7 +922,6 @@ def test_calibration_put_commits_geometry_and_increments_revision():
             assert saved.line_start == [.2, .5] and saved.line_end == [.8, .5]
             assert saved.inside_point == [.5, .8]
             assert saved.reference_width == 640 and saved.reference_height == 480
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at is None
 
 
 @test
@@ -980,40 +957,28 @@ def test_any_number_of_cameras_may_count_the_same_direction_and_one_camera_may_c
     with calibration_app() as fixture:
         for ident in (1, 2):
             assert request(fixture, "PUT", f"/api/attendance/cameras/{ident}", save_payload())[0] == 200
-        with Session(fixture.engine) as db:
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at is None, "Two entries never cover exits"
         status, body = request(fixture, "PUT", "/api/attendance/cameras/3", save_payload(role="BOTH"))
         assert status == 200 and body["role"] == "BOTH", body
         assert body["door_kind"] == "DOOR" and body["door_top"] == [[.2, .1], [.8, .1]]
-        with Session(fixture.engine) as db:
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at is not None
 
 
 @test
-def test_a_single_both_camera_starts_monitoring():
+def test_a_gate_can_be_enabled_on_any_camera_and_reports_whether_time_is_tracked():
     with calibration_app() as fixture:
-        assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload(role="BOTH"))[0] == 200
         with Session(fixture.engine) as db:
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at is not None
-
-
-@test
-def test_enabling_requires_an_entrance_camera_with_ai_but_saving_a_disabled_gate_does_not():
-    with calibration_app() as fixture:
-        for field, value, text in (("zone", "INTERIOR", "входам"), ("ai_enabled", False, "AI")):
-            with Session(fixture.engine) as db:
-                db.get(CameraProfile, 1).zone = "ENTRANCE"
-                db.get(CameraProfile, 1).ai_enabled = True
-                setattr(db.get(CameraProfile, 1), field, value)
-                db.commit()
-            status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())
-            assert status == 409 and text in body["detail"], body
-            status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload(enabled=False))
-            assert status == 200, body
-            with Session(fixture.engine) as db:
-                row = db.get(AttendanceCamera, 1)
-                row.revision, row.enabled = 0, False
-                db.commit()
+            profile = db.get(CameraProfile, 1)
+            profile.zone, profile.ai_enabled = "INTERIOR", False
+            db.commit()
+        status, body = request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())
+        assert status == 200 and body["enabled"] is True, body
+        status, body = request(fixture, "GET", "/api/attendance/cameras/1")
+        assert status == 200 and body["time_tracking"] is False and body["ai_included"] is False, body
+        with Session(fixture.engine) as db:
+            profile = db.get(CameraProfile, 1)
+            profile.ai_enabled = profile.time_tracking = True
+            db.commit()
+        status, body = request(fixture, "GET", "/api/attendance/cameras/1")
+        assert status == 200 and body["time_tracking"] is True and body["ai_included"] is True, body
 
 
 @test
@@ -1029,46 +994,6 @@ def test_assigned_role_can_change_or_disable_but_never_be_erased():
         with Session(fixture.engine) as db:
             row = db.get(AttendanceCamera, 1)
             assert row.role == "EXIT" and not row.enabled and row.revision == 2
-
-
-@test
-def test_enabling_second_role_atomically_starts_monitoring_and_revokes_commission():
-    with calibration_app() as fixture:
-        seed_commission(fixture.engine)
-        assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-        with Session(fixture.engine) as db:
-            runtime = db.get(AttendanceRuntime, 1)
-            assert runtime.commission_id is None and runtime.monitoring_started_at is None
-        status, body = request(fixture, "PUT", "/api/attendance/cameras/2", save_payload(role="EXIT"))
-        assert status == 200, body
-        with Session(fixture.engine) as db:
-            started = db.get(AttendanceRuntime, 1).monitoring_started_at
-            assert started is not None
-        assert request(fixture, "PUT", "/api/attendance/cameras/2",
-                       save_payload(role="EXIT", enabled=False, expected_revision=1))[0] == 200
-        with Session(fixture.engine) as db:
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at == started
-
-
-@test
-def test_monitoring_start_failure_rolls_back_second_role_enablement():
-    with calibration_app() as fixture:
-        assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-
-        def fail_runtime_update(_conn, _cursor, statement, _parameters, _context, _many):
-            if statement.lstrip().upper().startswith("UPDATE ATTENDANCE_RUNTIME"):
-                raise OperationalError(statement, {}, RuntimeError("Injected disk failure"))
-
-        event.listen(fixture.engine, "before_cursor_execute", fail_runtime_update)
-        try:
-            status, body = request(fixture, "PUT", "/api/attendance/cameras/2", save_payload(role="EXIT"))
-        finally:
-            event.remove(fixture.engine, "before_cursor_execute", fail_runtime_update)
-        assert status == 503, body
-        with Session(fixture.engine) as db:
-            row = db.get(AttendanceCamera, 2)
-            assert row.revision == 0 and row.role is None and not row.enabled
-            assert db.get(AttendanceRuntime, 1).monitoring_started_at is None
 
 
 @test
@@ -1110,10 +1035,9 @@ def test_metadata_snapshot_rejects_offline_stale_and_wrong_source_packets():
 def test_source_update_commits_invalidation_before_publishing_replacement_reader():
     with calibration_app() as fixture:
         assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-        seed_commission(fixture.engine)
         status, body = request(fixture, "PUT", "/api/cameras/1", {"nvr_host": "replacement"})
         assert status == 200, body
-        assert fixture.manager.published == [(2, 2, 2, False, None)]
+        assert fixture.manager.published == [(2, 2, 2, False)]
         with Session(fixture.engine) as db:
             camera = camera_service.get_camera(db, 1)
             config = db.get(AttendanceCamera, 1)
@@ -1133,27 +1057,22 @@ def test_every_connection_field_invalidates_source_but_name_and_empty_password_d
     for field, value in changes:
         with calibration_app() as fixture:
             assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-            seed_commission(fixture.engine)
             assert request(fixture, "PUT", "/api/cameras/1", {field: value})[0] == 200
             with Session(fixture.engine) as db:
                 config = db.get(AttendanceCamera, 1)
                 assert (config.source_revision, config.revision, config.enabled) == (2, 2, False), field
-                assert db.get(AttendanceRuntime, 1).commission_id is None
     with calibration_app() as fixture:
         assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-        approved = seed_commission(fixture.engine)
         assert request(fixture, "PUT", "/api/cameras/1", {"name": "Renamed", "password": ""})[0] == 200
         with Session(fixture.engine) as db:
             config = db.get(AttendanceCamera, 1)
             assert (config.source_revision, config.revision, config.enabled) == (1, 1, True)
-            assert db.get(AttendanceRuntime, 1).commission_id == approved
 
 
 @test
 def test_source_invalidation_failure_rolls_back_camera_and_attendance_together():
     with calibration_app() as fixture:
         assert request(fixture, "PUT", "/api/attendance/cameras/1", save_payload())[0] == 200
-        approved = seed_commission(fixture.engine)
 
         def fail_config_update(_conn, _cursor, statement, _parameters, _context, _many):
             if statement.lstrip().upper().startswith("UPDATE ATTENDANCE_CAMERAS"):
@@ -1170,7 +1089,6 @@ def test_source_invalidation_failure_rolls_back_camera_and_attendance_together()
             assert camera_service.get_camera(db, 1).nvr_host == "unused"
             config = db.get(AttendanceCamera, 1)
             assert (config.source_revision, config.revision, config.enabled) == (1, 1, True)
-            assert db.get(AttendanceRuntime, 1).commission_id == approved
 
 
 @test

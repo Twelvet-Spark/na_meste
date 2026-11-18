@@ -23,7 +23,7 @@ from app.ai.face_detector import FaceEngine, FaceInfo, norm_crop
 from app.ai.face_recognition import EmbeddingStore
 from app.ai.model_bundle import ModelBundleError
 from app.database.database import immediate_session
-from app.database.models import AttendanceCommission, AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata
+from app.database.models import AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata
 from app.services.gallery_migration import GalleryChangedError, rebuild_gallery, reembed_aligned_thumbnails
 from test_operator_storage import committed_v3, database, dump, schema
 
@@ -82,17 +82,8 @@ def sample(db, owner, embedding=None, thumb=None, model=None, alignment=ALIGNMEN
     return face.id
 
 
-def commission(db):
-    row = AttendanceCommission(request_id="migration-commission", actor="Operator", reason="Test",
-                               configuration_fingerprint={}, acceptance_record={})
-    db.add(row)
-    db.flush()
-    db.get(AttendanceRuntime, 1).commission_id = row.id
-    return row.id
-
-
 @test
-def test_v3_upgrade_preserves_unconvertible_samples_and_history_before_target_publication():
+def test_v3_upgrade_preserves_unconvertible_samples_before_target_publication():
     with database() as (engine, _root):
         committed_v3(engine)
         with immediate_session(engine) as db:
@@ -109,8 +100,9 @@ def test_v3_upgrade_preserves_unconvertible_samples_and_history_before_target_pu
             store = EmbeddingStore(MODEL)
             assert store.refresh(db) == 1 and store.match(vector(2)).employee_id == 41
         with engine.connect() as connection:
-            assert connection.exec_driver_sql("SELECT version FROM operator_schema").scalar_one() == 5
-            assert connection.exec_driver_sql("SELECT count(*) FROM presence_sessions").scalar_one() == 1
+            assert connection.exec_driver_sql("SELECT version FROM operator_schema").scalar_one() == 6
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM sqlite_master WHERE name='presence_sessions'").scalar_one() == 0
 
 
 @test
@@ -181,7 +173,6 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
             invalid = sample(db, 4, embedding=b"invalid", thumb=thumbnail(4), model=MODEL)
             missing = sample(db, 5)
             malformed = sample(db, 6, thumb=b"bad", model=OTHER_MODEL)
-            old_commission = commission(db)
         recognizer = Recognizer()
         report = rebuild_gallery(engine, recognizer)
         assert report["faces_reencoded"] == 4 and report["usable_faces_count"] == 5
@@ -196,8 +187,7 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
             assert db.get(FaceModelMetadata, missing) is None
             assert db.get(FaceModelMetadata, malformed).model_id == OTHER_MODEL
             assert db.get(AttendanceRuntime, 1).gallery_revision == 1
-            assert db.get(AttendanceRuntime, 1).commission_id is None
-            assert db.get(AttendanceCommission, old_commission) is not None
+            assert db.get(AttendanceRuntime, 1).schema_version == 3
             assert dict(db.query(Employee.id, Employee.revision).all()) == {
                 1: 0, 2: 1, 3: 1, 4: 1, 5: 0, 6: 0,
             }
@@ -208,13 +198,12 @@ def test_rebuild_keeps_valid_without_thumbnail_reencodes_only_needed_and_is_idem
 
 
 @test
-def test_compatible_restart_never_acquires_writer_or_revokes_commission():
+def test_compatible_restart_never_acquires_writer():
     with database() as (engine, _root):
         schema.initialize_attendance_schema(engine)
         with immediate_session(engine) as db:
             sample(db, 1, model=MODEL)
             sample(db, 2, thumb=thumbnail(2), model=MODEL)
-            old_commission = commission(db)
         before = dump(engine)
         statements = []
 
@@ -229,8 +218,6 @@ def test_compatible_restart_never_acquires_writer_or_revokes_commission():
             event.remove(engine, "before_cursor_execute", capture)
         assert not any(sql.startswith(("BEGIN IMMEDIATE", "UPDATE", "INSERT", "DELETE")) for sql in statements)
         assert recognizer.batches == [] and dump(engine) == before
-        with Session(engine) as db:
-            assert db.get(AttendanceRuntime, 1).commission_id == old_commission
 
 
 @test
@@ -270,7 +257,6 @@ def test_failed_inference_or_commit_leaves_all_old_data_and_revision_intact():
             schema.initialize_attendance_schema(engine)
             with immediate_session(engine) as db:
                 sample(db, 1, thumb=thumbnail(1))
-                commission(db)
             before = dump(engine)
             recognizer = Recognizer()
             if failure == "inference":

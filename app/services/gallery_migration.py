@@ -74,7 +74,7 @@ def rebuild_gallery(engine, face_engine) -> dict:
 
     Compatible, normalized vectors are retained byte-for-byte even without images.
     Unconvertible samples remain stored and excluded by EmbeddingStore. An
-    unchanged gallery never obtains a writer lock or revokes commissioning.
+    unchanged gallery never obtains a writer lock.
     """
     model_id, alignment_id = face_engine.model_id, face_engine.alignment_id
     if alignment_id != ALIGNMENT_ID:
@@ -136,5 +136,5 @@ def rebuild_gallery(engine, face_engine) -> dict:
         writer.execute(update(Employee).where(Employee.id.in_(changed_owners)).values(
             revision=Employee.revision + 1, updated_at=utcnow()))
         writer.execute(update(AttendanceRuntime).where(AttendanceRuntime.id == 1).values(
-            gallery_revision=AttendanceRuntime.gallery_revision + 1, commission_id=None))
+            gallery_revision=AttendanceRuntime.gallery_revision + 1))
     return report

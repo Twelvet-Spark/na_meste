@@ -27,7 +27,8 @@ from app.ai.face_recognition import EmbeddingStore
 from app.setup_transfer import TransferError, decode_binary, decode_transfer, encode_transfer, validate_document
 from app.services.setup_transfer_service import SetupTransferService
 from app.api.setup_transfer import router
-from test_setup_transfer_format import document, legacy_document, parse, v2_document, PASSWORD, MODEL_ID, ALIGNMENT_ID
+from test_setup_transfer_format import (
+    document, legacy_document, parse, v2_document, v3_document, PASSWORD, MODEL_ID, ALIGNMENT_ID)
 from operator_test_support import Client
 
 TESTS = []
@@ -153,14 +154,13 @@ def roundtrip_preserves_setup_not_history_and_gallery_works():
             gate = db.get(AttendanceCamera, 7)
             assert gate.role == "BOTH" and gate.door_kind == "DOOR" and gate.door_top == [[0.2, 0.1], [0.8, 0.1]]
             profile = db.get(CameraProfile, 7)
-            assert (profile.zone, profile.workplace_id, profile.ai_enabled, profile.ai_fps, profile.revision) == (
-                "ENTRANCE", 9, True, 2.5, 0)
+            assert (profile.zone, profile.workplace_id, profile.ai_enabled, profile.ai_fps, profile.time_tracking,
+                    profile.revision) == ("ENTRANCE", 9, True, 2.5, True, 0)
             assert not db.get(Workplace, 9).active
             assert db.get(EmployeeWorkplace, (4,9)) is not None
-            assert db.get(AttendanceRuntime, 1).commission_id is None
             assert db.query(GlobalPerson).count() == 0
             assert db.query(RecordingSession).count() == 0
-            assert db.query(AttendanceEvent).count() == 0
+            assert db.query(PresenceSegment).count() == db.query(DoorCrossing).count() == 0
             assert db.get(EmployeeFace, 12).embedding == decode_binary(document()["faces"][0]["embedding"])
             metadata = db.get(FaceModelMetadata, 12)
             assert metadata.model_id == MODEL_ID and metadata.alignment_id == ALIGNMENT_ID
@@ -414,7 +414,7 @@ asyncio.run(check())
 
 @test
 def legacy_and_null_faces_share_target_space_preparation_and_keep_bad_thumbnails():
-    for data in (legacy_document(), v2_document(), document()):
+    for data in (legacy_document(), v2_document(), v3_document(), document()):
         if data["transfer_version"] >= 2:
             data["faces"][0].update(face_model_id=None, alignment_id=None)
         data["faces"].extend([
@@ -635,7 +635,6 @@ def imported_scene_review_marker_survives_schema_restart():
             assert scene.source_revision == 0 and scene.revision == 1
             assert scene.geometry == document()["scenes"][0]["geometry"]
             assert db.get(AttendanceCamera, 7).enabled is False
-            assert db.get(AttendanceRuntime, 1).commission_id is None
 
 
 @test
@@ -651,8 +650,8 @@ def v2_documents_import_with_default_profiles_door_frames_and_upgraded_scenes():
             # 0.6 * 640 = 384 px threshold at y = 0.3 * 480: the 1.8x door reaches the frame top.
             assert gate.door_top == [[0.2, 0.0], [0.8, 0.0]]
             profile = db.get(CameraProfile, 7)
-            assert (profile.zone, profile.ai_enabled, profile.ai_fps, profile.workplace_id, profile.revision) == (
-                "ENTRANCE", True, None, None, 0)
+            assert (profile.zone, profile.ai_enabled, profile.ai_fps, profile.workplace_id, profile.time_tracking,
+                    profile.revision) == ("ENTRANCE", True, None, None, True, 0)
             geometry = db.get(CameraScene, 7).geometry
             assert geometry["version"] == 2 and geometry["doors"] == []
             assert geometry["floor"] == data["scenes"][0]["geometry"]["floor"]
@@ -668,8 +667,24 @@ def v2_documents_import_with_default_profiles_door_frames_and_upgraded_scenes():
 
 
 @test
+def v3_profiles_import_with_time_tracking_following_ai_and_v4_keeps_its_own_choice():
+    cases = [(v3_document(), True, True), (v3_document(), False, False), (document(), True, False)]
+    for data, ai_enabled, time_tracking in cases:
+        data["profiles"][0].update(ai_enabled=ai_enabled)
+        if data["transfer_version"] == 4:
+            data["profiles"][0].update(time_tracking=time_tracking)
+        blob = transfer_blob(data)
+        with database() as dest:
+            service(dest).import_setup(blob, PASSWORD, request_id=uuid4(),
+                                       expected_sha256=hashlib.sha256(blob).hexdigest())
+            with Session(dest) as db:
+                profile = db.get(CameraProfile, 7)
+                assert (profile.ai_enabled, profile.time_tracking) == (ai_enabled, time_tracking)
+
+
+@test
 def unusable_legacy_thumbnails_need_no_recognizer_or_gpu_lease():
-    for data in (legacy_document(), v2_document(), document()):
+    for data in (legacy_document(), v2_document(), v3_document(), document()):
         if data["transfer_version"] >= 2:
             data["faces"][0].update(face_model_id=None, alignment_id=None)
         data["faces"][0]["thumbnail"] = None

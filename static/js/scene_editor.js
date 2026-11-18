@@ -212,7 +212,6 @@
       {id: 'gate', points: gateQuad(state.gate), visible: !scene && state.layers.gate}];
   }
   function setTool(tool) {
-    if (tool === 'gate' && state.camera?.profile.zone !== 'ENTRANCE') return;
     cancelAnalysis();
     state.tool = tool; state.drawing = ['floor', 'object', 'door', 'metric', 'gate'].includes(tool);
     if (tool === 'floor') state.selection = 'floor';
@@ -460,13 +459,12 @@
   }
   function buttons() {
     root.setAttribute('aria-busy', String(state.busy));
-    const entrance = state.camera?.profile.zone === 'ENTRANCE';
     $('calibration-freeze').disabled = state.busy;
     $('scene-undo').disabled = !editable() || !state.undo.length; $('scene-redo').disabled = !editable() || !state.redo.length;
     $('scene-save').disabled = !saveable() || !state.saved || Boolean(geometryError());
-    $('calibration-save').disabled = !entrance || !saveable() || !state.config || Boolean(gateError());
+    $('calibration-save').disabled = !saveable() || !state.config || Boolean(gateError());
     $('calibration-disable').disabled = state.busy || !state.config?.role || !state.config?.enabled;
-    $('calibration-clear').disabled = !entrance || !editable();
+    $('calibration-clear').disabled = !editable();
     $('scene-reconcile').hidden = !state.review;
     $('scene-keep-draft').disabled = !state.validSnapshot || state.busy || !$('scene-reviewed').checked;
     $('scene-use-saved').disabled = !state.validSnapshot || state.busy;
@@ -488,7 +486,6 @@
     const parts = [{ENTRY: 'Только вход', EXIT: 'Только выход', BOTH: 'Вход и выход'}[r.role] || 'Роль не назначена', r.enabled ? 'учёт включён' : 'учёт отключён', `поток: ${state.cameraStatus}`];
     if (r.camera_enabled === false) parts.push('камера отключена');
     if (r.ai_enabled === false) parts.push('ИИ выключен'); else if (r.ai_included === false) parts.push('камера исключена из ИИ'); else if (r.ai_available === false) parts.push('ИИ недоступен');
-    parts.push(r.commissioning_required ? 'наладка не подтверждена — автоматический учёт запрещён' : 'акт наладки сохранён; готовность проверяет монитор учёта');
     $('calibration-state').textContent = parts.join(' · ');
   }
   function showScene() {
@@ -561,15 +558,14 @@
     try {
       const saved = await request(base,'PUT',{snapshot_id:state.snapshot.snapshot_id,expected_revision:state.saved.revision,expected_source_revision:state.snapshot.source_revision,geometry:clone(state.geometry)});
       state.saved = {...state.saved, ...saved}; state.geometry = clone(saved.geometry); state.sceneCurrent = saved.status === 'CURRENT' && epoch === state.sourceEpoch;
-      message('Сцена сохранена. Проход учёта и наладка не изменены.', 'ok'); showScene();
+      message('Сцена сохранена. Проход не изменён.', 'ok'); showScene();
       window.dispatchEvent(new CustomEvent('scene-saved',{detail:saved}));
     } catch (e) { errorMessage(e); }
     finally { state.busy = false; sync(); }
   }
   async function saveGate(disable = false) {
-    if (state.busy || !state.config || (!disable && (!saveable() || state.camera?.profile.zone !== 'ENTRANCE'))) return;
+    if (state.busy || !state.config || (!disable && !saveable())) return;
     if (!disable && gateError()) { message(gateError(), 'err', 'calibration-message'); return; }
-    if (!disable && state.gate.enabled && !state.camera.profile.ai_enabled) { message('Включите AI для камеры на вкладке «Обзор», прежде чем включать учёт.', 'err', 'calibration-message'); return; }
     if (!disable && !$('calibration-form').reportValidity()) return;
     const c = state.config, g = disable ? gateFrom(c) : state.gate;
     const payload = {role: g.role, enabled: disable ? false : g.enabled,
@@ -582,7 +578,7 @@
     try {
       const saved = await request(attendance, 'PUT', payload); state.config = saved; state.runtime = saved;
       if (!disable) state.gate = gateFrom(saved); else state.gate.enabled = false;
-      message(disable ? 'Учёт отключён. Черновик геометрии сохранён.' : 'Проход учёта сохранён. Требуется повторная наладка; сцена отдельно не сохранялась.', 'ok', 'calibration-message');
+      message(disable ? 'Учёт проходов отключён. Черновик геометрии сохранён.' : `Проход сохранён.${saved.enabled && !state.camera?.profile.time_tracking ? ' «Учёт времени» для камеры выключен — проходы не учитываются.' : ''}`, 'ok', 'calibration-message');
       showRuntime();
       window.dispatchEvent(new CustomEvent('camera-attendance-changed'));
     } catch (e) { errorMessage(e, 'calibration-message'); }
@@ -980,10 +976,6 @@
   }});
   function updateCamera(camera) {
     state.camera = camera; state.cameraStatus = camera.status || 'OFFLINE';
-    const allowed = camera.profile?.zone === 'ENTRANCE', button = $('mapping-mode-gate');
-    const changed = button.disabled === allowed;
-    button.disabled = !allowed; $('mapping-entrance-help').hidden = allowed;
-    if (changed) modeTabs.refresh();
     showRuntime(); buttons();
   }
   async function load() {

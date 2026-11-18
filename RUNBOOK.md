@@ -1,6 +1,6 @@
 # Camera monitoring: operational runbook
 
-Local FastAPI app: Dahua RTSP → detection/tracking/employee faces → calibrated doorway events and operator-reviewed work intervals. Optional OSNet cross-camera observations are separate from attendance. Video recording is **manual**, not always-on.
+Local FastAPI app: Dahua RTSP → detection/tracking/employee faces → all-camera presence segments and work-time reports. Same-day OSNet appearance can carry face-confirmed identity across cameras. Video recording is **manual**, not always-on.
 
 **No application authentication.** Use localhost or a firewall-restricted trusted LAN/VPN only; never expose the app publicly. An operator name or `X-Operator-Request: 1` is not a verified identity.
 
@@ -68,7 +68,7 @@ At `/` (**Камеры**), choose **Добавить устройство**:
 1. Enter a bare hostname/IP, separate RTSP port (normally 554), username and password. Do not enter a URL, credentials or port in the host field. IPv6 is accepted with or without brackets. Blank password while editing retains the saved secret.
 2. For a recorder, discover channel titles through CGI or enter channels **1–64** manually. Lack of CGI permission does not prevent manual RTSP setup. Choose a name and `main` (subtype 0) or `sub` (subtype 1) per selected channel.
 3. Probe the connection, then save and inspect the live preview. The connection test probes metadata; it does not save/start a reader or prove sustained decoding. Saving an enabled camera starts its reader; disabled cameras can be saved for later. Opening preview does not itself start a stopped reader.
-4. Selected recorder channels save in one atomic batch: invalid/duplicate sources reject the batch, without a partial set. Saving a camera does **not** start recording or commission attendance.
+4. Selected recorder channels save in one atomic batch: invalid/duplicate sources reject the batch, without a partial set. Saving a camera does **not** start recording or enable time tracking.
 5. Configure HTTP/HTTPS and port separately for recorder CGI/archive. Archive playback also needs an explicitly confirmed fixed device UTC offset (**−720…840 minutes**); workplace/browser time is not proof of the recorder's clock. There is no automatic DST or clock adjustment.
 
 The supported RTSP path is:
@@ -79,7 +79,7 @@ rtsp://USER:ENCODED_PASSWORD@HOST:PORT/cam/realmonitor?channel=1&subtype=1
 
 CGI title discovery, live RTSP, archive search and archive playback are separate capabilities. HTTPS certificates are verified; redirects/system proxies are not used for CGI. Real compatibility depends on device/firmware and permissions, not merely a successful protocol fixture or title lookup.
 
-Changing host, RTSP port, credentials, channel or stream invalidates attendance calibration/admission and stops active recording; recheck and recommission. Archive-only HTTP/offset changes do not rewrite attendance/history. Cameras with history cannot be deleted: disable them.
+Changing host, RTSP port, credentials, channel or stream invalidates the door-gate calibration and stops active recording; redraw the gate. Archive-only HTTP/offset changes do not rewrite attendance/history. Cameras with history cannot be deleted: disable them.
 
 ## 3. Employees and workplaces
 
@@ -90,22 +90,24 @@ Changing host, RTSP port, credentials, channel or stream invalidates attendance 
 - The detail page has data/photos/work time/history, explicit photo save/cancel and conflict recovery. Edit metadata/photo sets using the revision from the latest response. On 409, reload the current version, inspect the retained draft, then explicitly reapply it.
 - Only embeddings/aligned thumbnails are retained, not original uploads. Old incomplete records can be repaired without changing their ID/history. Employee deletion is blocked when history exists; deactivate instead.
 - Pending journal identifications also block employee deletion, including commands already taken by the writer. A later lost, closed or conflicted visit still preserves the former employee through its durable identification history; clearing live identity does not permit deleting that history.
-- Gallery startup retains valid matching model/alignment vectors unchanged, including samples without thumbnails. Other samples are re-embedded only from valid stored 112×112 aligned JPEGs. Unconvertible samples remain stored but cannot match. Changed owners advance their employee revision once in the same transaction as the gallery revision and commissioning revocation; a compatible restart writes nothing. Stored/usable counts describe provenance, while employee readiness separately reflects actual face-engine and gallery availability.
+- Gallery startup retains valid matching model/alignment vectors unchanged, including samples without thumbnails. Other samples are re-embedded only from valid stored 112×112 aligned JPEGs. Unconvertible samples remain stored but cannot match. Changed owners advance their employee revision once with the gallery revision; a compatible restart writes nothing. Stored/usable counts describe provenance; readiness separately reflects face-engine and gallery availability.
 - Photo preparation shares one nonblocking enrollment lease; overlapping requests return `503 ENROLLMENT_BUSY`, not concurrent unbounded CUDA work. Replaying a committed create request retains its original receipt.
 
 Workplaces are optional labels, not schedules, time zones, geofences or attendance admission. Create one beside the selector or manage them at `/settings`; multiple assignments are supported. Archiving preserves assignments/history. An archived label may be retained or removed from an existing employee, not newly assigned; there is no hard-delete workplace action.
 
 ## 4. Attendance versus observation archives
 
-**Current accounting** is `/presence` (**Рабочее время**) and `/api/attendance/*`: calibrated ENTRY/EXIT crossings, employee evidence, operator decisions, confirmed intervals and reports. Camera visibility, global IDs, restart, midnight or a missing frame do not create an entry/exit.
+**Current accounting** is `/presence` (**Рабочее время**) and `/api/attendance/*`. Enable **Учёт времени** on each participating camera (this also enables AI; turning AI off turns time tracking off). New cameras start with time tracking off. Zone does not restrict accounting. Door gates are optional and do not require commissioning or CUDA admission.
 
-Automatic acceptance remains closed until the installation is calibrated and commissioned on site. Admission is bound to source/geometry revisions, model configuration, thresholds and actual providers; changed inputs require renewed acceptance. Current technical readiness and commissioning are separate. CPU fallback does not meet the automatic-admission CUDA requirement. Follow the actual field acceptance procedure in [ATTENDANCE.md](ATTENDANCE.md#ввод-автоматического-учёта-в-эксплуатацию); this runbook makes no claim that an installation has passed it.
+Continuous employee sightings no more than 60 seconds apart form a per-camera segment. Today's **LIVE** calculation bridges gaps up to `ATTENDANCE_LIVE_GAP_MINUTES` (default 35); a finished local day's **FINAL** calculation bridges up to `ATTENDANCE_DAY_GAP_MINUTES` (default 120). Longer absences are subtracted. A nearby exit/entry pair removes its door gap even when short. Reports use `ATTENDANCE_UTC_OFFSET_MINUTES` (default **UTC+05:00**), not browser/server local time; midnight splits time.
 
-Manual events and operator review remain available without automatic admission. Review unknown crossings, conflicting events and coverage gaps; corrections require an operator signature/reason and preserve the audit trail. Open time is provisional. Reports use `ATTENDANCE_UTC_OFFSET_MINUTES` (default **UTC+05:00**), not browser/server local time. A complete day needs completed coverage and resolved blockers.
+Faces establish employee identity; a short-lived, same-day body gallery can identify a faceless track after two confident matches. Similar clothing remains a risk; review the timeline. Add manual presence or exclude a wrong automatic span with an operator name and reason. Corrections are at most 24 hours, cannot end in the future, and can be revoked without deletion. JSON/CSV reports share one calculation and allow up to 366 inclusive dates.
 
-**Legacy presence** is read-only `GET /api/presence/legacy`, with `trusted_for_hours=false`. Historical recognition updates/`last_seen_at` never proved continuous visibility or a real departure; an unclosed legacy row is not current presence. Old sessions are not imported into work hours. Removed `/api/presence/active` and old presence-list routes are not the current attendance API; `PRESENCE_END_TIMEOUT` does not control worked hours.
+**Upgrade warning:** attendance-v1/v2 → v3 deletes old events, sessions, evidence, review/coverage history and `presence_sessions` after a verified `data/backups/pre-attendance-<UTC>.db` backup. Employees/photos/cameras/gates remain. Operator-v6 initializes `time_tracking = ai_enabled` for existing profiles. New history starts with new observations. Setup-transfer-v4 includes this switch; v3 imports inherit AI, v1/v2 imports enable it.
 
-**Human journal** at `/global` defaults to generation-bound visits, including provisional first hits and people without usable faces/body crops. UUID detail pages are `/global/visits/{uuid}`; links appear only after durable acknowledgement. Existing integer URLs and the probabilistic cross-camera archive remain read-only and are not attendance authority. Optional body linking never assigns an employee or creates work sessions. Restart closes open visits at their last real observation and starts an empty live appearance gallery; new global IDs are allocated transactionally by SQLite, not guessed from archived vectors.
+`PresenceFlusher` writes memory observations every second and retries database failures, exposed as `PERSISTENCE_ERROR`. Pending door crossings are bounded at 1000; overflow drops the oldest and increments `dropped_crossings`. Unsaved memory is not crash-durable. There are no review queues, coverage blockers, admission checks or attendance evidence-retention setting.
+
+**Human journal** at `/global` remains separate: generation-bound visits, including people without usable faces/body crops. UUID detail pages are `/global/visits/{uuid}`; links appear only after durable acknowledgement. The journal's probabilistic cross-camera archive is not work-time authority. Restart closes open visits at their last real observation and starts an empty live appearance gallery; new global IDs are allocated by SQLite.
 
 `JOURNAL_DEGRADED`/`JOURNAL_GAP` mean completeness is not established. Accepted work is retried in order; saturated generations close at the admitted cutoff before continuity resets. Shutdown reports unresolved work honestly. Disable cameras with history or pending journal generations instead of deleting them. `JOURNAL_IMAGE_KEEP_DAYS` defaults to30, range1–365, applied on next startup. Hourly purge removes visit images, never visit/event metadata, employee samples or the legacy archive; maintenance runs even with live AI disabled.
 

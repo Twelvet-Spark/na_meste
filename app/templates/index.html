@@ -10,7 +10,7 @@
 {% block content %}
   <main class="container wide camera-workspace">
     <header class="page-heading">
-      <div><h1>Камеры</h1><p class="muted">Dahua: отдельные камеры и каналы регистратора. Подключение не запускает запись и не заменяет наладку учёта.</p></div>
+      <div><h1>Камеры</h1><p class="muted">Dahua: отдельные камеры и каналы регистратора. Подключение не запускает запись; время считается только по камерам с включённым «Учётом времени».</p></div>
     </header>
     <section class="panel" aria-label="Подключённые камеры">
       <div class="directory-summary">
@@ -46,6 +46,8 @@
         <button class="btn" type="button" data-camera-action="SET_INTERIOR">Сделать внутренними</button>
         <button class="btn" type="button" data-camera-action="AI_ON">AI вкл</button>
         <button class="btn" type="button" data-camera-action="AI_OFF">AI выкл</button>
+        <button class="btn" type="button" data-camera-action="TIME_ON">Учёт времени вкл</button>
+        <button class="btn" type="button" data-camera-action="TIME_OFF">Учёт времени выкл</button>
         <button class="btn" type="button" data-camera-action="ENABLE">Включить</button>
         <button class="btn" type="button" data-camera-action="DISABLE">Отключить</button>
       </div>

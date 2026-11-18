@@ -171,6 +171,7 @@ class HumanJournal:
         self._startup = True
         self._purge_pending = False
         self._last_purge = float('-inf')
+        self._next_tick_at = self._monotonic() + 1.
         self._inflight: _Command | None = None
         self._error: str | None = None
         self._capacity_degraded = False
@@ -651,6 +652,11 @@ class HumanJournal:
     def _run(self):
         while True:
             with self._condition:
+                # The journal owns its maintenance even when no AI worker exists.
+                mono = self._monotonic()
+                if not self._closing and mono >= self._next_tick_at:
+                    self.tick(self._now())
+                    self._next_tick_at = mono + 1.
                 if (self._closing and self._stop_deadline is not None
                         and time.monotonic() >= self._stop_deadline):
                     self._condition.notify_all()
@@ -662,7 +668,7 @@ class HumanJournal:
                     self._condition.notify_all()
                     if self._closing:
                         return
-                    self._condition.wait()
+                    self._condition.wait(max(0., self._next_tick_at - self._monotonic()))
                     continue
                 delay = self._retry_at - self._monotonic() if self._error else 0.
                 if delay > 0:

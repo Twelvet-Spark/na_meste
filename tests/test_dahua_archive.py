@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session
 from app.api import cameras
 from app.database.database import get_db, immediate_session
 from app.database.models import (
-    AttendanceCamera, AttendanceCommission, AttendanceEvent, AttendanceRuntime, Camera,
+    AttendanceCamera, Camera, Employee, PresenceSegment,
 )
 from app.rtsp.dahua import build_rtsp_url, mask_url
 from app.services import camera_service
@@ -595,12 +595,6 @@ def test_two_absent_archive_drafts_use_null_and_stale_save_rolls_back_live_chang
             config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
             config.door_kind, config.door_top = "DOOR", [[0., .1], [1., .1]]
             config.reference_width, config.reference_height = 1920, 1080
-            commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Verified",
-                                             configuration_fingerprint={"version": 1}, acceptance_record={})
-            db.add(commission)
-            db.flush()
-            commission_id = commission.id
-            db.get(AttendanceRuntime, 1).commission_id = commission_id
         first = client.json("PUT", path, {
             "archive": archive(), "expected_archive_revision": None})
         assert (first["archive"]["http_scheme"], first["archive"]["http_port"],
@@ -608,14 +602,13 @@ def test_two_absent_archive_drafts_use_null_and_stale_save_rolls_back_live_chang
         with Session(engine) as db:
             config = db.get(AttendanceCamera, saved["id"])
             assert (config.source_revision, config.revision, config.enabled) == (1, 0, True)
-            assert db.get(AttendanceRuntime, 1).commission_id == commission_id
         before = dump(engine)
         publications = (list(manager.started), list(manager.synced), list(manager.stopped))
         client.json("PUT", path, {
             "name": "Stale draft", "password": "stale-secret", "channel": 2,
             "archive": archive(http_scheme="https", http_port=443, utc_offset_minutes=240),
             "expected_archive_revision": None}, status=409)
-        assert dump(engine) == before, "Stale absence must roll back camera, source, calibration and commission"
+        assert dump(engine) == before, "Stale absence must roll back camera, source and calibration"
         assert (manager.started, manager.synced, manager.stopped) == publications
         assert client.json("GET", path) == first, "The first archive configuration must survive the stale draft"
 
@@ -678,7 +671,7 @@ def test_existing_archive_revision_zero_accepts_zero_and_advances_to_one():
 
 
 @test
-def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidation():
+def test_archive_edit_cas_is_separate_from_live_source_invalidation():
     with api() as (client, engine, manager, _root):
         saved = create(client, archive=archive())
         assert saved.get("archive") is not None, "Single-camera creation must persist/output explicit archive settings"
@@ -690,12 +683,6 @@ def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidati
             config.line_start, config.line_end, config.inside_point = [0., .5], [1., .5], [.5, .8]
             config.door_kind, config.door_top = "DOOR", [[0., .1], [1., .1]]
             config.reference_width, config.reference_height = 1920, 1080
-            commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Verified",
-                                             configuration_fingerprint={"version": 1}, acceptance_record={})
-            db.add(commission)
-            db.flush()
-            commission_id = commission.id
-            db.get(AttendanceRuntime, 1).commission_id = commission_id
         changed = client.json("PUT", f"/api/cameras/{camera_id}", {
             "archive": archive(http_scheme="https", http_port=443, utc_offset_minutes=240),
             "expected_archive_revision": 0})
@@ -703,7 +690,6 @@ def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidati
         with Session(engine) as db:
             config = db.get(AttendanceCamera, camera_id)
             assert (config.source_revision, config.revision, config.enabled) == (1, 0, True)
-            assert db.get(AttendanceRuntime, 1).commission_id == commission_id
         assert not manager.synced[-1][1] & {"nvr_host", "rtsp_port", "username", "password", "channel", "stream_type"}
         before = dump(engine)
         client.json("PUT", f"/api/cameras/{camera_id}", {
@@ -714,7 +700,6 @@ def test_archive_edit_cas_is_separate_from_live_source_and_commission_invalidati
         with Session(engine) as db:
             config = db.get(AttendanceCamera, camera_id)
             assert (config.source_revision, config.revision, config.enabled) == (2, 1, False)
-            assert db.get(AttendanceRuntime, 1).commission_id is None
         assert manager.synced[-1][0].source_revision == 2
 
 
@@ -792,9 +777,11 @@ def test_camera_archive_settings_are_deleted_but_historical_camera_still_returns
             assert db.exec_driver_sql("SELECT count(*) FROM cameras").scalar_one() == 0
         historical = create(client, archive=archive())
         with immediate_session(engine) as db:
-            db.add(AttendanceEvent(id="camera-history", source_key="camera-history", source="CAMERA",
-                camera_id=historical["id"], camera_name="Вход", direction="ENTRY", occurred_at=STAMP,
-                recorded_at=STAMP, status="VISITOR", raw={"version": 1, "candidate_employee_ids": []}))
+            employee = Employee(name="Сотрудник")
+            db.add(employee)
+            db.flush()
+            db.add(PresenceSegment(employee_id=employee.id, camera_id=historical["id"], started_at=STAMP,
+                                   last_seen_at=STAMP, face_seen=True))
         before, stopped = dump(engine), list(manager.stopped)
         client.json("DELETE", f"/api/cameras/{historical['id']}", status=409)
         assert dump(engine) == before and manager.stopped == stopped

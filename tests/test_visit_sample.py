@@ -21,7 +21,7 @@ from app.ai.face_recognition import EmbeddingStore
 from app.database.database import immediate_session
 from app.database.models import AttendanceCamera, AttendanceRuntime, Employee, EmployeeFace, FaceModelMetadata, HumanVisit, OperatorRequest
 from app.services.visit_sample_service import VisitSampleService, OPERATION
-from test_attendance_service import database
+from attendance_test_support import database
 
 MODEL = "a" * 64
 NOW = datetime(2026, 11, 16, 12)

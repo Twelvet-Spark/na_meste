@@ -21,7 +21,7 @@ const cameraTabs = window.OperatorUI.tabs($('camera-tabs'), {onChange(name) {
 
 function renderControls() {
   if (!camera?.profile || controlsBusy) return;
-  const profile = camera.profile, counting = Boolean(camera.attendance?.enabled);
+  const profile = camera.profile;
   $('camera-enabled').checked = camera.enabled;
   $('camera-enabled').disabled = false;
   $('camera-reconnect').disabled = !camera.enabled;
@@ -39,22 +39,16 @@ function renderControls() {
     $('camera-workplace').value = profile.workplace_id ?? '';
     controls.querySelectorAll('[name="camera-zone"]').forEach(input => { input.checked = input.value === profile.zone; });
     $('camera-ai-enabled').checked = profile.ai_enabled;
+    $('camera-time-tracking').checked = profile.time_tracking;
     $('camera-ai-fps').value = profile.ai_fps ?? '';
     profileRevision = profile.revision;
   }
   $('camera-workplace').disabled = false;
-  // Counting needs AI, so the switch is locked only while AI is on; a camera left without AI can be repaired.
-  $('camera-ai-enabled').disabled = counting && profile.ai_enabled;
-  $('camera-ai-enabled').setAttribute('aria-describedby', 'camera-ai-help');
-  $('camera-ai-fps').disabled = counting;
+  $('camera-ai-enabled').disabled = false;
+  $('camera-time-tracking').disabled = false;
+  $('camera-ai-fps').disabled = false;
   $('camera-profile-save').disabled = false;
-  controls.querySelectorAll('[name="camera-zone"]').forEach(input => {
-    input.disabled = counting && input.value === 'INTERIOR';
-    input.setAttribute('aria-describedby', 'camera-zone-help');
-  });
-  $('camera-zone-help').textContent = counting ? 'Сначала отключите учёт на этой камере, чтобы сделать её внутренней.' : '';
-  $('camera-ai-help').textContent = counting ? (profile.ai_enabled ? 'Камера учёта требует AI; сначала отключите учёт.' : 'Учёт включён, но AI выключен — включите AI.') : '';
-  $('camera-fps-help').textContent = counting ? 'Камера учёта работает с частотой учёта' : 'Пустое поле — общая частота AI.';
+  controls.querySelectorAll('[name="camera-zone"]').forEach(input => { input.disabled = false; });
 }
 function showCamera(cam) {
   camera = cam;
@@ -131,6 +125,8 @@ controls.querySelectorAll('[name="camera-stream"]').forEach(input => input.addEv
   }
 }));
 $('camera-profile-form').addEventListener('input', () => { profileDirty = true; });
+$('camera-time-tracking').addEventListener('change', () => { if ($('camera-time-tracking').checked) $('camera-ai-enabled').checked = true; });
+$('camera-ai-enabled').addEventListener('change', () => { if (!$('camera-ai-enabled').checked) $('camera-time-tracking').checked = false; });
 $('camera-profile-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (!camera || controlsBusy || !$('camera-profile-form').reportValidity()) return;
@@ -139,10 +135,9 @@ $('camera-profile-form').addEventListener('submit', async event => {
     workplace_id: $('camera-workplace').value ? Number($('camera-workplace').value) : null,
     zone: controls.querySelector('[name="camera-zone"]:checked').value,
     ai_enabled: $('camera-ai-enabled').checked,
+    time_tracking: $('camera-time-tracking').checked,
     ai_fps: $('camera-ai-fps').value === '' ? null : Number($('camera-ai-fps').value),
   };
-  // The attendance rate is managed separately; preserve its stored interior override.
-  if (camera.attendance?.enabled) delete payload.ai_fps;
   const result = await controlAction(`/api/cameras/${cameraId}/profile`, 'PUT', payload, 'Настройки камеры сохранены.');
   if (result) { profileDirty = false; renderControls(); }
 });
@@ -157,7 +152,7 @@ function labelFor(track) {
     base = `Неизвестный${conf ? ' ' + conf : ''}`;
   } else base = '…';
   const tag = `T${track.track_id}` + (track.global_id ? `·G${track.global_id}` : '');
-  return `${base} [${tag}]`;
+  return `${base}${track.identity_source === 'REID' ? ' · по внешности' : ''} [${tag}]`;
 }
 async function refreshBoxes() {
   // Detection metadata still drives source-staleness guards while the stream is hidden.

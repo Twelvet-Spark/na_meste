@@ -1,6 +1,7 @@
 """SQLAlchemy engine + сессии для SQLite (data/app.db)."""
 import logging
 from contextlib import contextmanager, nullcontext
+from typing import Callable, TypeVar
 from pathlib import Path
 from threading import Lock, RLock
 from weakref import WeakKeyDictionary
@@ -110,3 +111,17 @@ def immediate_session(bind: Engine, *, publish: bool = False):
         except BaseException:
             connection.rollback()
             raise
+
+
+T = TypeVar("T")
+
+
+def read_snapshot(engine: Engine, reader: Callable[[Session], T]) -> T:
+    """Run `reader` inside one explicit SQLite read snapshot."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN")
+        try:
+            with Session(bind=connection, expire_on_commit=False) as db:
+                return reader(db)
+        finally:
+            connection.rollback()

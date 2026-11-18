@@ -1,83 +1,27 @@
-"""Attendance calibration, consistent work views and audited human corrections."""
+"""Door-gate calibration and work-time views over presence segments, with audited corrections."""
 import base64
 import time
-from datetime import datetime
 from typing import Literal
 
 import cv2
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.ai.doorway import DoorwayCalibration
-from app.attendance_roles import covered_directions
-from app.attendance_types import (
-    ActiveView, AttendanceDate, CommissionInput, EventDecisionInput, EventDetail, EventPage, EventView,
-    GapDecisionInput, GapDetail, GapView, ManualEventInput, ReviewPage, SessionPage, VisitorBatchInput, milliseconds,
-)
+from app.api.operator_security import require_operator_request
+from app.attendance_types import AttendanceDate, CorrectionInput, RevokeInput, milliseconds
 from app.config import settings
-from app.database.database import get_db, immediate_session
-from app.database.models import (
-    AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
-    AttendanceEvent, AttendanceEvidence, AttendanceRuntime, Camera, CameraProfile, Employee, WorkSession,
-)
+from app.database.database import get_db, immediate_session, read_snapshot
+from app.database.models import AttendanceCamera, Camera, CameraProfile
 from app.rtsp.reader import CameraStatus
 from app.scene_geometry import validate_door
-from app.time_utils import attendance_iso, day_bounds, utcnow
-from app.services.attendance_queries import (
-    evaluate_session, event_view, gap_view, load_trust_blockers, read_snapshot,
-)
-from app.services.attendance_reports import AttendanceReport, build_report, report_csv
+from app.services import attendance_reports as reports
+from app.time_utils import attendance_iso, utcnow
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
-
-
-@router.get("/status")
-def attendance_status(request: Request):
-    service = getattr(request.app.state, "attendance", None)
-    if service is None:
-        raise HTTPException(503, "Attendance service unavailable")
-    snapshot = service.health.snapshot()
-
-    def read(db):
-        runtime = db.get(AttendanceRuntime, 1)
-        configurations = [_view(row) for row in db.query(AttendanceCamera).order_by(AttendanceCamera.camera_id)]
-        valid = service._commission_valid(db, invalidate=False, providers=snapshot["providers"])
-        blocked = service._clock_blocked(db)
-        commission = db.get(AttendanceCommission, runtime.commission_id) if runtime.commission_id else None
-        return dict(configuration=configurations, commission_id=runtime.commission_id,
-                    commissioning_required=not valid, clock_blocked=blocked,
-                    commission=None if commission is None else dict(
-                        id=commission.id, actor=commission.actor, reason=commission.reason,
-                        created_at=attendance_iso(commission.created_at),
-                        acceptance_record=commission.acceptance_record),
-                    monitoring_started_at=attendance_iso(runtime.monitoring_started_at),
-                    as_of=attendance_iso(milliseconds(service._now())),
-                    heartbeat_at=attendance_iso(runtime.heartbeat_at), stopped_at=attendance_iso(runtime.stopped_at),
-                    unresolved_crossings=db.query(AttendanceEvent).filter_by(status="REVIEW").count(),
-                    projection_conflicts=db.query(AttendanceEvent).filter(AttendanceEvent.projection_reasons != []).count(),
-                    unreviewed_gaps=db.query(AttendanceCoverageGap).filter_by(reviewed=False).count(),
-                    open_sessions=db.query(WorkSession).filter(WorkSession.ended_at.is_(None)).count(),
-                    utc_offset_minutes=settings.attendance_utc_offset_minutes)
-    try:
-        persisted = read_snapshot(service.engine, read)
-    except SQLAlchemyError as exc:
-        raise HTTPException(503, "Attendance status unavailable") from exc
-    snapshot.update(persisted)
-    snapshot["automatic_ready"] = (snapshot["technical_ready"] and not persisted["commissioning_required"]
-                                   and not persisted["clock_blocked"]
-                                   and not snapshot["pending_fault_count"] and not snapshot["pending_write_count"])
-    # Live faults and cached admission gates have different lifetimes. Only the
-    # latter are replaced with the current durable commission/clock decisions.
-    reasons = set(snapshot["technical_reasons"])
-    if persisted["commissioning_required"]:
-        reasons.add("COMMISSIONING_REQUIRED")
-    if persisted["clock_blocked"]:
-        reasons.add("CLOCK_DISCONTINUITY")
-    snapshot["reasons"] = sorted(reasons)
-    return snapshot
 
 
 class CalibrationInput(BaseModel):
@@ -130,7 +74,7 @@ class CalibrationView(BaseModel):
     ai_enabled: bool | None = None
     ai_included: bool | None = None
     ai_available: bool | None = None
-    commissioning_required: bool | None = None
+    time_tracking: bool | None = None
 
 
 class CalibrationSnapshotView(BaseModel):
@@ -169,13 +113,12 @@ def get_camera_calibration(camera_id: int, request: Request, db: Session = Depen
     try:
         data = _view(_configuration(db, camera_id))
         camera = db.get(Camera, camera_id)
-        runtime = db.get(AttendanceRuntime, 1)
         profile = db.get(CameraProfile, camera_id)
         worker = getattr(request.app.state, "ai_worker", None)
         data.update(camera_enabled=camera.enabled, ai_enabled=settings.ai_enabled,
                     ai_included=profile is not None and profile.ai_enabled,
                     ai_available=worker is not None and worker.is_alive(),
-                    commissioning_required=runtime is None or runtime.commission_id is None)
+                    time_tracking=profile is not None and profile.time_tracking)
         return data
     except SQLAlchemyError as exc:
         raise HTTPException(503, "Database unavailable") from exc
@@ -193,12 +136,6 @@ def put_camera_calibration(camera_id: int, payload: CalibrationInput, db: Sessio
                 raise HTTPException(409, "Calibration or camera source changed; freeze a new snapshot")
             if config.role is not None and payload.role is None:
                 raise HTTPException(409, "Assigned attendance role cannot be erased; disable instead")
-            if payload.enabled:
-                profile = writer.get(CameraProfile, camera_id)
-                if profile is None or profile.zone != "ENTRANCE":
-                    raise HTTPException(409, "Отнесите камеру к входам, прежде чем включать учёт")
-                if not profile.ai_enabled:
-                    raise HTTPException(409, "Включите AI для камеры, прежде чем включать учёт")
             config.role, config.enabled = payload.role, payload.enabled
             for name in ("line_start", "line_end", "inside_point"):
                 value = getattr(payload, name)
@@ -208,15 +145,6 @@ def put_camera_calibration(camera_id: int, payload: CalibrationInput, db: Sessio
             config.reference_width, config.reference_height = payload.reference_width, payload.reference_height
             config.revision += 1
             config.updated_at = utcnow()
-            runtime = writer.get(AttendanceRuntime, 1)
-            if runtime is None:
-                raise HTTPException(503, "Attendance runtime unavailable")
-            runtime.commission_id = None
-            writer.flush()
-            roles = {row[0] for row in writer.query(AttendanceCamera.role).filter(
-                AttendanceCamera.enabled.is_(True)).all()}
-            if runtime.monitoring_started_at is None and covered_directions(roles) == {"ENTRY", "EXIT"}:
-                runtime.monitoring_started_at = utcnow()
             writer.flush()
             result = _view(config)
         db.expire_all()
@@ -251,215 +179,100 @@ def get_camera_calibration_snapshot(camera_id: int, request: Request, db: Sessio
             "width": width, "height": height}
 
 
-def _service(request: Request):
-    service = getattr(request.app.state, "attendance", None)
-    if service is None:
-        raise HTTPException(503, "Attendance service unavailable")
-    return service
+# ------------------------------------------------------------------ work time
+
+def _presence(request: Request):
+    presence = getattr(request.app.state, "presence", None)
+    if presence is None:
+        raise HTTPException(503, "Work-time recording unavailable")
+    return presence
 
 
-def _read(request, reader):
+def _read(request: Request, reader):
     try:
-        return read_snapshot(_service(request).engine, reader)
+        return read_snapshot(_presence(request).engine, reader)
     except SQLAlchemyError as exc:
-        raise HTTPException(503, "Attendance storage unavailable; retry the request") from exc
+        raise HTTPException(503, "Work-time storage unavailable; retry the request") from exc
 
 
-def _validate_filters(db, employee_id, from_date, to_date):
-    if from_date is not None and to_date is not None and to_date < from_date:
-        raise HTTPException(422, "End date precedes start date")
-    if employee_id is not None and db.get(Employee, employee_id) is None:
-        raise HTTPException(404, "Employee not found")
+def _now():
+    return milliseconds(utcnow())
 
 
-def _dates(query, column, from_date, to_date):
-    if from_date is not None:
-        query = query.filter(column >= day_bounds(from_date)[0])
-    if to_date is not None:
-        query = query.filter(column < day_bounds(to_date)[1])
-    return query
+@router.get("/status")
+def attendance_status(request: Request):
+    presence = _presence(request)
+    state = request.app.state
+    manager = getattr(state, "manager", None)
+    worker = getattr(state, "ai_worker", None)
 
-
-def _event_query(db, employee_id, from_date, to_date, status=None):
-    query = db.query(AttendanceEvent)
-    if employee_id is not None:
-        query = query.filter(AttendanceEvent.employee_id == employee_id)
-    if status is not None:
-        query = query.filter(AttendanceEvent.status == status)
-    return _dates(query, AttendanceEvent.occurred_at, from_date, to_date)
-
-
-@router.get("/events", response_model=EventPage)
-def list_events(request: Request, employee_id: int | None = None,
-                from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
-                status: Literal["ACCEPTED", "REVIEW", "VISITOR", "VOID"] | None = None,
-                limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     def read(db):
-        _validate_filters(db, employee_id, from_date, to_date)
-        query = _event_query(db, employee_id, from_date, to_date, status)
-        total = query.count()
-        rows = query.order_by(AttendanceEvent.occurred_at.desc(), AttendanceEvent.id.desc()).offset(offset).limit(limit)
-        return EventPage(items=[event_view(db, row) for row in rows], total=total, limit=limit, offset=offset)
-    return _read(request, read)
+        rows = db.query(Camera, CameraProfile).outerjoin(
+            CameraProfile, CameraProfile.camera_id == Camera.id).order_by(Camera.channel, Camera.id).all()
+        return [{"camera_id": camera.id, "name": camera.name, "enabled": camera.enabled,
+                 "time_tracking": bool(profile is not None and profile.time_tracking),
+                 "ai_enabled": bool(profile is not None and profile.ai_enabled),
+                 "status": manager.status(camera.id)["status"] if manager is not None else "OFFLINE"}
+                for camera, profile in rows]
+    cameras = _read(request, read)
+    return {"as_of": attendance_iso(_now()), "utc_offset_minutes": settings.attendance_utc_offset_minutes,
+            "live_gap_minutes": settings.attendance_live_gap_minutes,
+            "day_gap_minutes": settings.attendance_day_gap_minutes,
+            "ai_enabled": settings.ai_enabled, "worker_alive": worker is not None and worker.is_alive(),
+            "face_available": getattr(state, "embedding_store", None) is not None,
+            "appearance_available": worker is not None and getattr(worker, "reid", None) is not None,
+            "cameras": cameras, "recorder": presence.snapshot()}
 
 
-def _public_effective(snapshot):
-    result = dict(snapshot)
-    if result.get("occurred_at") is not None:
-        result["occurred_at"] = attendance_iso(datetime.fromisoformat(result["occurred_at"]))
-    return result
+@router.get("/active")
+def attendance_active(request: Request):
+    as_of = _now()
+    return _read(request, lambda db: reports.active_view(db, as_of))
 
 
-@router.get("/events/{event_id}", response_model=EventDetail)
-def event_detail(event_id: str, request: Request):
-    def read(db):
-        row = db.get(AttendanceEvent, event_id)
-        if row is None:
-            raise HTTPException(404, "Event not found")
-        decisions = [dict(
-            id=item.id, request_id=item.request_id, revision=item.revision, actor=item.actor,
-            reason=item.reason, before=_public_effective(item.before), after=_public_effective(item.after),
-            created_at=attendance_iso(item.created_at),
-        ) for item in db.query(AttendanceDecision).filter_by(event_id=event_id).order_by(
-            AttendanceDecision.revision, AttendanceDecision.id)]
-        return EventDetail(**event_view(db, row).model_dump(), raw=row.raw, decisions=decisions)
-    return _read(request, read)
-
-
-@router.get("/events/{event_id}/evidence/{kind}")
-def event_evidence(event_id: str, kind: Literal["before", "after", "face"], request: Request):
-    def read(db):
-        if db.get(AttendanceEvent, event_id) is None:
-            raise HTTPException(404, "Event not found")
-        row = db.get(AttendanceEvidence, event_id)
-        if row is not None and row.purged_at is not None:
-            raise HTTPException(410, "Evidence retention period expired")
-        image = getattr(row, f"{kind}_jpeg") if row is not None else None
-        if not image:
-            raise HTTPException(404, "This evidence image is absent")
-        return image
-    return Response(_read(request, read), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-
-def _sessions(db, employee_id, from_date, to_date, status, as_of, *, active=False):
-    _validate_filters(db, employee_id, from_date, to_date)
-    query = db.query(WorkSession)
-    if employee_id is not None:
-        query = query.filter(WorkSession.employee_id == employee_id)
-    if active:
-        query = query.filter(WorkSession.ended_at.is_(None))
-    query = _dates(query, WorkSession.started_at, from_date, to_date)
-    blockers = load_trust_blockers(db, as_of=as_of)
-    rows = [evaluate_session(row, blockers, as_of=as_of) for row in query.order_by(
-        WorkSession.started_at.desc(), WorkSession.entry_event_id.desc())]
-    return [row for row in rows if status is None or row.status == status]
-
-
-@router.get("/sessions", response_model=SessionPage)
-def list_sessions(request: Request, employee_id: int | None = None,
-                  from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
-                  status: Literal["OPEN", "CLOSED", "REVIEW"] | None = None,
-                  limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
-    as_of = milliseconds(_service(request)._now())
-    def read(db):
-        rows = _sessions(db, employee_id, from_date, to_date, status, as_of)
-        return SessionPage(items=rows[offset:offset + limit], total=len(rows), limit=limit, offset=offset)
-    return _read(request, read)
-
-
-@router.get("/active", response_model=ActiveView)
-def active_sessions(request: Request, employee_id: int | None = None):
-    as_of = milliseconds(_service(request)._now())
-    def read(db):
-        rows = _sessions(db, employee_id, None, None, None, as_of, active=True)
-        return ActiveView(items=rows, total=len(rows), as_of=attendance_iso(as_of),
-                          utc_offset_minutes=settings.attendance_utc_offset_minutes)
-    return _read(request, read)
-
-
-def _report(request, from_date, to_date, employee_id):
-    as_of = milliseconds(_service(request)._now())
-    return _read(request, lambda db: build_report(db, from_date, to_date, employee_id, as_of=as_of))
-
-
-@router.get("/report", response_model=AttendanceReport)
-def attendance_report(request: Request, from_date: AttendanceDate, to_date: AttendanceDate, employee_id: int | None = None):
-    return _report(request, from_date, to_date, employee_id)
+@router.get("/report")
+def attendance_report(request: Request, from_date: AttendanceDate, to_date: AttendanceDate,
+                      employee_id: int | None = None):
+    as_of = _now()
+    return _read(request, lambda db: reports.build_report(db, from_date, to_date, employee_id, as_of))
 
 
 @router.get("/report.csv")
-def attendance_report_csv(request: Request, from_date: AttendanceDate, to_date: AttendanceDate, employee_id: int | None = None):
-    report = _report(request, from_date, to_date, employee_id)
-    return Response(report_csv(report), media_type="text/csv", headers={
-        "Content-Disposition": f'attachment; filename="attendance-{from_date}-{to_date}.csv"',
+def attendance_report_csv(request: Request, from_date: AttendanceDate, to_date: AttendanceDate,
+                          employee_id: int | None = None):
+    as_of = _now()
+    report = _read(request, lambda db: reports.build_report(db, from_date, to_date, employee_id, as_of))
+    return Response(reports.report_csv(report), media_type="text/csv; charset=utf-8", headers={
+        "Content-Disposition": f'attachment; filename="work-time-{from_date}-{to_date}.csv"',
         "Cache-Control": "no-store",
     })
 
 
-@router.get("/review", response_model=ReviewPage)
-def list_review(request: Request, employee_id: int | None = None,
-                from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None,
-                kind: Literal["event", "gap"] | None = None,
-                limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
-    def read(db):
-        _validate_filters(db, employee_id, from_date, to_date)
-        ordered = []
-        if kind != "gap":
-            events = _event_query(db, employee_id, from_date, to_date).filter(
-                (AttendanceEvent.status == "REVIEW") | (AttendanceEvent.projection_reasons != []))
-            ordered.extend((row.occurred_at, f"event:{row.id}", "event", row) for row in events)
-        if kind != "event":
-            gaps = db.query(AttendanceCoverageGap).filter_by(reviewed=False)
-            if from_date is not None:
-                lower = day_bounds(from_date)[0]
-                gaps = gaps.filter((AttendanceCoverageGap.ended_at.is_(None)) |
-                                   (AttendanceCoverageGap.ended_at > lower) |
-                                   (AttendanceCoverageGap.started_at >= lower))
-            if to_date is not None:
-                gaps = gaps.filter(AttendanceCoverageGap.started_at < day_bounds(to_date)[1])
-            ordered.extend((row.started_at, f"gap:{row.id}", "gap", row) for row in gaps)
-        ordered.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        items = [dict(kind=kind, **{kind: event_view(db, row) if kind == "event" else gap_view(row)})
-                 for _stamp, _key, kind, row in ordered[offset:offset + limit]]
-        return ReviewPage(items=items, total=len(ordered), limit=limit, offset=offset)
-    return _read(request, read)
+@router.get("/timeline")
+def attendance_timeline(request: Request, employee_id: int, date: AttendanceDate):
+    as_of = _now()
+    return _read(request, lambda db: reports.timeline(db, employee_id, date, as_of))
 
 
-@router.post("/events/{event_id}/decision", response_model=EventView)
-def decide_event(event_id: str, payload: EventDecisionInput, request: Request):
-    return _service(request).decide_event(event_id, payload)
+@router.get("/corrections")
+def list_corrections(request: Request, employee_id: int | None = None,
+                     from_date: AttendanceDate | None = None, to_date: AttendanceDate | None = None):
+    return _read(request, lambda db: reports.list_corrections(db, from_date, to_date, employee_id))
 
 
-@router.post("/visitors", response_model=list[EventView])
-def mark_visitors(payload: VisitorBatchInput, request: Request):
-    return _service(request).mark_visitors(payload)
+def _write(request: Request, action):
+    try:
+        return action(_presence(request).engine)
+    except SQLAlchemyError as exc:
+        raise HTTPException(503, "Work-time storage unavailable; the correction was not saved") from exc
 
 
-@router.post("/manual", response_model=EventView)
-def create_manual_event(payload: ManualEventInput, request: Request):
-    return _service(request).create_manual_event(payload)
+@router.post("/corrections/{kind}", dependencies=[Depends(require_operator_request)])
+def create_correction(kind: Literal["manual", "exclusion"], payload: CorrectionInput, request: Request):
+    return _write(request, lambda engine: reports.create_correction(engine, kind, payload, _now()))
 
 
-@router.post("/gaps/{gap_id}/review", response_model=GapView)
-def review_gap(gap_id: int, payload: GapDecisionInput, request: Request):
-    return _service(request).review_gap(gap_id, payload)
-
-
-@router.post("/commission")
-def commission(payload: CommissionInput, request: Request):
-    return _service(request).commission(payload)
-
-
-@router.get("/gaps/{gap_id}", response_model=GapDetail)
-def gap_detail(gap_id: int, request: Request):
-    def read(db):
-        row = db.get(AttendanceCoverageGap, gap_id)
-        if row is None:
-            raise HTTPException(404, "Coverage gap not found")
-        decisions = [dict(
-            id=item.id, request_id=item.request_id, revision=item.revision, actor=item.actor,
-            reason=item.reason, before=item.before, after=item.after, created_at=attendance_iso(item.created_at),
-        ) for item in db.query(AttendanceDecision).filter_by(gap_id=gap_id).order_by(
-            AttendanceDecision.revision, AttendanceDecision.id)]
-        return GapDetail(**gap_view(row).model_dump(), decisions=decisions)
-    return _read(request, read)
+@router.post("/corrections/{kind}/{correction_id}/revoke", dependencies=[Depends(require_operator_request)])
+def revoke_correction(kind: Literal["manual", "exclusion"], correction_id: int, payload: RevokeInput,
+                      request: Request):
+    return _write(request, lambda engine: reports.revoke_correction(engine, kind, correction_id, payload, _now()))

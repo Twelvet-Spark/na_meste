@@ -19,8 +19,8 @@
     if (text) value.textContent = text;
     return value;
   }
-  function roleLabel(role) {
-    return ({ BOTH: 'вход и выход', ENTRY: 'только вход', EXIT: 'только выход' })[role] || 'не настроен';
+  function gateLabel(role) {
+    return ({ BOTH: 'Проход: вход и выход', ENTRY: 'Проход: только вход', EXIT: 'Проход: только выход' })[role] || 'Проход';
   }
   function directoryTabs(items, places) {
     const known = new Map(places.map((place) => [place.id, place]));
@@ -133,8 +133,8 @@
     const people = node('p', 'cam-meta');
     const recording = node('span', 'p-badge');
     const badges = node('div', 'cam-card-badges');
-    const zone = node('span', 'p-badge'), ai = node('span', 'p-badge'), attendance = node('span', 'p-badge');
-    badges.append(zone, ai, attendance);
+    const zone = node('span', 'p-badge'), ai = node('span', 'p-badge'), timeTracking = node('span', 'p-badge', 'Учёт времени'), attendance = node('span', 'p-badge');
+    badges.append(zone, ai, timeTracking, attendance);
     const workplace = node('p', 'cam-meta muted');
     const result = node('p', 'cam-card-result'); result.hidden = true; result.setAttribute('role', 'status');
     const actions = node('div', 'cam-card-actions');
@@ -143,7 +143,7 @@
     const remove = node('button', 'btn danger', 'Удалить'); remove.type = 'button';
     const reconnect = node('button', 'btn ghost', 'Переподключить'); reconnect.type = 'button';
     const card = { element, title, status, meta, people, recording, image, unavailable, selection,
-      zone, ai, attendance, workplace, reconnect, result, camera, previewAt: 0, busy: false };
+      zone, ai, timeTracking, attendance, workplace, reconnect, result, camera, previewAt: 0, busy: false };
     reconnect.addEventListener('click', async () => {
       if (card.busy) return;
       card.busy = true; ui.setBusy(actions, true); result.hidden = false;
@@ -172,8 +172,9 @@
     card.zone.textContent = camera.profile.zone === 'ENTRANCE' ? 'Вход' : 'Внутренняя';
     card.ai.textContent = !camera.profile.ai_enabled ? 'AI выкл'
       : camera.profile.ai_fps == null ? 'AI' : `AI ${camera.profile.ai_fps.toLocaleString('ru-RU')} к/с`;
+    card.timeTracking.hidden = !camera.profile.time_tracking;
     card.attendance.hidden = !camera.attendance.enabled;
-    card.attendance.textContent = `Учёт: ${roleLabel(camera.attendance.role)}`;
+    card.attendance.textContent = gateLabel(camera.attendance.role);
     card.workplace.textContent = camera.profile.workplace_name
       ? `${camera.profile.workplace_name}${camera.profile.workplace_active ? '' : ' (архив)'}` : 'Без рабочего места';
     card.reconnect.disabled = card.busy || !camera.enabled;

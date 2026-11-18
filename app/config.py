@@ -90,7 +90,8 @@ class Settings(BaseSettings):
     attendance_face_min_size: int = Field(default=80, ge=1)
     attendance_face_det_score: float = Field(default=0.80, ge=0, le=1, allow_inf_nan=False)
     attendance_face_blur_min: float = Field(default=20.0, ge=0, allow_inf_nan=False)
-    attendance_evidence_keep_days: int = Field(default=30, ge=1)
+    attendance_live_gap_minutes: int = Field(default=35, ge=1, le=240)
+    attendance_day_gap_minutes: int = Field(default=120, ge=1, le=720)
 
     # --- Telegram ---
     telegram_enabled: bool = True
@@ -104,6 +105,8 @@ class Settings(BaseSettings):
     multi_camera_tracking_enabled: bool = True
     reid_embedding_interval: float = 2.5    # сек между обновлениями эмбеддинга трека
     reid_similarity_threshold: float = 0.80 # мин. косинус OSNet для кандидата
+    reid_employee_threshold: float = Field(default=0.80, gt=0, le=1)
+    reid_employee_margin: float = Field(default=0.05, ge=0, le=1)
     global_match_threshold: float = 0.65    # мин. composite score для связывания
     global_match_margin: float = 0.05       # мин. отрыв от второго кандидата (неоднозначность)
     global_gallery_ttl: float = 600.0       # сек жизни identity в памяти без наблюдений
@@ -122,6 +125,8 @@ class Settings(BaseSettings):
     def attendance_window(self):
         if self.attendance_face_interval > self.attendance_face_window:
             raise ValueError("ATTENDANCE_INTERVAL_EXCEEDS_WINDOW")
+        if self.attendance_day_gap_minutes < self.attendance_live_gap_minutes:
+            raise ValueError("attendance_day_gap_minutes must not be shorter than attendance_live_gap_minutes")
         return self
 
 

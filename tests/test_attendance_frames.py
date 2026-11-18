@@ -29,7 +29,7 @@ from app.database.attendance_schema import initialize_attendance_schema
 from app.database.models import AttendanceCamera, Camera, CameraProfile
 from app.rtsp.jpeg_cache import JPEGCache
 from app.rtsp.reader import CameraStatus, ConnectionLost, FrameBuffer, RTSPReader
-from app.services.attendance_service import AttendanceService
+from app.services.presence_recorder import PresenceRecorder
 
 TESTS = []
 STAMP = datetime(2026, 11, 11, 4, 0, 0, 123456)
@@ -67,7 +67,7 @@ def database():
                               password="p", channel=1))
                 db.commit()
                 db.add_all([AttendanceCamera(camera_id=1),
-                            CameraProfile(camera_id=1, zone="INTERIOR", ai_enabled=True, revision=0)])
+                            CameraProfile(camera_id=1, zone="INTERIOR", ai_enabled=True, time_tracking=False, revision=0)])
                 db.commit()
                 yield db
         finally:
@@ -301,7 +301,7 @@ def run_worker(stages, *, attendance=False, on_stage=None):
                 on_stage(index, db)
 
         worker = AIWorker(
-            LoopManager(stages, clock, advance), service, AttendanceService(db.get_bind()), state,
+            LoopManager(stages, clock, advance), service, PresenceRecorder(db.get_bind()), state,
         )
         # Match the fixture's 100 ms receipt cadence with a valid production
         # rate, leaving real scheduler slack for optional appearance work.

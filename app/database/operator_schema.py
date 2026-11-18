@@ -6,7 +6,7 @@ Recording metadata is installed explicitly by version 3, never via create_all.
 from app.operator_settings import legacy_ai_camera_ids
 from app.time_utils import utcnow
 
-VERSION = 5
+VERSION = 6
 LEGACY_EMPLOYEE_DDL = """CREATE TABLE employees (
     id INTEGER NOT NULL,
     name VARCHAR(150) NOT NULL,
@@ -227,9 +227,23 @@ V5_INDEXES = {
     **V4_INDEXES,
     "ix_camera_profiles_workplace": "CREATE INDEX ix_camera_profiles_workplace ON camera_profiles (workplace_id)",
 }
-INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES}
-SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES}
-TABLES = frozenset(V5_TABLES)
+V6_CAMERA_PROFILES_DDL = """CREATE TABLE camera_profiles (
+        camera_id INTEGER NOT NULL PRIMARY KEY,
+        workplace_id INTEGER,
+        zone VARCHAR(8) NOT NULL CHECK (zone IN ('INTERIOR','ENTRANCE')),
+        ai_enabled BOOLEAN NOT NULL CHECK (ai_enabled IN (0,1)),
+        ai_fps FLOAT CHECK (ai_fps IS NULL OR (ai_fps > 0 AND ai_fps <= 30)),
+        time_tracking BOOLEAN NOT NULL CHECK (time_tracking IN (0,1) AND (time_tracking = 0 OR ai_enabled = 1)),
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE CASCADE,
+        FOREIGN KEY(workplace_id) REFERENCES workplaces (id) ON DELETE RESTRICT
+    )"""
+V6_TABLES = {**V5_TABLES, "camera_profiles": V6_CAMERA_PROFILES_DDL}
+V6_INDEXES = V5_INDEXES
+INDEXES = {1: {}, 2: {}, 3: V3_INDEXES, 4: V4_INDEXES, 5: V5_INDEXES, 6: V6_INDEXES}
+SCHEMAS = {1: V1_TABLES, 2: V2_TABLES, 3: V3_TABLES, 4: V4_TABLES, 5: V5_TABLES, 6: V6_TABLES}
+TABLES = frozenset(V6_TABLES)
 
 
 def _refuse(detail):
@@ -343,3 +357,17 @@ def install(connection, installed=0):
             "UPDATE camera_scenes SET geometry = json_set(json_set(geometry, '$.version', 2), "
             "'$.doors', json('[]'))")
         connection.exec_driver_sql("UPDATE operator_schema SET version=5,updated_at=? WHERE id=1", (now,))
+        installed = 5
+    if installed == 5:
+        now = utcnow().isoformat(sep=" ")
+        connection.exec_driver_sql("DROP INDEX ix_camera_profiles_workplace")
+        connection.exec_driver_sql("ALTER TABLE camera_profiles RENAME TO camera_profiles_v5")
+        connection.exec_driver_sql(V6_TABLES["camera_profiles"])
+        # Cameras that already ran AI start tracking time.
+        connection.exec_driver_sql(
+            "INSERT INTO camera_profiles (camera_id, workplace_id, zone, ai_enabled, ai_fps, time_tracking, "
+            "revision, updated_at) SELECT camera_id, workplace_id, zone, ai_enabled, ai_fps, ai_enabled, "
+            "revision, updated_at FROM camera_profiles_v5")
+        connection.exec_driver_sql("DROP TABLE camera_profiles_v5")
+        connection.exec_driver_sql(V6_INDEXES["ix_camera_profiles_workplace"])
+        connection.exec_driver_sql("UPDATE operator_schema SET version=6,updated_at=? WHERE id=1", (now,))

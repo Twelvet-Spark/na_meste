@@ -159,31 +159,6 @@ class EmployeeFace(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
-class PresenceSession(Base):
-    """Сессия присутствия сотрудника на камере.
-
-    Вместо тысяч событий на каждый кадр — одна открытая сессия:
-    started_at при первом подтверждении, last_seen_at обновляется,
-    ended_at = last_seen_at при исчезновении (по таймауту).
-    """
-    __tablename__ = "presence_sessions"
-    __table_args__ = (
-        Index("ix_presence_emp_cam_end", "employee_id", "camera_id", "ended_at"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    employee_id: Mapped[int] = mapped_column(
-        ForeignKey("employees.id", ondelete="CASCADE"), index=True
-    )
-    camera_id: Mapped[int] = mapped_column(
-        ForeignKey("cameras.id", ondelete="CASCADE"), index=True
-    )
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-
-
 class GlobalPerson(Base):
     """Глобальная личность человека (global_id) — единая для всех камер.
 
@@ -312,162 +287,99 @@ class AttendanceCamera(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
-class AttendanceEvent(Base):
-    __tablename__ = "attendance_events"
-    __table_args__ = (
-        CheckConstraint("source IN ('CAMERA', 'MANUAL')", name="ck_attendance_event_source"),
-        CheckConstraint("direction IS NULL OR direction IN ('ENTRY', 'EXIT')", name="ck_attendance_event_direction"),
-        CheckConstraint("status IN ('ACCEPTED', 'REVIEW', 'VISITOR', 'VOID')", name="ck_attendance_event_status"),
-        CheckConstraint("revision >= 0", name="ck_attendance_event_revision"),
-        CheckConstraint("json_valid(raw) AND json_type(raw, '$.version') IS 'integer' "
-                        "AND json_extract(raw, '$.version') = 1", name="ck_attendance_event_raw_version"),
-    )
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    source_key: Mapped[str] = mapped_column(String, unique=True)
-    source: Mapped[str] = mapped_column(String(6))
-    camera_id: Mapped[int | None] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"), nullable=True)
-    camera_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    stream_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    tracking_generation: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    crossing_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    raw: Mapped[dict] = mapped_column(JSON)
-    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), nullable=True)
-    employee_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
-    direction: Mapped[str | None] = mapped_column(String(5), nullable=True)
-    occurred_at: Mapped[datetime] = mapped_column(DateTime)
-    status: Mapped[str] = mapped_column(String(8))
-    revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
-    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
-    projection_reasons: Mapped[list] = mapped_column(JSON, default=list)
-
-
-class AttendanceEvidence(Base):
-    __tablename__ = "attendance_evidence"
-
-    event_id: Mapped[str] = mapped_column(ForeignKey("attendance_events.id", ondelete="CASCADE"), primary_key=True)
-    before_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    after_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    face_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
-    purged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-
-class AttendanceRequest(Base):
-    __tablename__ = "attendance_requests"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    operation: Mapped[str] = mapped_column(String(100))
-    payload: Mapped[dict] = mapped_column(JSON)
-    result: Mapped[dict | list] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-
-class AttendanceDecision(Base):
-    __tablename__ = "attendance_decisions"
-    __table_args__ = (
-        CheckConstraint("(event_id IS NOT NULL AND gap_id IS NULL) OR "
-                        "(event_id IS NULL AND gap_id IS NOT NULL)", name="ck_attendance_decision_target"),
-        CheckConstraint("revision >= 0", name="ck_attendance_decision_revision"),
-        CheckConstraint("length(trim(actor)) BETWEEN 1 AND 100", name="ck_attendance_decision_actor"),
-        CheckConstraint("length(trim(reason)) BETWEEN 1 AND 1000", name="ck_attendance_decision_reason"),
-        UniqueConstraint("event_id", "revision", name="uq_attendance_decision_event_revision"),
-        UniqueConstraint("gap_id", "revision", name="uq_attendance_decision_gap_revision"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    request_id: Mapped[str] = mapped_column(ForeignKey("attendance_requests.id", ondelete="RESTRICT"))
-    event_id: Mapped[str | None] = mapped_column(ForeignKey("attendance_events.id", ondelete="RESTRICT"), nullable=True)
-    gap_id: Mapped[int | None] = mapped_column(ForeignKey("attendance_coverage_gaps.id", ondelete="RESTRICT"), nullable=True)
-    revision: Mapped[int] = mapped_column(Integer)
-    actor: Mapped[str] = mapped_column(String(100))
-    reason: Mapped[str] = mapped_column(String(1000))
-    before: Mapped[dict] = mapped_column(JSON)
-    after: Mapped[dict] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-
-class WorkSession(Base):
-    __tablename__ = "work_sessions"
-    __table_args__ = (
-        CheckConstraint("status IN ('OPEN', 'CLOSED', 'REVIEW')", name="ck_work_session_status"),
-        CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="ck_work_session_times"),
-        Index("uq_work_sessions_open_employee", "employee_id", unique=True,
-              sqlite_where=text("ended_at IS NULL")),
-    )
-
-    entry_event_id: Mapped[str] = mapped_column(ForeignKey("attendance_events.id", ondelete="RESTRICT"), primary_key=True)
-    exit_event_id: Mapped[str | None] = mapped_column(ForeignKey("attendance_events.id", ondelete="RESTRICT"), nullable=True, unique=True)
-    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), index=True)
-    employee_name: Mapped[str] = mapped_column(String(150))
-    started_at: Mapped[datetime] = mapped_column(DateTime)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    status: Mapped[str] = mapped_column(String(6))
-    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
-
-
-class AttendanceCoverageGap(Base):
-    __tablename__ = "attendance_coverage_gaps"
-    __table_args__ = (
-        CheckConstraint("singleton = 1", name="ck_attendance_gap_singleton"),
-        CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="ck_attendance_gap_times"),
-        CheckConstraint("revision >= 0", name="ck_attendance_gap_revision"),
-        CheckConstraint("reviewed IN (0, 1)", name="ck_attendance_gap_reviewed"),
-        Index("uq_attendance_coverage_gaps_open", "singleton", unique=True,
-              sqlite_where=text("ended_at IS NULL")),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    singleton: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
-    started_at: Mapped[datetime] = mapped_column(DateTime)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
-    source_fault_ids: Mapped[list] = mapped_column(JSON, default=list)
-    reviewed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
-    revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
-
-
-class AttendanceEmployeeReference(Base):
-    __tablename__ = "attendance_employee_references"
-
-    event_id: Mapped[str] = mapped_column(ForeignKey("attendance_events.id", ondelete="RESTRICT"), primary_key=True)
-    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), primary_key=True)
-    employee_name: Mapped[str] = mapped_column(String(150))
-
-
-class AttendanceCommission(Base):
-    __tablename__ = "attendance_commissions"
-    __table_args__ = (
-        CheckConstraint("length(trim(actor)) BETWEEN 1 AND 100", name="ck_attendance_commission_actor"),
-        CheckConstraint("length(trim(reason)) BETWEEN 1 AND 1000", name="ck_attendance_commission_reason"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    request_id: Mapped[str] = mapped_column(String(36), unique=True)
-    actor: Mapped[str] = mapped_column(String(100))
-    reason: Mapped[str] = mapped_column(String(1000))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    configuration_fingerprint: Mapped[dict] = mapped_column(JSON)
-    acceptance_record: Mapped[dict] = mapped_column(JSON)
-
-
 class AttendanceRuntime(Base):
     __tablename__ = "attendance_runtime"
     __table_args__ = (
         CheckConstraint("id = 1", name="ck_attendance_runtime_singleton"),
-        CheckConstraint("schema_version = 2", name="ck_attendance_runtime_version"),
+        CheckConstraint("schema_version = 3", name="ck_attendance_runtime_version"),
         CheckConstraint("gallery_revision >= 0", name="ck_attendance_runtime_gallery"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    schema_version: Mapped[int] = mapped_column(Integer, default=2, server_default=text("2"))
+    schema_version: Mapped[int] = mapped_column(Integer, default=3, server_default=text("3"))
     gallery_revision: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
-    commission_id: Mapped[int | None] = mapped_column(ForeignKey("attendance_commissions.id", ondelete="RESTRICT"), nullable=True)
-    monitoring_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    stopped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PresenceSegment(Base):
+    """One employee seen on one camera: consecutive sightings no more than 60 s apart."""
+    __tablename__ = "attendance_presence_segments"
+    __table_args__ = (
+        CheckConstraint("last_seen_at >= started_at", name="ck_presence_segment_order"),
+        CheckConstraint("face_seen IN (0, 1)", name="ck_presence_segment_face"),
+        Index("ix_presence_segments_employee_start", "employee_id", "started_at"),
+        Index("ix_presence_segments_start", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime)
+    face_seen: Mapped[bool] = mapped_column(Boolean)
+
+
+class DoorCrossing(Base):
+    __tablename__ = "attendance_door_crossings"
+    __table_args__ = (
+        CheckConstraint("direction IN ('ENTRY', 'EXIT')", name="ck_door_crossing_direction"),
+        Index("ix_door_crossings_employee_time", "employee_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(300), unique=True)
+    camera_id: Mapped[int] = mapped_column(ForeignKey("cameras.id", ondelete="RESTRICT"))
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    direction: Mapped[str] = mapped_column(String(5))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ManualPresenceInterval(Base):
+    """Audited operator interval; revoking keeps the row with the revoker and reason."""
+    __tablename__ = "attendance_manual_intervals"
+    __table_args__ = (
+        CheckConstraint("ended_at > started_at", name="ck_manual_interval_order"),
+        CheckConstraint("(revoked_at IS NULL AND revoked_by IS NULL AND revoke_reason IS NULL) OR "
+                        "(revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND revoke_reason IS NOT NULL)",
+                        name="ck_manual_interval_revoke"),
+        Index("ix_manual_intervals_employee_start", "employee_id", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), unique=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime] = mapped_column(DateTime)
+    actor: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class PresenceExclusion(Base):
+    """Audited operator exclusion of a wrong automatic span; same lifecycle as a manual interval."""
+    __tablename__ = "attendance_exclusions"
+    __table_args__ = (
+        CheckConstraint("ended_at > started_at", name="ck_exclusion_order"),
+        CheckConstraint("(revoked_at IS NULL AND revoked_by IS NULL AND revoke_reason IS NULL) OR "
+                        "(revoked_at IS NOT NULL AND revoked_by IS NOT NULL AND revoke_reason IS NOT NULL)",
+                        name="ck_exclusion_revoke"),
+        Index("ix_exclusions_employee_start", "employee_id", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), unique=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"))
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime] = mapped_column(DateTime)
+    actor: Mapped[str] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(String(1000))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
 class FaceModelMetadata(Base):
@@ -502,6 +414,7 @@ class CameraProfile(Base):
     zone: Mapped[str] = mapped_column(String(8))
     ai_enabled: Mapped[bool] = mapped_column(Boolean)
     ai_fps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_tracking: Mapped[bool] = mapped_column(Boolean)
     revision: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 

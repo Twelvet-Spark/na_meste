@@ -268,12 +268,23 @@ class SceneRecord(Record):
     geometry: TransferSceneGeometry
 
 
-class CameraProfileRecord(Record):
+class LegacyCameraProfileRecord(Record):
+    """Version 3 profile: time tracking did not exist yet."""
     camera_id: ID
     workplace_id: ID | None
     zone: Literal["INTERIOR", "ENTRANCE"]
     ai_enabled: bool
     ai_fps: float | None = Field(gt=0, le=30)
+
+
+class CameraProfileRecord(LegacyCameraProfileRecord):
+    time_tracking: bool
+
+    @model_validator(mode="after")
+    def tracking_needs_ai(self):
+        if self.time_tracking and not self.ai_enabled:
+            raise ValueError("time tracking requires AI")
+        return self
 
 
 class AssignmentRecord(Record):
@@ -350,7 +361,8 @@ class SetupDocumentV2(_SetupRecords):
     scenes: list[LegacySceneRecord] = Field(max_length=10000)
 
 
-class SetupDocument(_SetupRecords):
+class SetupDocumentV3(_SetupRecords):
+    """Authenticated v3 data: profiles without time tracking."""
     transfer_version: Literal[3]
     attendance_schema_version: Literal[2]
     operator_schema_version: Literal[5]
@@ -358,10 +370,21 @@ class SetupDocument(_SetupRecords):
     faces: list[FaceRecord] = Field(max_length=150000, repr=False)
     calibrations: list[CalibrationRecord] = Field(max_length=10000)
     scenes: list[SceneRecord] = Field(max_length=10000)
+    profiles: list[LegacyCameraProfileRecord] = Field(max_length=10000)
+
+
+class SetupDocument(_SetupRecords):
+    transfer_version: Literal[4]
+    attendance_schema_version: Literal[3]
+    operator_schema_version: Literal[6]
+    face_model_id: FaceModelID
+    faces: list[FaceRecord] = Field(max_length=150000, repr=False)
+    calibrations: list[CalibrationRecord] = Field(max_length=10000)
+    scenes: list[SceneRecord] = Field(max_length=10000)
     profiles: list[CameraProfileRecord] = Field(max_length=10000)
 
 
-TransferDocument = SetupDocument | SetupDocumentV2 | LegacySetupDocument
+TransferDocument = SetupDocument | SetupDocumentV3 | SetupDocumentV2 | LegacySetupDocument
 
 
 def decode_binary(value: str) -> bytes:
@@ -446,12 +469,12 @@ def validate_document(payload: bytes, *, expected_face_model_id: str | None = No
         if not isinstance(raw, dict):
             raise TransferError("TRANSFER_INVALID")
         version = raw.get("transfer_version")
-        schemas = {1: (3, 1), 2: (4, 1), 3: (5, 2)}.get(version) if type(version) is int else None
+        schemas = {1: (3, 1), 2: (4, 1), 3: (5, 2), 4: (6, 3)}.get(version) if type(version) is int else None
         if schemas is None or any(type(raw.get(k)) is not type(v) or raw.get(k) != v for k, v in (
             ("operator_schema_version", schemas[0]), ("attendance_schema_version", schemas[1]),
             ("embedding_encoding", "float32-le-512"))):
             raise TransferError("TRANSFER_INCOMPATIBLE")
-        model = {1: LegacySetupDocument, 2: SetupDocumentV2, 3: SetupDocument}[version]
+        model = {1: LegacySetupDocument, 2: SetupDocumentV2, 3: SetupDocumentV3, 4: SetupDocument}[version]
         result = model.model_validate(raw)
         if version >= 2 and expected_face_model_id is not None:
             if result.face_model_id != expected_face_model_id or any(

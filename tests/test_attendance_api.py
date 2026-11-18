@@ -1,17 +1,13 @@
-"""Attendance HTTP contracts using direct ASGI and isolated real SQLite services.
+"""Work-time HTTP contracts over direct ASGI and a real temporary SQLite database.
 
 Run: .venv/Scripts/python.exe tests/test_attendance_api.py
-Controller owns RED/GREEN execution; no lifespan, models, camera or production DB.
+Local workplace offset is +05:00 (the default); 2026-03-10 local = 03-09 19:00 .. 03-10 19:00 UTC.
 """
-import asyncio
-import copy
-import json
 import sys
 import traceback
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -19,24 +15,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import FastAPI
-from sqlalchemy import event
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.api import attendance, employees, presence
-from app.attendance_types import VisitorBatchInput
-from app.config import settings
-from app.database.database import get_db, immediate_session
+from app.api import attendance
+from app.database.database import get_db
 from app.database.models import (
-    AttendanceCamera, AttendanceCommission, AttendanceCoverageGap, AttendanceDecision,
-    AttendanceEmployeeReference, AttendanceEvent, AttendanceEvidence, AttendanceRequest,
-    AttendanceRuntime, Employee, EmployeeFace, PresenceSession, WorkSession,
+    DoorCrossing, ManualPresenceInterval, PresenceExclusion, PresenceSegment,
 )
-from app.services.attendance_service import AttendanceService
-from test_attendance_service import AS_OF, BASE, CUDA_PROVIDERS, crossing, database, model_bundle_fixture
-from test_attendance_lifecycle import Clock, health_for, warm
+from app.services.presence_recorder import PresenceRecorder
+from operator_test_support import Client
+from test_presence_recorder import database
 
 TESTS = []
+DAY_START = datetime(2026, 3, 9, 19, 0)         # 2026-03-10 00:00 local
+FINISHED = datetime(2026, 3, 11, 10, 0)          # the day is over
+EVENING = datetime(2026, 3, 10, 14, 0)           # 19:00 local, the day is running
 
 
 def test(fn):
@@ -44,701 +37,251 @@ def test(fn):
     return fn
 
 
-class Client:
-    def __init__(self, app):
-        self.app = app
+def local(hours, minutes=0):
+    return DAY_START + timedelta(hours=hours, minutes=minutes)
 
-    def request(self, method, url, payload=None):
-        async def run():
-            parsed = urlsplit(url)
-            body = b"" if payload is None else json.dumps(payload).encode("utf-8")
-            sent, messages = False, []
 
-            async def receive():
-                nonlocal sent
-                if sent:
-                    return {"type": "http.disconnect"}
-                sent = True
-                return {"type": "http.request", "body": body, "more_body": False}
-
-            async def send(message):
-                messages.append(message)
-
-            await self.app({
-                "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-                "method": method, "scheme": "http", "path": parsed.path,
-                "raw_path": parsed.path.encode(), "query_string": parsed.query.encode(),
-                "root_path": "", "headers": [(b"content-type", b"application/json"),
-                                            (b"x-operator-request", b"1")],
-                "client": ("127.0.0.1", 1234), "server": ("test", 80),
-            }, receive, send)
-            start = next(item for item in messages if item["type"] == "http.response.start")
-            data = b"".join(item.get("body", b"") for item in messages if item["type"] == "http.response.body")
-            headers = dict(start["headers"])
-            if not data:
-                data = None
-            elif headers.get(b"content-type", b"").startswith(b"application/json"):
-                data = json.loads(data)
-            return start["status"], headers, data
-        return asyncio.run(run())
-
-    def json(self, method, url, payload=None, *, status=200):
-        actual, _headers, data = self.request(method, url, payload)
-        assert actual == status, (method, url, actual, data)
-        return data
+def iso(value):
+    return value.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 @contextmanager
-def api():
-    with database() as (engine, service):
+def api(as_of=FINISHED):
+    with database() as engine:
         app = FastAPI()
-        app.state.attendance = service
+        app.state.presence = PresenceRecorder(engine)
         app.include_router(attendance.router)
-        app.include_router(employees.router)
-        app.include_router(presence.router)
 
         def isolated_db():
             with Session(engine) as db:
                 yield db
 
         app.dependency_overrides[get_db] = isolated_db
-        yield Client(app), engine, service
+        with patch("app.api.attendance._now", return_value=as_of):
+            yield Client(app), engine
 
 
-def human(**values):
-    return dict(request_id=str(uuid4()), actor=" Operator ", reason=" Reconciled doorway ", **values)
+def seed(engine, employee=1, camera=1, start=local(9), end=local(12), face=True):
+    with Session(engine) as db:
+        db.add(PresenceSegment(employee_id=employee, camera_id=camera, started_at=start, last_seen_at=end,
+                               face_seen=face))
+        db.commit()
 
 
-def manual_payload(direction="ENTRY", when="2026-11-11T09:00:00+05:00", employee=1):
-    return human(employee_id=employee, direction=direction, occurred_at=when)
+def seed_day(engine, employee=1):
+    seed(engine, employee, 1, local(9), local(12))
+    seed(engine, employee, 2, local(15), local(18))
 
 
-def manual(client, **values):
-    return client.json("POST", "/api/attendance/manual", manual_payload(**values))
+def get(client, url, status=200):
+    code, _headers, data = client.request("GET", url)
+    assert code == status, (url, code, data)
+    return data
 
 
-def decide(client, identifier, action, revision=0, **values):
-    payload = human(expected_revision=revision, action=action, **values)
-    return client.json("POST", f"/api/attendance/events/{identifier}/decision", payload)
+def correction(**values):
+    return {"request_id": str(uuid4()), "actor": " Operator ", "reason": " Wrong camera ", "employee_id": 1,
+            "started_at": "2026-03-10T09:00:00+05:00", "ended_at": "2026-03-10T10:00:00+05:00", **values}
 
 
-def review_crossing(service, *, ordinal=1, hours=0):
-    return service.record_crossing(crossing(ordinal=ordinal, when=BASE + timedelta(hours=hours)))
-
-
-def commission_payload(**counts):
-    record = dict(entry_trials=30, exit_trials=30, employee_count=1, visitor_trials=20,
-                  retreat_trials=10, wrong_employee=0, duplicate_trips=0, missed_unflagged=0,
-                  frontal_trials=100, frontal_eligible=95, performance_minutes=15, site_confirmed=True)
-    record.update(counts)
-    return human(expected_cameras=[dict(camera_id=1, revision=3), dict(camera_id=2, revision=3)],
-                 acceptance_record=record)
-
-
-def commission_ready(engine, service):
-    with immediate_session(engine) as db:
-        db.add(EmployeeFace(employee_id=1, embedding=bytes(512 * 4)))
-    clock = Clock()
-    health = health_for(service, clock)
-    warm(health, clock)
-    # Persist real immutable notifications before commission; commissioning-only
-    # readiness is intentionally not part of technical readiness.
-    faults = health.pending_faults()
-    service.persist_health([(fault, health.fault_source_ids(fault.id)) for fault in faults],
-                           healthy=True, reasons=[], observed_at=clock.utc)
-    for fault in faults:
-        health.ack_fault(fault.id)
-    assert health.snapshot()["technical_ready"]
-    return clock, health
+DAY_URL = "from_date=2026-03-10&to_date=2026-03-10"
 
 
 @test
-def test_manual_json_normalization_audit_and_replay_survives_later_correction():
-    with api() as (client, engine, _service):
-        payload = manual_payload(when="2026-11-11T09:00:00.123999+05:00")
-        original = client.json("POST", "/api/attendance/manual", payload)
-        assert original["occurred_at"].startswith("2026-11-11T09:00:00.123")
-        assert original["occurred_at"].endswith("+05:00")
-        assert original["source"] == "MANUAL" and original["status"] == "ACCEPTED"
-        assert original["evidence"] == dict(before=False, after=False, face=False, purged=False)
-        decide(client, original["id"], "VOID")
-        assert client.json("POST", "/api/attendance/manual", payload) == original
-        detail = client.json("GET", f"/api/attendance/events/{original['id']}")
-        assert detail["raw"] == {"version": 1, "candidate_employee_ids": []}
-        assert [row["revision"] for row in detail["decisions"]] == [0, 1]
-        assert detail["decisions"][0]["actor"] == "Operator"
-        assert detail["decisions"][0]["before"] == {}
+def report_gives_final_day_hours_and_live_hours_for_a_running_day():
+    with api() as (client, engine):
+        seed_day(engine)
+        report = get(client, f"/api/attendance/report?{DAY_URL}")
+        (row,) = report["rows"]
+        assert row["worked_ms"] == 21600000 and row["method"] == "FINAL" and row["sessions"] == 2
+        assert (row["employee_name"], row["face_seen"], row["has_manual"]) == ("Анна", True, False)
+        assert row["first_seen_at"] == "2026-03-10T09:00:00+05:00" and row["last_seen_at"] == "2026-03-10T18:00:00+05:00"
+        assert report["totals"] == [{"employee_id": 1, "employee_name": "Анна", "worked_ms": 21600000, "days": 1}]
+        assert (report["live_gap_minutes"], report["day_gap_minutes"], report["utc_offset_minutes"]) == (35, 120, 300)
+    with api(EVENING) as (client, engine):
+        seed_day(engine)
+        (row,) = get(client, f"/api/attendance/report?{DAY_URL}")["rows"]
+        assert row["method"] == "LIVE" and row["worked_ms"] == 21600000
+
+
+@test
+def report_filters_by_employee_skips_empty_days_and_future_days():
+    with api(EVENING) as (client, engine):
+        seed(engine, 1, 1, local(9), local(10))
+        seed(engine, 2, 1, local(9), local(11))
+        both = get(client, f"/api/attendance/report?from_date=2026-03-09&to_date=2026-03-12")["rows"]
+        assert [(r["date"], r["employee_name"]) for r in both] == [("2026-03-10", "Анна"), ("2026-03-10", "Борис")]
+        only = get(client, f"/api/attendance/report?{DAY_URL}&employee_id=2")["rows"]
+        assert [r["employee_id"] for r in only] == [2]
+        get(client, f"/api/attendance/report?{DAY_URL}&employee_id=99", 404)
+
+
+@test
+def report_period_must_be_one_to_366_days():
+    with api() as (client, _engine):
+        get(client, "/api/attendance/report?from_date=2026-03-10&to_date=2026-03-09", 422)
+        get(client, "/api/attendance/report?from_date=2025-01-01&to_date=2026-03-10", 422)
+        assert get(client, "/api/attendance/report?from_date=2025-03-10&to_date=2026-03-10")["rows"] == []
+        code, _h, data = client.request("GET", "/api/attendance/report?from_date=2025-01-01&to_date=2026-03-10")
+        assert data["detail"] == "Укажите период от 1 до 366 дней"
+
+
+@test
+def active_lists_employees_seen_within_the_live_gap_with_their_source():
+    with api(datetime(2026, 3, 10, 13, 10)) as (client, engine):
+        seed(engine, 1, 1, local(9), local(12), face=True)
+        seed(engine, 1, 2, local(15), local(18), face=True)      # ends 13:00 UTC, 10 min before as_of
+        seed(engine, 2, 2, local(17), local(18), face=False)
+        active = get(client, "/api/attendance/active")
+        assert [(i["employee_name"], i["source"], i["last_camera_name"]) for i in active["items"]] == [
+            ("Анна", "FACE", "Зал"), ("Борис", "REID", "Зал")]
+        anna = active["items"][0]
+        assert anna["today_ms"] == 21600000 and anna["since"] == "2026-03-10T15:00:00+05:00"
+    with api(EVENING) as (client, engine):
+        seed(engine, 1, 1, local(15), local(18), face=True)       # last seen 60 min ago
+        assert get(client, "/api/attendance/active")["items"] == []
+
+
+@test
+def csv_export_has_bom_header_and_rows():
+    with api() as (client, engine):
+        seed_day(engine)
+        seed(engine, 2, 1, local(9), local(10), face=False)
+        code, headers, body = client.request("GET", f"/api/attendance/report.csv?{DAY_URL}")
+        assert code == 200 and headers[b"content-type"].startswith(b"text/csv")
+        assert b"work-time-2026-03-10-2026-03-10.csv" in headers[b"content-disposition"]
+        assert body.startswith(b"\xef\xbb\xbf")
+        lines = body.decode("utf-8-sig").splitlines()
+        assert lines[0] == ('"Дата";"Сотрудник";"Отработано (ч:мм)";"Минут";"Первое появление";'
+                            '"Последнее появление";"Сессий";"Расчёт";"Примечания"')
+        assert '"2026-03-10";"Анна";"6:00";"360";"09:00";"18:00";"2";"Итог дня";""' in lines
+        assert '"2026-03-10";"Борис";"1:00";"60";"09:00";"10:00";"1";"Итог дня";"только по внешности"' in lines
+
+
+@test
+def timeline_shows_sessions_door_gaps_and_excluded_rows():
+    with api() as (client, engine):
+        seed(engine, 1, 1, local(9), local(11, 40))
+        seed(engine, 1, 2, local(12), local(15))
         with Session(engine) as db:
-            assert db.query(AttendanceEvent).count() == 1
-            assert db.query(AttendanceDecision).count() == 2
-            assert db.query(WorkSession).count() == 0
-        changed = dict(payload, direction="EXIT")
-        client.json("POST", "/api/attendance/manual", changed, status=409)
+            db.add_all([
+                DoorCrossing(source_key="a", camera_id=1, employee_id=1, direction="EXIT", occurred_at=local(11, 40)),
+                DoorCrossing(source_key="b", camera_id=1, employee_id=1, direction="ENTRY", occurred_at=local(12)),
+            ])
+            db.commit()
+        line = get(client, "/api/attendance/timeline?employee_id=1&date=2026-03-10")
+        assert line["worked_ms"] == 21600000 - 1200000 and line["method"] == "FINAL"
+        assert len(line["sessions"]) == 2 and len(line["door_gaps"]) == 1
+        assert line["door_gaps"][0] == {"started_at": "2026-03-10T11:40:00+05:00",
+                                        "ended_at": "2026-03-10T12:00:00+05:00"}
+        assert [s["camera_name"] for s in line["segments"]] == ["Вход", "Зал"]
+        assert [c["direction"] for c in line["crossings"]] == ["EXIT", "ENTRY"]
+        get(client, "/api/attendance/timeline?employee_id=99&date=2026-03-10", 404)
 
 
 @test
-def test_decision_replay_precedes_revision_and_preserves_original_employee_reference():
-    with api() as (client, engine, service):
-        identifier = review_crossing(service)
-        payload = human(expected_revision=0, action="ACCEPT", employee_id=1, direction="ENTRY",
-                        occurred_at="2026-11-11T09:00:00.456789+05:00")
-        first = client.json("POST", f"/api/attendance/events/{identifier}/decision", payload)
-        assert first["employee_id"] == 1 and first["revision"] == 1
-        assert first["occurred_at"].startswith("2026-11-11T09:00:00.456")
-        assert first["occurred_at"].endswith("+05:00")
-        reassigned = decide(client, identifier, "ACCEPT", 1, employee_id=2)
-        assert reassigned["occurred_at"] == first["occurred_at"]
-        assert client.json("POST", f"/api/attendance/events/{identifier}/decision", payload) == first
-        client.json("POST", f"/api/attendance/events/{identifier}/decision",
-                    human(expected_revision=0, action="VOID"), status=409)
-        other = review_crossing(service, ordinal=2)
-        client.json("POST", f"/api/attendance/events/{other}/decision", payload, status=409)
-        decide(client, identifier, "VISITOR", 2)
-        client.json("DELETE", "/api/employees/1", status=409)
+def corrections_create_replay_conflict_validate_and_revoke():
+    with api() as (client, engine):
+        seed_day(engine)
+        payload = correction()
+        code, _h, first = client.request("POST", "/api/attendance/corrections/exclusion", payload)
+        assert code == 200 and first["kind"] == "EXCLUSION" and first["actor"] == "Operator"
+        assert first["reason"] == "Wrong camera" and first["revoked_at"] is None
+        assert first["started_at"] == "2026-03-10T09:00:00+05:00"
+        # Excluding 09:00-10:00 moves the first sighting to 10:00 and leaves 5 hours.
+        (row,) = get(client, f"/api/attendance/report?{DAY_URL}")["rows"]
+        assert row["worked_ms"] == 18000000 and row["first_seen_at"] == "2026-03-10T10:00:00+05:00"
+        assert client.request("POST", "/api/attendance/corrections/exclusion", payload)[2] == first
+        different = dict(payload, ended_at="2026-03-10T10:30:00+05:00")
+        code, _h, conflict = client.request("POST", "/api/attendance/corrections/exclusion", different)
+        assert code == 409 and conflict["detail"] == "request_id уже использован с другими данными"
         with Session(engine) as db:
-            assert db.get(Employee, 1) is not None
-            assert db.get(AttendanceEmployeeReference, (identifier, 1)) is not None
-            assert db.get(AttendanceEmployeeReference, (identifier, 2)) is not None
-            assert db.query(AttendanceDecision).filter_by(event_id=identifier).count() == 3
-            assert db.query(WorkSession).count() == 0
-        detail = client.json("GET", f"/api/attendance/events/{identifier}")
-        assert detail["raw"]["would_auto_accept"] is True
-        assert detail["status"] == "VISITOR" and detail["employee_id"] is None
+            assert db.query(PresenceExclusion).count() == 1
+        revoked = client.request("POST", f"/api/attendance/corrections/exclusion/{first['id']}/revoke",
+                                 {"actor": "Boss", "reason": "Mistake"})[2]
+        assert revoked["revoked_by"] == "Boss" and revoked["revoke_reason"] == "Mistake" and revoked["revoked_at"]
+        code, _h, again = client.request("POST", f"/api/attendance/corrections/exclusion/{first['id']}/revoke",
+                                         {"actor": "Boss", "reason": "Again"})
+        assert code == 409 and again["detail"] == "Корректировка уже отменена"
+        (row,) = get(client, f"/api/attendance/report?{DAY_URL}")["rows"]
+        assert row["worked_ms"] == 21600000
+        listed = get(client, f"/api/attendance/corrections?{DAY_URL}")["items"]
+        assert [(i["id"], i["revoked_by"], i["employee_name"]) for i in listed] == [(first["id"], "Boss", "Анна")]
+        assert client.request("POST", "/api/attendance/corrections/manual/999/revoke",
+                              {"actor": "a", "reason": "r"})[0] == 404
 
 
 @test
-def test_visitor_batch_is_atomic_unique_canonical_and_replays_original_rows():
-    with api() as (client, engine, service):
-        one = review_crossing(service)
-        two = review_crossing(service, ordinal=2, hours=1)
-        items = [{"event_id": one, "expected_revision": 0}, {"event_id": two, "expected_revision": 1}]
-        failed = human(items=items)
-        client.json("POST", "/api/attendance/visitors", failed, status=409)
+def manual_interval_adds_time_and_is_flagged_in_the_report():
+    with api() as (client, engine):
+        seed(engine, 1, 1, local(9), local(10))
+        code, _h, row = client.request("POST", "/api/attendance/corrections/manual", correction(
+            started_at="2026-03-10T10:00:00+05:00", ended_at="2026-03-10T12:00:00+05:00"))
+        assert code == 200 and row["kind"] == "MANUAL"
+        (day,) = get(client, f"/api/attendance/report?{DAY_URL}")["rows"]
+        assert day["worked_ms"] == 3 * 3600000 and day["has_manual"] is True
         with Session(engine) as db:
-            assert db.get(AttendanceEvent, one).status == "REVIEW"
-            assert db.get(AttendanceRequest, failed["request_id"]) is None
-            assert db.query(AttendanceDecision).count() == 0
-        client.json("POST", "/api/attendance/visitors", human(items=[items[0], items[0]]), status=422)
-        items[1]["expected_revision"] = 0
-        payload = human(items=items)
-        first = client.json("POST", "/api/attendance/visitors", payload)
-        assert len(first) == 2 and all(row["status"] == "VISITOR" for row in first)
-        decide(client, one, "VOID", 1)
-        retry = dict(payload, items=list(reversed(items)))
-        assert client.json("POST", "/api/attendance/visitors", retry) == first
-        with Session(engine) as db:
-            assert db.query(AttendanceDecision).filter_by(request_id=payload["request_id"]).count() == 2
+            assert db.query(ManualPresenceInterval).count() == 1
 
 
 @test
-def test_gap_review_closed_only_clock_reconciliation_and_immutable_replay():
-    with api() as (client, engine, _service):
-        with immediate_session(engine) as db:
-            closed = AttendanceCoverageGap(started_at=BASE, ended_at=BASE + timedelta(seconds=1),
-                                           reason_codes=["CLOCK_DISCONTINUITY"])
-            opened = AttendanceCoverageGap(started_at=BASE + timedelta(hours=1), reason_codes=["FRAME_GAP"])
-            db.add_all([closed, opened])
-            db.flush()
-            closed_id, open_id = closed.id, opened.id
-        client.json("POST", f"/api/attendance/gaps/{open_id}/review", human(expected_revision=0), status=409)
-        payload = human(expected_revision=0)
-        first = client.json("POST", f"/api/attendance/gaps/{closed_id}/review", payload)
-        assert first["reviewed"] and first["revision"] == 1
-        newer = client.json("POST", f"/api/attendance/gaps/{closed_id}/review", human(expected_revision=1))
-        assert newer["revision"] == 2
-        assert client.json("POST", f"/api/attendance/gaps/{closed_id}/review", payload) == first
-        with Session(engine) as db:
-            assert db.query(AttendanceDecision).filter_by(gap_id=closed_id).count() == 2
-        client.json("POST", f"/api/attendance/gaps/{open_id}/review", payload, status=409)
-        detail = client.json("GET", f"/api/attendance/gaps/{closed_id}")
-        assert detail["reviewed"] and detail["revision"] == 2
-        assert [item["revision"] for item in detail["decisions"]] == [1, 2]
-        assert detail["decisions"][0]["before"]["started_at"].endswith("+05:00")
-        client.json("GET", "/api/attendance/gaps/999", status=404)
+def corrections_reject_bad_input_and_foreign_requests():
+    with api() as (client, _engine):
+        post = lambda body, kind="manual": client.request("POST", f"/api/attendance/corrections/{kind}", body)
+        assert post(correction(), "manual")[0] == 200
+        assert post(correction(employee_id=99))[0] == 404
+        future = correction(started_at="2026-03-11T09:00:00+05:00", ended_at="2026-03-11T16:00:00+05:00")
+        code, _h, data = post(future)
+        assert code == 422 and data["detail"] == "Время в будущем недопустимо"
+        too_long = correction(started_at="2026-03-09T09:00:00+05:00", ended_at="2026-03-10T09:00:01+05:00")
+        assert post(too_long)[0] == 422
+        assert post(correction(ended_at="2026-03-10T08:00:00+05:00"))[0] == 422
+        assert post(correction(started_at="2026-03-10T09:00:00"))[0] == 422      # no UTC offset
+        assert post(dict(correction(), reason="   "))[0] == 422
+        assert post(correction(), "other")[0] == 422
+        code, _h, _d = client.request("POST", "/api/attendance/corrections/manual", correction(), operator=False)
+        assert code == 403
 
 
 @test
-def test_events_lists_filter_count_local_dates_and_validate_inputs():
-    with api() as (client, _engine, _service):
-        first = manual(client, when="2026-11-10T23:59:59+05:00")
-        second = manual(client, direction="EXIT", when="2026-11-11T00:00:00+05:00")
-        third = manual(client, when="2026-11-11T23:59:59+05:00", employee=2)
-        page = client.json("GET", "/api/attendance/events?from_date=2026-11-11&to_date=2026-11-11&limit=1")
-        assert page["total"] == 2 and len(page["items"]) == 1
-        assert page["items"][0]["id"] == third["id"]
-        page = client.json("GET", "/api/attendance/events?from_date=2026-11-11&to_date=2026-11-11&limit=1&offset=1")
-        assert page["items"][0]["id"] == second["id"] and page["total"] == 2
-        page = client.json("GET", "/api/attendance/events?employee_id=1")
-        assert page["total"] == 2 and {row["id"] for row in page["items"]} == {first["id"], second["id"]}
-        for query, status in (("limit=201", 422), ("offset=-1", 422), ("status=UNKNOWN", 422),
-                              ("from_date=bad", 422), ("from_date=2026-11-12&to_date=2026-11-11", 422),
-                              ("employee_id=999", 404)):
-            client.json("GET", f"/api/attendance/events?{query}", status=status)
+def status_reports_cameras_workers_and_recorder_state():
+    with api() as (client, _engine):
+        status = get(client, "/api/attendance/status")
+        assert [(c["camera_id"], c["time_tracking"], c["status"]) for c in status["cameras"]] == [
+            (1, False, "OFFLINE"), (2, False, "OFFLINE")]
+        assert (status["worker_alive"], status["appearance_available"], status["face_available"]) == (False, False, False)
+        assert status["recorder"]["open_segments"] == 0 and status["recorder"]["last_error"] is None
+        assert (status["live_gap_minutes"], status["day_gap_minutes"]) == (35, 120)
+        assert status["as_of"] == "2026-03-11T15:00:00+05:00"
 
 
 @test
-def test_sessions_active_and_review_share_quarantine_and_pagination_counts():
-    with api() as (client, engine, service):
-        manual(client)
-        manual(client, direction="EXIT", when="2026-11-11T18:00:00+05:00")
-        open_entry = manual(client, when="2026-11-12T09:00:00+05:00", employee=2)
-        identifier = review_crossing(service, hours=3)
-        with immediate_session(engine) as db:
-            db.add(AttendanceCoverageGap(started_at=BASE + timedelta(days=1, hours=1),
-                                         ended_at=BASE + timedelta(days=1, hours=2), reason_codes=["FRAME_GAP"]))
-        page = client.json("GET", "/api/attendance/sessions?employee_id=1")
-        assert page["total"] == 1
-        assert page["items"][0]["status"] == "REVIEW" and page["items"][0]["review_ms"] == 32_400_000
-        assert page["items"][0]["confirmed_ms"] == 0
-        active = client.json("GET", "/api/attendance/active")
-        assert active["total"] == 1 and active["utc_offset_minutes"] == 300
-        assert active["as_of"].endswith("+05:00")
-        assert active["items"][0]["entry_event_id"] == open_entry["id"]
-        assert active["items"][0]["ended_at"] is None and active["items"][0]["status"] == "REVIEW"
-        review = client.json("GET", "/api/attendance/review?limit=1")
-        assert review["total"] == 2 and len(review["items"]) == 1
-        both = client.json("GET", "/api/attendance/review?limit=2")
-        assert {item["kind"] for item in both["items"]} == {"event", "gap"}
-        assert any(item["kind"] == "event" and item["event"]["id"] == identifier for item in both["items"])
-        decide(client, identifier, "VISITOR")
-        repaired = client.json("GET", "/api/attendance/sessions?employee_id=1")["items"][0]
-        assert repaired["confirmed_ms"] == 32_400_000 and repaired["status"] == "CLOSED"
-        assert client.json("GET", "/api/attendance/sessions?status=CLOSED")["total"] == 1
-        client.json("GET", "/api/attendance/active?employee_id=999", status=404)
+def endpoints_report_503_without_the_recorder():
+    with api() as (client, _engine):
+        client.app.state.presence = None
+        assert get(client, "/api/attendance/status", 503)
 
 
 @test
-def test_evidence_returns_actual_jpeg_absent_and_expired_without_ledger_loss():
-    with api() as (client, engine, service):
-        identifier = review_crossing(service)
-        status, headers, data = client.request("GET", f"/api/attendance/events/{identifier}/evidence/before")
-        assert status == 200 and headers[b"content-type"].startswith(b"image/jpeg")
-        assert data.startswith(b"\xff\xd8")
-        manual_row = manual(client)
-        client.json("GET", f"/api/attendance/events/{manual_row['id']}/evidence/face", status=404)
-        client.json("GET", f"/api/attendance/events/{identifier}/evidence/wrong", status=422)
-        with immediate_session(engine) as db:
-            image = db.get(AttendanceEvidence, identifier)
-            image.before_jpeg = image.after_jpeg = image.face_jpeg = None
-            image.purged_at = AS_OF
-        client.json("GET", f"/api/attendance/events/{identifier}/evidence/before", status=410)
-        detail = client.json("GET", f"/api/attendance/events/{identifier}")
-        assert detail["evidence"]["purged"] and detail["raw"]["version"] == 1
-
-
-@test
-def test_json_validation_and_historical_inactive_employee_manual_assignment():
-    with api() as (client, engine, _service):
-        for change in (dict(occurred_at="2026-11-11T09:00:00"), dict(occurred_at="2027-01-01T09:00:00+05:00"),
-                       dict(direction="SIDEWAYS"), dict(actor=" "), dict(reason=" "), dict(extra="forbidden")):
-            client.json("POST", "/api/attendance/manual", dict(manual_payload(), **change), status=422)
-        client.json("POST", "/api/attendance/manual", manual_payload(employee=999), status=404)
-        with immediate_session(engine) as db:
-            db.get(Employee, 1).active = False
-        row = manual(client, when="2026-11-01T09:00:00+05:00")
-        assert row["employee_id"] == 1 and row["status"] == "ACCEPTED"
-        client.json("POST", f"/api/attendance/events/{row['id']}/decision",
-                    human(expected_revision=0, action="UNKNOWN"), status=422)
-        with Session(engine) as db:
-            assert db.query(AttendanceEvent).count() == 1 and db.query(AttendanceDecision).count() == 1
-
-
-@test
-def test_read_count_and_rows_use_one_snapshot_during_concurrent_visitor_commit():
-    with api() as (client, engine, service):
-        identifier = review_crossing(service)
-        changed = False
-
-        def concurrent_write(_connection, _cursor, statement, _parameters, _context, _many):
-            nonlocal changed
-            if not changed and "count(" in statement.lower() and "attendance_events" in statement.lower():
-                changed = True
-                service.mark_visitors(VisitorBatchInput(**human(items=[dict(event_id=identifier, expected_revision=0)])))
-
-        event.listen(engine, "after_cursor_execute", concurrent_write)
-        try:
-            page = client.json("GET", "/api/attendance/events?status=REVIEW")
-        finally:
-            event.remove(engine, "after_cursor_execute", concurrent_write)
-        assert changed and page["total"] == 1 and page["items"][0]["status"] == "REVIEW"
-        assert client.json("GET", "/api/attendance/events?status=REVIEW")["total"] == 0
-
-
-@test
-def test_database_failure_returns_503_and_rolls_back_request_and_event():
-    with api() as (client, engine, _service):
-        payload = manual_payload()
-
-        def fail_insert(_connection, _cursor, statement, parameters, _context, _many):
-            if statement.startswith("INSERT INTO attendance_events"):
-                raise OperationalError(statement, parameters, RuntimeError("injected write fault"))
-
-        event.listen(engine, "before_cursor_execute", fail_insert)
-        try:
-            client.json("POST", "/api/attendance/manual", payload, status=503)
-        finally:
-            event.remove(engine, "before_cursor_execute", fail_insert)
-        with Session(engine) as db:
-            assert db.get(AttendanceRequest, payload["request_id"]) is None
-            assert db.query(AttendanceEvent).count() == db.query(AttendanceDecision).count() == 0
-        assert client.json("POST", "/api/attendance/manual", payload)["status"] == "ACCEPTED"
-
-
-@test
-def test_status_keeps_live_clock_fault_before_persistence_and_clears_reviewed_admission():
-    with api() as (client, engine, service):
-        clock, health = commission_ready(engine, service)
-        client.json("POST", "/api/attendance/commission", commission_payload())
-        service.persist_health([], healthy=True, reasons=[], observed_at=clock.utc)
-        assert client.json("GET", "/api/attendance/status")["automatic_ready"]
-        assert health.observe_clock(clock.utc, clock.mono)
-
-        clock.advance(.1, utc_seconds=-5)
-        assert not health.observe_clock(clock.utc, clock.mono)
-        # No monitor tick has durably recorded this live technical failure yet.
-        with Session(engine) as db:
-            assert not any("CLOCK_DISCONTINUITY" in gap.reason_codes
-                           for gap in db.query(AttendanceCoverageGap))
-        live = client.json("GET", "/api/attendance/status")
-        assert not live["technical_ready"] and not live["automatic_ready"]
-        assert live["pending_fault_count"] > 0
-        assert "CLOCK_DISCONTINUITY" in live["reasons"]
-
-        clock.advance(.1)
-        assert health.observe_clock(clock.utc, clock.mono)
-        faults = health.pending_faults()
-        service.persist_health([(fault, health.fault_source_ids(fault.id)) for fault in faults],
-                               healthy=True, reasons=[], observed_at=clock.utc)
-        for fault in faults:
-            health.ack_fault(fault.id)
-        durable = client.json("GET", "/api/attendance/status")
-        assert durable["technical_ready"] and not durable["automatic_ready"]
-        assert "CLOCK_DISCONTINUITY" in durable["reasons"]
-        with Session(engine) as db:
-            gap = next(gap for gap in db.query(AttendanceCoverageGap).filter_by(reviewed=False)
-                       if "CLOCK_DISCONTINUITY" in gap.reason_codes)
-            gap_id, revision = gap.id, gap.revision
-        client.json("POST", f"/api/attendance/gaps/{gap_id}/review",
-                    human(expected_revision=revision))
-        # The health monitor has not refreshed its cached admission flag. A
-        # completed human reconciliation must still clear that obsolete reason.
-        assert "CLOCK_DISCONTINUITY" in health.snapshot()["reasons"]
-        reviewed = client.json("GET", "/api/attendance/status")
-        assert reviewed["technical_ready"] and reviewed["automatic_ready"]
-        assert not reviewed["clock_blocked"]
-        assert "CLOCK_DISCONTINUITY" not in reviewed["reasons"]
-        health.set_pending_writes(1)
-        assert "CLOCK_DISCONTINUITY" in health.snapshot()["reasons"]
-        other_fault = client.json("GET", "/api/attendance/status")
-        assert not other_fault["technical_ready"] and not other_fault["automatic_ready"]
-        assert "PERSISTENCE_ERROR" in other_fault["reasons"]
-        assert "CLOCK_DISCONTINUITY" not in other_fault["reasons"]
-
-
-@test
-def test_status_exposes_actual_readiness_providers_metrics_and_unresolved_counts():
-    with api() as (client, _engine, service):
-        review_crossing(service)
-        status = client.json("GET", "/api/attendance/status")
-        assert status["commission_id"] is None and not status["automatic_ready"]
-        assert not status["technical_ready"] and status["unresolved_crossings"] == 1
-        assert status["providers"]["person_detection"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        assert status["providers"]["scene_encoder"] == status["providers"]["scene_decoder"] == []
-        assert "pending_write_count" in status and "pending_fault_count" in status
-        assert len(status["configuration"]) == 2
-        assert "COMMISSIONING_REQUIRED" in status["reasons"]
-
-
-@test
-def test_commission_valid_attestation_is_atomic_replayable_and_controls_future_capture():
-    with api() as (client, engine, service):
-        trial = review_crossing(service)
-        clock, health = commission_ready(engine, service)
-        payload = commission_payload()
-        first = client.json("POST", "/api/attendance/commission", payload)
-        assert first["commission_id"] > 0
-        with Session(engine) as db:
-            record = db.get(AttendanceCommission, first["commission_id"])
-            assert record.actor == "Operator" and record.acceptance_record["entry_trials"] == 30
-            assert record.acceptance_record["site_confirmed"] is True
-            assert record.configuration_fingerprint["providers"]["person_detection"][0] == "CUDAExecutionProvider"
-            assert db.get(AttendanceRuntime, 1).commission_id == record.id
-        second = client.json("POST", "/api/attendance/commission", commission_payload())
-        assert second["commission_id"] != first["commission_id"]
-        assert client.json("POST", "/api/attendance/commission", payload) == first
-        client.json("POST", "/api/attendance/commission", dict(payload, reason="Changed"), status=409)
-        service.persist_health([], healthy=True, reasons=[], observed_at=clock.utc)
-        captured = review_crossing(service, ordinal=2, hours=1)
-        assert client.json("GET", f"/api/attendance/events/{captured}")["status"] == "ACCEPTED"
-        assert client.json("GET", f"/api/attendance/events/{trial}")["status"] == "REVIEW"
-        with immediate_session(engine) as db:
-            db.get(AttendanceCamera, 1).revision += 1
-        # A status read must not advertise stale approval while monitor waits.
-        status = client.json("GET", "/api/attendance/status")
-        assert not status["automatic_ready"] and status["commissioning_required"]
-        with Session(engine) as db:
-            assert db.query(AttendanceCommission).count() == 2
-
-
-@test
-def test_commission_rejects_counts_stale_revisions_cpu_and_unhealthy_metrics():
-    with api() as (client, engine, service):
-        _clock, health = commission_ready(engine, service)
-        for changes in (dict(entry_trials=29), dict(exit_trials=29), dict(visitor_trials=19),
-                        dict(retreat_trials=9), dict(employee_count=0), dict(wrong_employee=1),
-                        dict(duplicate_trips=1), dict(missed_unflagged=1), dict(frontal_trials=0),
-                        dict(frontal_eligible=94), dict(frontal_eligible=101), dict(performance_minutes=14),
-                        dict(site_confirmed=False)):
-            client.json("POST", "/api/attendance/commission", commission_payload(**changes), status=422)
-        stale = dict(commission_payload(), expected_cameras=[dict(camera_id=1, revision=3),
-                                                              dict(camera_id=2, revision=2)])
-        client.json("POST", "/api/attendance/commission", stale, status=409)
-        for key in ("person_detection", "live_face_detection", "live_face_recognition",
-                    "enroll_face_detection", "enroll_face_recognition"):
-            for actual in (["CPUExecutionProvider"], ["cuda"], []):
-                health.set_providers(dict(CUDA_PROVIDERS, **{key: actual}))
-                client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-        health.set_providers(CUDA_PROVIDERS)
-        health.set_pending_writes(1)
-        client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-        health.set_pending_writes(0)
-        with immediate_session(engine) as db:
-            db.query(EmployeeFace).delete()
-        client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-        with Session(engine) as db:
-            assert db.query(AttendanceCommission).count() == db.query(AttendanceRequest).count() == 0
-
-
-@test
-def test_cpu_scene_and_body_providers_do_not_block_or_revoke_cuda_commission():
-    with api() as (client, engine, service):
-        clock, health = commission_ready(engine, service)
-        health.set_providers(dict(CUDA_PROVIDERS, reid=["CPUExecutionProvider"],
-                                  scene_encoder=["CPUExecutionProvider"], scene_decoder=["CPUExecutionProvider"]))
-        approved = client.json("POST", "/api/attendance/commission", commission_payload())
-        assert set(approved["configuration_fingerprint"]["providers"]) == {
-            "person_detection", "live_face_detection", "live_face_recognition",
-            "enroll_face_detection", "enroll_face_recognition",
-        }
-        service.persist_health([], healthy=True, reasons=[], observed_at=clock.utc)
-        status = client.json("GET", "/api/attendance/status")
-        assert status["automatic_ready"]
-        assert status["providers"]["scene_encoder"] == ["CPUExecutionProvider"]
-        health.set_providers(CUDA_PROVIDERS)
-        assert client.json("GET", "/api/attendance/status")["automatic_ready"]
-
-
-@test
-def test_missing_verified_critical_models_cannot_receive_commission_from_cuda_provider_claims():
-    for missing in (None, "person", "face_detection", "face_recognition"):
-        with api() as (client, engine, original):
-            _clock, health = commission_ready(engine, original)
-            bundle = model_bundle_fixture() if missing is not None else None
-            if bundle is not None:
-                bundle.component_status[missing] = "MODEL_MISSING"
-            service = AttendanceService(engine, model_bundle=bundle)
-            service.health = health
-            client.app.state.attendance = service
-            client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-            with Session(engine) as db:
-                assert db.get(AttendanceRuntime, 1).commission_id is None
-                assert db.query(AttendanceCommission).count() == db.query(AttendanceRequest).count() == 0
-
-
-@test
-def test_commission_rejects_short_technical_streak_and_slow_completion():
-    with api() as (client, engine, service):
-        with immediate_session(engine) as db:
-            db.add(EmployeeFace(employee_id=1, embedding=bytes(512 * 4)))
-        clock = Clock()
-        health = health_for(service, clock)
-        warm(health, clock, seconds=9)
-        assert health.snapshot()["technically_healthy_seconds"] < 10
-        client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-        warm(health, clock, seconds=21, completion=1.1)
-        assert next(row for row in health.snapshot()["cameras"]
-                    if row["camera_id"] == 1)["completion_age_p95_seconds"] > 1
-        client.json("POST", "/api/attendance/commission", commission_payload(), status=422)
-        with Session(engine) as db:
-            assert db.get(AttendanceRuntime, 1).commission_id is None
-            assert db.query(AttendanceCommission).count() == 0
-
-
-@test
-def test_commission_employee_floor_counts_distinct_active_enrolled_people():
-    with api() as (client, engine, service):
-        commission_ready(engine, service)
-        with immediate_session(engine) as db:
-            db.add_all([EmployeeFace(employee_id=1, embedding=bytes(512 * 4)),
-                        EmployeeFace(employee_id=2, embedding=bytes(512 * 4))])
-        client.json("POST", "/api/attendance/commission", commission_payload(employee_count=1), status=422)
-        approved = client.json("POST", "/api/attendance/commission", commission_payload(employee_count=2))
-        assert approved["commission_id"] > 0
-        with Session(engine) as db:
-            assert db.query(AttendanceCommission).count() == 1
-
-
-@test
-def test_legacy_archive_is_separate_offset_explicit_and_not_trusted_for_hours():
-    with api() as (client, engine, _service):
-        with immediate_session(engine) as db:
-            db.add(PresenceSession(employee_id=1, camera_id=1, started_at=BASE,
-                                   last_seen_at=BASE + timedelta(seconds=30), ended_at=None, confidence=.9))
-        archive = client.json("GET", "/api/presence/legacy?employee_id=1&from_date=2026-11-11&to_date=2026-11-11")
-        assert archive["total"] == 1 and not archive["trusted_for_hours"]
-        assert archive["items"][0]["historical_unclosed"]
-        assert archive["items"][0]["started_at"].endswith("+05:00")
-        assert client.json("GET", "/api/attendance/sessions")["total"] == 0
-        client.json("GET", "/api/presence", status=404)
-
-
-DATE_FILTER_ROUTES = (
-    "/api/attendance/events", "/api/attendance/sessions", "/api/attendance/review",
-    "/api/presence/legacy", "/api/attendance/report", "/api/attendance/report.csv",
-)
-
-
-def assert_date_boundary(offset, day, expected_status):
-    with patch.object(settings, "attendance_utc_offset_minutes", offset):
-        with api() as (client, _engine, _service):
-            for route in DATE_FILTER_ROUTES:
-                queries = [f"from_date={day}&to_date={day}"]
-                if not route.startswith("/api/attendance/report"):
-                    queries += [f"from_date={day}", f"to_date={day}"]
-                for query in queries:
-                    status, _headers, body = client.request("GET", f"{route}?{query}")
-                    assert status == expected_status, (offset, route, query, status, body)
-                    if expected_status == 200 and route == "/api/attendance/report":
-                        assert body["from_date"] == body["to_date"] == day
-                        assert len(body["rows"]) == 2
-                        assert all(row["date"] == day and row["confirmed_ms"] == 0 for row in body["rows"])
-                        assert not body["finalizable"]
-
-
-@test
-def test_minimum_date_positive_offset_is_422_across_all_date_filters():
-    assert_date_boundary(300, "0001-01-01", 422)
-
-
-@test
-def test_maximum_date_negative_or_zero_offset_is_422_across_all_date_filters():
-    for offset in (-300, 0):
-        assert_date_boundary(offset, "9999-12-31", 422)
-
-
-@test
-def test_representable_extreme_dates_remain_valid_across_all_date_filters():
-    # Shift midnight to UTC BEFORE adding the day: +05:00's final UTC bound
-    # is 9999-12-31 19:00, not an unrepresentable local year 10000.
-    for offset, day in ((300, "9999-12-31"), (-300, "0001-01-01"), (0, "0001-01-01"),
-                        (300, "0001-01-02"), (-300, "9999-12-30")):
-        assert_date_boundary(offset, day, 200)
-
-
-def assert_timestamp_rejected_without_writes(offset, timestamps):
-    with patch.object(settings, "attendance_utc_offset_minutes", offset):
-        with api() as (client, engine, _service):
-            original = manual(client)
-            for value in timestamps:
-                payload = manual_payload(when=value)
-                client.json("POST", "/api/attendance/manual", payload, status=422)
-                # VOID would otherwise ignore occurred_at, exposing missing
-                # input validation even when a future-date business check could
-                # hide an unrenderable maximum timestamp on ACCEPT.
-                decision = human(expected_revision=0, action="VOID", occurred_at=value)
-                client.json("POST", f"/api/attendance/events/{original['id']}/decision",
-                            decision, status=422)
-                with Session(engine) as db:
-                    assert db.query(AttendanceEvent).count() == 1
-                    assert db.query(AttendanceRequest).count() == 1
-                    assert db.query(AttendanceDecision).count() == 1
-                    assert db.get(AttendanceRequest, payload["request_id"]) is None
-                    assert db.get(AttendanceRequest, decision["request_id"]) is None
-                    row = db.get(AttendanceEvent, original["id"])
-                    assert row.revision == 0 and row.status == "ACCEPTED"
-
-
-@test
-def test_timestamp_utc_underflow_and_overflow_return_422_without_partial_writes():
-    assert_timestamp_rejected_without_writes(300, (
-        "0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00",
-    ))
-
-
-@test
-def test_timestamp_workplace_overflow_returns_422_without_partial_writes():
-    assert_timestamp_rejected_without_writes(300, ("9999-12-31T20:00:00Z",))
-
-
-@test
-def test_timestamp_workplace_underflow_returns_422_without_partial_writes():
-    assert_timestamp_rejected_without_writes(-300, ("0001-01-01T00:00:00Z",))
-
-
-@test
-def test_supported_timestamp_extremes_normalize_once_and_roundtrip_through_http():
-    cases = (
-        (300, "0001-01-01T05:00:00.123999+05:00", "0001-01-01T05:00:00.123000+05:00",
-         datetime(1, 1, 1, 0, 0, 0, 123000), AS_OF),
-        (-300, "0001-01-01T00:00:00.123999-05:00", "0001-01-01T00:00:00.123000-05:00",
-         datetime(1, 1, 1, 5, 0, 0, 123000), AS_OF),
-        (300, "9999-12-31T23:59:59.123999+05:00", "9999-12-31T23:59:59.123000+05:00",
-         datetime(9999, 12, 31, 18, 59, 59, 123000), datetime(9999, 12, 31, 18, 59, 59, 999000)),
-        (-300, "9999-12-31T18:59:59.123999-05:00", "9999-12-31T18:59:59.123000-05:00",
-         datetime(9999, 12, 31, 23, 59, 59, 123000), datetime(9999, 12, 31, 23, 59, 59, 999000)),
-    )
-    for offset, value, rendered, stored, now in cases:
-        with patch.object(settings, "attendance_utc_offset_minutes", offset):
-            with api() as (client, engine, service):
-                service._now = lambda: now
-                payload = manual_payload(direction="EXIT", when=value)
-                row = client.json("POST", "/api/attendance/manual", payload)
-                assert row["occurred_at"] == rendered
-                assert client.json("POST", "/api/attendance/manual", payload) == row
-                detail = client.json("GET", f"/api/attendance/events/{row['id']}")
-                assert detail["occurred_at"] == rendered
-                assert detail["decisions"][0]["after"]["occurred_at"] == rendered
-                with Session(engine) as db:
-                    assert db.get(AttendanceEvent, row["id"]).occurred_at == stored
-                    assert db.query(AttendanceRequest).count() == db.query(AttendanceDecision).count() == 1
-
-
-@test
-def test_shared_time_helpers_expose_value_errors_not_arithmetic_overflows():
-    from app.attendance_types import milliseconds
-    from app.time_utils import attendance_iso, day_bounds
-
-    cases = (
-        (300, lambda: day_bounds(date.min)),
-        (-300, lambda: day_bounds(date.max)),
-        (300, lambda: milliseconds(datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=5))))),
-        (300, lambda: milliseconds(datetime(9999, 12, 31, 23, tzinfo=timezone(timedelta(hours=-5))))),
-        (300, lambda: attendance_iso(datetime.max)),
-        (-300, lambda: attendance_iso(datetime.min)),
-    )
-    for offset, operation in cases:
-        with patch.object(settings, "attendance_utc_offset_minutes", offset):
-            try:
-                operation()
-            except ValueError:
-                pass
-            else:
-                raise AssertionError("Unsupported time must raise a validation ValueError")
-    with patch.object(settings, "attendance_utc_offset_minutes", 300):
-        assert day_bounds(date.max) == (datetime(9999, 12, 30, 19), datetime(9999, 12, 31, 19))
-    with patch.object(settings, "attendance_utc_offset_minutes", -300):
-        assert day_bounds(date.min) == (datetime(1, 1, 1, 5), datetime(1, 1, 2, 5))
+def report_and_period_totals_preserve_exact_millisecond_durations():
+    with api() as (client, engine):
+        previous = local(9) - timedelta(days=1)
+        seed(engine, start=previous, end=previous + timedelta(milliseconds=1001))
+        seed(engine, start=local(9), end=local(9) + timedelta(milliseconds=58999))
+        report = get(client, "/api/attendance/report?from_date=2026-03-09&to_date=2026-03-10")
+        assert [row["worked_ms"] for row in report["rows"]] == [1001, 58999]
+        assert report["totals"][0]["worked_ms"] == 60000
 
 
 if __name__ == "__main__":
-    failed = 0
+    failures = 0
     for case in TESTS:
         try:
             case()
             print(f"PASS {case.__name__}")
         except Exception:
-            failed += 1
+            failures += 1
             print(f"FAIL {case.__name__}")
             traceback.print_exc()
-    print(f"{len(TESTS) - failed}/{len(TESTS)} passed")
-    raise SystemExit(1 if failed else 0)
+    print(f"{len(TESTS) - failures}/{len(TESTS)} passed")
+    raise SystemExit(bool(failures))

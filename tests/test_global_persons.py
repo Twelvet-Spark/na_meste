@@ -197,7 +197,7 @@ def archived_database():
     """Real file SQLite/FKs with independent person, observation and event links."""
     from app.database.database import immediate_session
     from app.database.models import AttendanceCamera
-    from test_attendance_service import database
+    from attendance_test_support import database
 
     with database() as (engine, service):
         vector = archive_vector()
@@ -244,10 +244,10 @@ def archive_client(engine, service):
     from app.api import cameras, employees
     from app.database.database import get_db
     from app.rtsp.manager import ReaderManager
-    from test_attendance_api import Client
+    from operator_test_support import Client
 
     app = FastAPI()
-    app.state.attendance = service
+    app.state.presence = service
     app.state.manager = ReaderManager()
     for router in (api.router, cameras.router, employees.router):
         app.include_router(router)

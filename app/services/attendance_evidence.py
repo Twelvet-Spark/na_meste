@@ -1,14 +1,8 @@
-"""Bounded JPEG evidence and image-only retention for the attendance ledger."""
+"""Bounded JPEG encoding of crossing evidence crops."""
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
-from sqlalchemy import Engine, update
-
-from app.config import settings
-from app.database.database import immediate_session
-from app.database.models import AttendanceEvidence
 
 _CONTEXT_MAX_DIMENSION = 640
 _CONTEXT_MAX_BYTES = 96 * 1024
@@ -74,17 +68,3 @@ def encode_evidence(*, before: np.ndarray | None, after: np.ndarray | None,
     unavailable = before_jpeg is None or after_jpeg is None or (face is not None and face_jpeg is None)
     return EncodedEvidence(before_jpeg, after_jpeg, face_jpeg,
                            ("EVIDENCE_UNAVAILABLE",) if unavailable else ())
-
-
-def evidence_expires_at(recorded_at: datetime) -> datetime:
-    return recorded_at + timedelta(days=settings.attendance_evidence_keep_days)
-
-
-def purge_evidence(engine: Engine, now: datetime) -> int:
-    """Clear expired image BLOBs, retaining ledger/audit/session rows forever."""
-    with immediate_session(engine) as db:
-        result = db.execute(update(AttendanceEvidence).where(
-            AttendanceEvidence.expires_at <= now,
-            AttendanceEvidence.purged_at.is_(None),
-        ).values(before_jpeg=None, after_jpeg=None, face_jpeg=None, purged_at=now))
-        return result.rowcount

@@ -13,7 +13,7 @@ never identity ground truth. Nonempty scene_calibrations await the scene contrac
 Optional --scene-prompts reads private, explicitly reviewed visible-image prompts.
 
 The CLI bootstraps temporary settings before importing application modules, then
-runs the production AIWorker, attendance monitor, journal, appearance linker and
+runs the production AIWorker, presence recorder, journal, appearance linker and
 bounded preview cache against independent local FFmpeg readers. Instrumentation
 observes real publication; it never bypasses source/gallery/reset guards. Required
 stages without real work remain NOT_EVALUATED, including unavailable concurrency.
@@ -53,7 +53,7 @@ MAX_JSON_BYTES = 16 * 1024 * 1024
 INTEGRATION_NEEDS = (
     "AI_WORKER_SCHEDULER_NOT_EXERCISED",
     "DURABLE_HUMAN_JOURNAL_NOT_EXERCISED",
-    "ATTENDANCE_QUEUE_GATES_AND_CROSSINGS_NOT_EXERCISED",
+    "DOOR_CROSSINGS_NOT_EXERCISED",
     "BATCHED_BODY_LINKING_NOT_EXERCISED",
     "ENROLLMENT_CONCURRENT_LOAD_NOT_EXERCISED",
     "SCENE_ASSISTANCE_CONCURRENT_IMPACT_NOT_EVALUATED",
@@ -1544,8 +1544,9 @@ def instrument_pipeline(service, state, journal, reid, accounting):
         return outcomes
     service.process_batch = measured_batch
     update = state.update
-    def published(camera_id, detections, *, packet=None, generation=None, configuration=None):
-        update(camera_id, detections, packet=packet, generation=generation, configuration=configuration)
+    def published(camera_id, detections, *, packet=None, generation=None, configuration=None, identities=None):
+        update(camera_id, detections, packet=packet, generation=generation, configuration=configuration,
+               identities=identities)
         if packet is not None:
             accounting.published(camera_id, packet, generation, time.monotonic())
     state.update = published
@@ -1915,7 +1916,7 @@ class SceneLoad:
 class ApprovedInference:
     """Own the actual production pipeline, with no server or recorder services."""
     def __init__(self, manifest, isolated, device, specs, manager, accounting):
-        self.engine = self.worker = self.monitor = self.journal = None
+        self.engine = self.worker = self.flusher = self.journal = None
         self.scene = self.assistance = self.segmenter = self.enrollment = None
         self.enrollment_semaphore = threading.BoundedSemaphore(1)
         self.component_errors, self.shutdown_errors = [], []
@@ -1943,8 +1944,8 @@ class ApprovedInference:
             from app.ai.reid import PersonReID
             from app.ai.scene_segmenter import SceneSegmenter
             from app.services.human_journal import HumanJournal
-            from app.services.attendance_service import AttendanceService
-            from app.services.attendance_monitor import AttendanceMonitor
+            from app.services.presence_recorder import PresenceFlusher, PresenceRecorder
+            from app.ai.employee_appearance import EmployeeAppearanceGallery
             from app.services.scene_service import SceneService
             from app.services.scene_assistance import SceneAssistanceService
             from app.database.database import engine, init_db, SessionLocal
@@ -1995,19 +1996,18 @@ class ApprovedInference:
                 specs, manifest.identity_labels, self.employee_subjects, self.face_engine,
                 ordinary_interval=self.service.retry_interval,
                 attendance_interval=settings.attendance_face_interval)
-            self.attendance = AttendanceService(engine, model_bundle=self.bundle)
-            self.attendance.health.set_providers(self.providers)
+            self.presence = PresenceRecorder(engine)
             self.journal = HumanJournal(engine, min_hits=self.service.min_hits,
                                         lost_timeout=settings.track_lost_timeout,
                                         image_keep_days=settings.journal_image_keep_days)
             self.state = DetectionState()
             instrument_pipeline(self.service, self.state, self.journal, self.reid, accounting)
-            self.worker = AIWorker(manager, self.service, self.attendance, self.state,
+            self.worker = AIWorker(manager, self.service, self.presence, self.state,
                                    GlobalIdentityManager() if self.reid is not None else None,
-                                   journal=self.journal, reid=self.reid)
+                                   journal=self.journal, reid=self.reid,
+                                   appearance_gallery=EmployeeAppearanceGallery() if self.reid is not None else None)
             self.worker.model_ids = dict(bundle_id=self.bundle.bundle_id, face_model_id=self.bundle.face_model_id)
-            self.monitor = AttendanceMonitor(self.attendance, write_queue=self.worker.write_queue,
-                                             manager=manager, worker=self.worker)
+            self.flusher = PresenceFlusher(self.presence)
             self.scene = SceneService(engine, manager)
             self.assistance = SceneAssistanceService(self.scene, self.segmenter)
             self.enrollment = EnrollmentLoad(self.enroll_engine, self.enrollment_semaphore, manifest.enrollments)
@@ -2055,14 +2055,13 @@ class ApprovedInference:
         return employee_subjects
 
     def start(self):
-        self.monitor.startup()
         self.worker.start()
-        self.monitor.start()
+        self.flusher.start()
         self.enrollment.start()
 
     def close(self):
         # Stop producers before draining persistence; never steal worker-owned acks.
-        for name in ("enrollment", "worker", "monitor"):
+        for name in ("enrollment", "worker", "flusher"):
             owner = getattr(self, name, None)
             if owner is not None:
                 try:
@@ -2113,7 +2112,7 @@ def configure_replay_cameras(engine, specs):
                 if spec.attendance else None,
                 reference_width=spec.probe.width, reference_height=spec.probe.height))
             db.add(CameraProfile(camera_id=spec.camera_id, zone="ENTRANCE" if spec.attendance else "INTERIOR",
-                                 ai_enabled=True, revision=0, updated_at=utcnow()))
+                                 ai_enabled=True, time_tracking=True, revision=0, updated_at=utcnow()))
 
 
 
@@ -2345,7 +2344,7 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
             now = time.monotonic()
             for replay in replays:
                 replay.check_health()
-            if not inference.worker.is_alive() or not inference.monitor.is_alive():
+            if not inference.worker.is_alive() or not inference.flusher.is_alive():
                 raise EvaluationError("PRODUCTION_OWNER_STOPPED")
             accounting.health(now, inference.journal.health_snapshot())
             result = manager.preview(specs[0].camera_id)
@@ -2359,9 +2358,10 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
                     peaks[gpu["name"]] = max(peaks.get(gpu["name"], 0), gpu["memory_used_mib"])
                 snapshot = inference.worker.inference_snapshot()
                 runtime_samples.append((now, snapshot))
-                attendance_snapshot = inference.attendance.health.snapshot()
-                attendance_reasons.update(attendance_snapshot["reasons"])
-                peak_attendance_pending = max(peak_attendance_pending, attendance_snapshot["pending_write_count"])
+                recorder = inference.presence.snapshot()
+                if recorder["last_error"]:
+                    attendance_reasons.update([recorder["last_error"]])
+                peak_attendance_pending = max(peak_attendance_pending, recorder["pending_crossings"])
                 last_resource_sample = now
             time.sleep(.05)
         ended = min(time.monotonic(), started + duration)
@@ -2408,8 +2408,8 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
         camera_reports.append(report)
     with closing(sqlite3.connect(isolated.database_path)) as db:
         integrity = journal_integrity(db, accounting.expected)
-        attendance_events = db.execute("SELECT status,count(*) FROM attendance_events GROUP BY status").fetchall()
-        payroll_sessions = db.execute("SELECT count(*) FROM work_sessions").fetchone()[0]
+        segments = db.execute("SELECT count(*) FROM attendance_presence_segments").fetchone()[0]
+        crossings = db.execute("SELECT count(*) FROM attendance_door_crossings").fetchone()[0]
     journal_health = accounting.health_report(ended)
     journal_report = dict(
         integrity=integrity, **journal_health, admissions=dict(accounting.admission_counts),
@@ -2426,7 +2426,7 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
     exercised = {
         "AI_WORKER_SCHEDULER_NOT_EXERCISED": bool(accounting.batch_calls and all(metric.analyses for metric in metrics.values())),
         "DURABLE_HUMAN_JOURNAL_NOT_EXERCISED": bool(integrity["durable_visits"] and accounting.ack_counts["COMMITTED"]),
-        "ATTENDANCE_QUEUE_GATES_AND_CROSSINGS_NOT_EXERCISED": bool(attendance_events),
+        "DOOR_CROSSINGS_NOT_EXERCISED": crossings > 0,
         "BATCHED_BODY_LINKING_NOT_EXERCISED": bool(appearance_report["embedded_crops"] and appearance_report["acknowledged_links"]),
         "ENROLLMENT_CONCURRENT_LOAD_NOT_EXERCISED": enrollment_report["status"] == "MEASURED" and enrollment_report["impact"]["overlapping_analyses"] > 0,
         "SCENE_ASSISTANCE_CONCURRENT_IMPACT_NOT_EVALUATED": scene_report["status"] == "MEASURED" and scene_report["impact"]["overlapping_analyses"] > 0,
@@ -2442,8 +2442,6 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
         failures.append("JOURNAL_DEGRADED")
     if journal_health["persistent_growth"]:
         failures.append("PERSISTENT_QUEUE_GROWTH")
-    if payroll_sessions:
-        failures.append("UNCOMMISSIONED_REPLAY_CREATED_PAYROLL")
     if accounting.source_metadata_missing:
         failures.append("SOURCE_TIMESTAMP_ACCOUNTING_LOST")
     if enrollment_report["errors"]:
@@ -2452,7 +2450,7 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
         failures.append("SCENE_CONCURRENT_WORKLOAD_ERRORS")
     if any(item["status"] == "FAIL" for item in gpu_profiles):
         failures.append("CUDA_HEAVY_NODE_FALLBACK")
-    if inference.worker.write_queue.pending():
+    if inference.presence.snapshot()["pending_crossings"]:
         failures.append("ATTENDANCE_WRITES_UNFLUSHED")
     if any(reason in attendance_reasons for reason in ("EVIDENCE_LOST", "PERSISTENCE_ERROR")):
         failures.append("ATTENDANCE_PERSISTENCE_DEGRADED")
@@ -2489,10 +2487,8 @@ def evaluate(manifest: Manifest, *, copies: int, duration: float, device: str,
                         long_edge_limit=1280, consumer="PRODUCTION_JPEG_CACHE_ONE_LOCAL_PREVIEW"),
         "face_observations": face_observations.summary(), "journal": journal_report,
         "appearance": appearance_report,
-        "attendance": dict(events_by_status=dict(attendance_events), payroll_sessions=payroll_sessions,
-                           synthetic_gate=True, commissioned=False, verified_crossing_accuracy="NOT_EVALUATED",
-                           pending_writes=len(inference.worker.write_queue.pending()),
-                           peak_pending_writes=peak_attendance_pending,
+        "attendance": dict(segments=segments, crossings=crossings, recorder=inference.presence.snapshot(),
+                           peak_pending_crossings=peak_attendance_pending,
                            observed_health_reasons=dict(attendance_reasons)),
         "scene_assistance": scene_report, "enrollment": enrollment_report,
         "errors": errors, "runtime_failures": sorted(set(failures)), "integration_needs": integration_needs,

@@ -1,8 +1,8 @@
 """Receipt-timed, finite doorway crossings; owned exclusively by the AI worker.
 
 A face is evidence for one local trajectory, never a substitute for a crossing.
-The detector neither writes attendance nor consults commissioning: auto_eligible
-is captured technical eligibility, to be revalidated transactionally at storage.
+The detector neither writes attendance nor decides work time: auto_eligible
+is captured technical eligibility; the AI worker records crossings of known employees.
 """
 import math
 import time

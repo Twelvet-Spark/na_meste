@@ -39,8 +39,8 @@ from app.ai.face_detector import FaceInfo
 from app.ai.face_recognition import EmbeddingStore
 from app.database.database import get_db, immediate_session
 from app.database.models import (
-    AttendanceCommission, AttendanceRuntime, Camera, Employee, EmployeeFace,
-    FaceModelMetadata, HumanJournalGap, HumanVisit, HumanVisitEvent,
+    AttendanceRuntime, Camera, Employee, EmployeeFace, FaceModelMetadata, HumanJournalGap, HumanVisit,
+    HumanVisitEvent, PresenceSegment,
 )
 from operator_test_support import Client, multipart
 from test_operator_storage import database, dump, legacy, schema, STAMP
@@ -579,11 +579,13 @@ def test_legacy_remediation_preserves_history_and_allows_deactivation_before_pho
         assert named["needs_name_completion"] is False and named["needs_photo_remediation"]
         corrected = save_faces(client, named, [], files())
         assert corrected["needs_photo_remediation"] is False
+        with immediate_session(engine) as db:
+            db.add(PresenceSegment(employee_id=41, camera_id=12, started_at=STAMP, last_seen_at=STAMP,
+                                   face_seen=True))
         client.json("DELETE", "/api/employees/41", status=409)
         with engine.connect() as connection:
-            assert connection.exec_driver_sql("SELECT employee_name FROM attendance_events").scalar_one() == "Снимок события"
-            assert connection.exec_driver_sql("SELECT employee_name FROM attendance_employee_references").scalar_one() == "Снимок ссылки"
-            assert connection.exec_driver_sql("SELECT employee_name FROM work_sessions").scalar_one() == "Снимок интервала"
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM attendance_presence_segments WHERE employee_id=41").scalar_one() == 1
 
 
 @test
@@ -898,18 +900,13 @@ def test_views_distinguish_stored_unproven_samples_and_unavailable_runtime_model
 
 
 @test
-def test_provenance_rollback_and_gallery_mutations_revoke_commission_atomically():
+def test_provenance_rollback_and_gallery_mutations_bump_gallery_revision_atomically():
     with api() as (client, engine, _model, _store, _root):
         original = create(client)
-        with immediate_session(engine) as db:
-            commission = AttendanceCommission(request_id=str(uuid4()), actor="Operator", reason="Test",
-                                              configuration_fingerprint={}, acceptance_record={})
-            db.add(commission)
-            db.flush()
-            db.get(AttendanceRuntime, 1).commission_id = commission.id
+        revision = gallery_revision(engine)
         saved = save_faces(client, original, [], files())
         with Session(engine) as db:
-            assert db.get(AttendanceRuntime, 1).commission_id is None
+            assert db.get(AttendanceRuntime, 1).gallery_revision == revision + 1
             samples = db.query(EmployeeFace).all()
             metadata_rows = db.query(FaceModelMetadata).all()
             assert len(samples) == len(metadata_rows) == 1

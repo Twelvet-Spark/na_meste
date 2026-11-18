@@ -29,7 +29,6 @@ from app.api.cameras import router as cameras_router
 from app.api.employees import router as employees_router
 from app.api.workplaces import router as workplaces_router
 from app.api.global_persons import router as global_persons_router
-from app.api.presence import router as presence_router
 from app.api.recordings import router as recordings_router
 from app.api.settings import router as settings_router
 from app.api.debug import router as debug_router
@@ -40,8 +39,7 @@ from app.database.database import SessionLocal, engine, init_db
 from app.database.models import AttendanceCamera, Camera
 from app.rtsp.manager import ReaderManager
 from app.rtsp.source import CameraSource
-from app.services.attendance_service import AttendanceService
-from app.services.attendance_monitor import AttendanceMonitor
+from app.services.presence_recorder import PresenceFlusher, PresenceRecorder
 from app.time_utils import utcnow
 from app.services.telegram_service import TelegramNotifier
 from app.media.process_guard import MediaProcessGuard
@@ -156,8 +154,7 @@ async def lifespan(app: FastAPI):
     app.state.embedding_store = None
     app.state.ai_worker = None
     app.state.detection_state = None
-    app.state.attendance = AttendanceService(
-        engine, notifier=notifier, now=utcnow, model_bundle=bundle)
+    app.state.presence = PresenceRecorder(engine, notifier=notifier)
     app.state.human_journal = HumanJournal(
         engine, lost_timeout=settings.track_lost_timeout,
         image_keep_days=settings.journal_image_keep_days)
@@ -183,33 +180,31 @@ async def lifespan(app: FastAPI):
         app.state.setup_transfer = SetupTransferService(
             engine, face_model_id=bundle.face_model_id,
             face_engine=app.state.face_engine, enrollment_semaphore=app.state.enrollment_lock)
-    app.state.attendance.health.set_providers(loaded_providers(
-        enroll=app.state.face_engine, scene=app.state.scene_segmenter,
-        scene_detector=app.state.scene_detector))
 
+    app.state.ai_startup_error = None
     if settings.ai_enabled:
         try:
             worker = build_ai_worker(
-                app.state.manager, app.state.attendance, app.state.embedding_store,
+                app.state.manager, app.state.presence, app.state.embedding_store,
                 bundle=bundle, session_factory=SessionLocal, notifier=notifier,
-                enroll_engine=app.state.face_engine, journal=app.state.human_journal)
+                journal=app.state.human_journal)
             if worker is not None:
                 worker.start()
                 app.state.ai_worker = worker
                 app.state.detection_state = worker.state
             else:
-                app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])
+                app.state.ai_startup_error = "AI_UNAVAILABLE"
         except Exception:
-            logger.exception("Live inference unavailable; attendance remains in review/manual mode")
-            app.state.attendance.health.transition("inference_startup", ["AI_UNAVAILABLE"])
+            logger.exception("Live inference unavailable; work time is not recorded")
+            app.state.ai_startup_error = "AI_UNAVAILABLE"
     else:
         logger.info("AI отключён (AI_ENABLED=false)")
     worker = app.state.ai_worker
-    app.state.attendance.health.set_providers(loaded_providers(
+    app.state.ai_providers = loaded_providers(
         detector=worker.service.detector if worker is not None else None,
         live=worker.service.faces if worker is not None else None,
         enroll=app.state.face_engine, reid=worker.reid if worker is not None else None,
-        scene=app.state.scene_segmenter, scene_detector=app.state.scene_detector))
+        scene=app.state.scene_segmenter, scene_detector=app.state.scene_detector)
 
     with SessionLocal() as session:
         saved_sources = [
@@ -220,18 +215,8 @@ async def lifespan(app: FastAPI):
         ]
     for camera in saved_sources:
         app.state.manager.start(camera)
-    app.state.attendance_monitor = AttendanceMonitor(
-        app.state.attendance,
-        write_queue=app.state.ai_worker.write_queue if app.state.ai_worker is not None else None,
-        manager=app.state.manager, worker=app.state.ai_worker,
-        journal=app.state.human_journal,
-    )
-    try:
-        app.state.attendance_monitor.startup()
-    except Exception:
-        logger.exception("Attendance restart coverage could not be persisted")
-        app.state.attendance.health.transition("monitor", ["PERSISTENCE_ERROR"])
-    app.state.attendance_monitor.start()
+    app.state.presence_flusher = PresenceFlusher(app.state.presence)
+    app.state.presence_flusher.start()
 
     logger.info(
         "Приложение запущено: http://localhost:%d (API docs: /docs)", settings.app_port
@@ -262,7 +247,7 @@ async def lifespan(app: FastAPI):
         app.state.journal_close_result = asdict(app.state.human_journal.close())
         if not app.state.journal_close_result["drained"]:
             logger.error("Journal shutdown incomplete: %s", app.state.journal_close_result)
-        app.state.attendance_monitor.stop()
+        app.state.presence_flusher.stop()
         if app.state.telegram is not None:
             app.state.telegram.stop()
         app.state.manager.stop_all()
@@ -280,7 +265,6 @@ app.include_router(cameras_router)
 app.include_router(scenes_router)
 app.include_router(employees_router)
 app.include_router(workplaces_router)
-app.include_router(presence_router)
 app.include_router(global_persons_router)
 app.include_router(attendance_router)
 app.include_router(recordings_router)

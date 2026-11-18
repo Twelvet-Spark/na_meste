@@ -304,6 +304,29 @@ def image_failure_does_not_rollback_metadata_and_retention_is_visit_only():
 
 
 @test
+def writer_expires_visits_and_purges_images_without_an_ai_tick():
+    with database() as engine:
+        clock = Clock()
+        journal = start(engine, clock, image_keep_days=1)
+        try:
+            journal.observe(1, packet(clock, 1), outcome(person(evidence=face(clock, 1))))
+            idle(journal)
+            assert rows(engine, HumanVisit)[0].snapshot
+            clock.advance(86401)
+            # Deterministic timer wakeup: no worker exists and no caller invokes tick().
+            with journal._condition:
+                journal._condition.notify_all()
+                assert journal._condition.wait_for(
+                    lambda: journal._last_purge >= clock.mono(), timeout=5)
+            idle(journal)
+            visit = rows(engine, HumanVisit)[0]
+            assert visit.status == 'CLOSED' and visit.end_reason == 'TRACK_EXPIRED'
+            assert visit.snapshot is None and visit.face_thumbnail is None and visit.images_purged_at
+        finally:
+            journal.close()
+
+
+@test
 def saturation_freezes_existing_identity_transition_and_reserved_barrier_flushes_cutoff():
     with database() as engine:
         clock = Clock()

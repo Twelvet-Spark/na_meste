@@ -5,10 +5,7 @@
   const reasons = {
     AI_UNAVAILABLE: 'Модели AI не готовы. Проверьте загруженные провайдеры и настройки развёртывания.',
     AI_EXCLUDED: 'AI-анализ камеры выключен. Проверьте настройки камеры на вкладке «Обзор».',
-    CAMERA_UNCONFIGURED: 'Камеры учёта не покрывают вход и выход. Настройте проходы и направления учёта.',
     CAMERA_OFFLINE: 'Камера недоступна. Проверьте питание, сеть и подключение.',
-    COMMISSIONING_REQUIRED: 'Нужен ввод системы в эксплуатацию. Проверьте калибровку и критерии на странице рабочего времени.',
-    CLOCK_DISCONTINUITY: 'Обнаружено изменение часов. Требуется проверка временных разрывов; история не сбрасывается.',
     FRAME_GAP: 'Недостаточно свежих кадров. Проверьте поток камеры.',
     PERFORMANCE_WARMUP: 'Измеряется производительность. Дождитесь устойчивой обработки кадров.',
     PERFORMANCE_DEGRADED: 'Производительность ниже требований. Проверьте загрузку и провайдеры AI.',
@@ -63,9 +60,7 @@
   const time = (value) => value ? new Date(value).toLocaleString('ru-RU') : 'Нет данных';
   const gb = (value) => value === null || value === undefined ? 'Нет данных' : `${(value / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} ГБ`;
   const why = (code) => reasons[code] || `Код ${code}. Проверьте состояние модуля и передайте отчёт администратору.`;
-  function roleLabel(role) {
-    return ({ BOTH: 'вход и выход', ENTRY: 'только вход', EXIT: 'только выход' })[role] || 'не настроен';
-  }
+
   function facts(target, entries) {
     target.replaceChildren();
     for (const [label, value] of entries) {
@@ -84,17 +79,11 @@
     target.append(article);
   }
   function render(view) {
-    const attendance = view.attendance;
-    $('debug-readiness').textContent = attendance.automatic_ready ? 'Автоматический учёт готов по текущему состоянию системы.' : 'Автоматический учёт не готов. Не считайте отсутствие автоматических отметок подтверждением отсутствия сотрудника.';
-    const reasonList = $('debug-reasons'); reasonList.replaceChildren();
-    for (const code of attendance.reasons || []) { const li = document.createElement('li'); li.textContent = why(code); reasonList.append(li); }
-    facts($('debug-attendance'), [['Техническая готовность', attendance.technical_ready ? 'Готово' : 'Не готово'],
-      ['Ожидающие сообщения о разрывах', attendance.pending_fault_count], ['Ожидающие записи', attendance.pending_write_count]]);
-    const cameraMetrics = $('debug-attendance-cameras'); cameraMetrics.replaceChildren();
-    for (const camera of attendance.cameras || []) {
-      row(cameraMetrics, `Камера #${camera.camera_id} — ${roleLabel(camera.role)}`,
-        `Обработка: ${text(camera.processed_fps)} кадров/с. Возраст кадра: ${text(camera.frame_age_seconds)} с. Задержка p95: ${text(camera.processing_age_p95_seconds)} с; завершение p95: ${text(camera.completion_age_p95_seconds)} с. ${(camera.reasons || []).map(why).join(' ')}`);
-    }
+    const tracking = view.time_tracking, recorder = tracking.recorder || {};
+    facts($('debug-attendance'), [['Камер с учётом времени', tracking.time_tracking_cameras], ['Из них онлайн', tracking.time_tracking_online],
+      ['Узнавание по лицу', tracking.face_available ? 'Доступно' : 'Недоступно'], ['Узнавание по внешности', tracking.appearance_available ? 'Доступно' : 'Недоступно'],
+      ['Открытых сегментов', recorder.open_segments], ['Ожидающих проходов', recorder.pending_crossings], ['Потеряно проходов', recorder.dropped_crossings],
+      ['Последняя запись', time(recorder.last_flush_at)], ['Ошибка записи', recorder.last_error ? why(recorder.last_error) : 'Нет']]);
     facts($('debug-tools'), [['FFmpeg', view.tools.error_code ? 'Нет данных' : view.tools.ffmpeg_available ? 'Найден' : 'Не найден'], ['ffprobe', view.tools.error_code ? 'Нет данных' : view.tools.ffprobe_available ? 'Найден' : 'Не найден'],
       ['AI в настройках текущего запуска', view.ai.enabled ? 'Включён' : 'Отключён'],
       ['Защита медиапроцессов', view.processes.containment_available ? 'Доступна' : 'Недоступна / нет данных']]);

@@ -1,0 +1,215 @@
+"""Frozen DDL of every released attendance schema version, so upgrades never depend on the live ORM.
+
+Whitespace between SQL tokens is not significant (attendance_schema._sql_key); everything else is.
+"""
+# Version 1 allowed one enabled camera per ENTRY/EXIT role and had no door frame.
+V1_ATTENDANCE_CAMERAS_DDL = """CREATE TABLE attendance_cameras (
+    camera_id INTEGER NOT NULL,
+    role VARCHAR(5),
+    enabled BOOLEAN DEFAULT 0 NOT NULL,
+    revision INTEGER DEFAULT 0 NOT NULL,
+    source_revision INTEGER DEFAULT 1 NOT NULL,
+    line_start JSON,
+    line_end JSON,
+    inside_point JSON,
+    reference_width INTEGER,
+    reference_height INTEGER,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (camera_id),
+    CONSTRAINT ck_attendance_camera_role CHECK (role IS NULL OR role IN ('ENTRY', 'EXIT')),
+    CONSTRAINT ck_attendance_camera_revisions CHECK (revision >= 0 AND source_revision >= 1),
+    CONSTRAINT ck_attendance_camera_enabled CHECK (enabled IN (0, 1)),
+    CONSTRAINT ck_attendance_camera_complete CHECK (enabled = 0 OR (role IS NOT NULL AND line_start IS NOT NULL AND line_end IS NOT NULL AND inside_point IS NOT NULL AND reference_width IS NOT NULL AND reference_height IS NOT NULL AND reference_width > 0 AND reference_height > 0)),
+    FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+)"""
+V1_ROLE_INDEX_DDL = ("CREATE UNIQUE INDEX uq_attendance_cameras_enabled_role "
+                      "ON attendance_cameras (role) WHERE enabled = 1")
+V1_ATTENDANCE_RUNTIME_DDL = """CREATE TABLE attendance_runtime (
+    id INTEGER NOT NULL,
+    schema_version INTEGER DEFAULT 1 NOT NULL,
+    gallery_revision INTEGER DEFAULT 0 NOT NULL,
+    commission_id INTEGER,
+    monitoring_started_at DATETIME,
+    heartbeat_at DATETIME,
+    stopped_at DATETIME,
+    PRIMARY KEY (id),
+    CONSTRAINT ck_attendance_runtime_singleton CHECK (id = 1),
+    CONSTRAINT ck_attendance_runtime_version CHECK (schema_version = 1),
+    CONSTRAINT ck_attendance_runtime_gallery CHECK (gallery_revision >= 0),
+    FOREIGN KEY(commission_id) REFERENCES attendance_commissions (id) ON DELETE RESTRICT
+)"""
+
+V2_TABLES: dict[str, str] = {
+    'attendance_cameras': """CREATE TABLE attendance_cameras (
+    camera_id INTEGER NOT NULL, 
+    role VARCHAR(5), 
+    enabled BOOLEAN DEFAULT 0 NOT NULL, 
+    revision INTEGER DEFAULT 0 NOT NULL, 
+    source_revision INTEGER DEFAULT 1 NOT NULL, 
+    line_start JSON, 
+    line_end JSON, 
+    inside_point JSON, 
+    door_kind VARCHAR(7), 
+    door_top JSON, 
+    reference_width INTEGER, 
+    reference_height INTEGER, 
+    updated_at DATETIME NOT NULL, 
+    PRIMARY KEY (camera_id), 
+    CONSTRAINT ck_attendance_camera_role CHECK (role IS NULL OR role IN ('ENTRY', 'EXIT', 'BOTH')), 
+    CONSTRAINT ck_attendance_camera_door_kind CHECK (door_kind IS NULL OR door_kind IN ('DOOR', 'PASSAGE')), 
+    CONSTRAINT ck_attendance_camera_revisions CHECK (revision >= 0 AND source_revision >= 1), 
+    CONSTRAINT ck_attendance_camera_enabled CHECK (enabled IN (0, 1)), 
+    CONSTRAINT ck_attendance_camera_complete CHECK (enabled = 0 OR (role IS NOT NULL AND line_start IS NOT NULL AND line_end IS NOT NULL AND inside_point IS NOT NULL AND door_kind IS NOT NULL AND door_top IS NOT NULL AND reference_width IS NOT NULL AND reference_height IS NOT NULL AND reference_width > 0 AND reference_height > 0)), 
+    FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT
+)""",
+    'attendance_commissions': """CREATE TABLE attendance_commissions (
+    id INTEGER NOT NULL, 
+    request_id VARCHAR(36) NOT NULL, 
+    actor VARCHAR(100) NOT NULL, 
+    reason VARCHAR(1000) NOT NULL, 
+    created_at DATETIME NOT NULL, 
+    configuration_fingerprint JSON NOT NULL, 
+    acceptance_record JSON NOT NULL, 
+    PRIMARY KEY (id), 
+    CONSTRAINT ck_attendance_commission_actor CHECK (length(trim(actor)) BETWEEN 1 AND 100), 
+    CONSTRAINT ck_attendance_commission_reason CHECK (length(trim(reason)) BETWEEN 1 AND 1000), 
+    UNIQUE (request_id)
+)""",
+    'attendance_coverage_gaps': """CREATE TABLE attendance_coverage_gaps (
+    id INTEGER NOT NULL, 
+    singleton INTEGER DEFAULT 1 NOT NULL, 
+    started_at DATETIME NOT NULL, 
+    ended_at DATETIME, 
+    reason_codes JSON NOT NULL, 
+    source_fault_ids JSON NOT NULL, 
+    reviewed BOOLEAN DEFAULT 0 NOT NULL, 
+    revision INTEGER DEFAULT 0 NOT NULL, 
+    PRIMARY KEY (id), 
+    CONSTRAINT ck_attendance_gap_singleton CHECK (singleton = 1), 
+    CONSTRAINT ck_attendance_gap_times CHECK (ended_at IS NULL OR ended_at >= started_at), 
+    CONSTRAINT ck_attendance_gap_revision CHECK (revision >= 0), 
+    CONSTRAINT ck_attendance_gap_reviewed CHECK (reviewed IN (0, 1))
+)""",
+    'attendance_decisions': """CREATE TABLE attendance_decisions (
+    id INTEGER NOT NULL, 
+    request_id VARCHAR(36) NOT NULL, 
+    event_id VARCHAR(36), 
+    gap_id INTEGER, 
+    revision INTEGER NOT NULL, 
+    actor VARCHAR(100) NOT NULL, 
+    reason VARCHAR(1000) NOT NULL, 
+    "before" JSON NOT NULL, 
+    "after" JSON NOT NULL, 
+    created_at DATETIME NOT NULL, 
+    PRIMARY KEY (id), 
+    CONSTRAINT ck_attendance_decision_target CHECK ((event_id IS NOT NULL AND gap_id IS NULL) OR (event_id IS NULL AND gap_id IS NOT NULL)), 
+    CONSTRAINT ck_attendance_decision_revision CHECK (revision >= 0), 
+    CONSTRAINT ck_attendance_decision_actor CHECK (length(trim(actor)) BETWEEN 1 AND 100), 
+    CONSTRAINT ck_attendance_decision_reason CHECK (length(trim(reason)) BETWEEN 1 AND 1000), 
+    CONSTRAINT uq_attendance_decision_event_revision UNIQUE (event_id, revision), 
+    CONSTRAINT uq_attendance_decision_gap_revision UNIQUE (gap_id, revision), 
+    FOREIGN KEY(request_id) REFERENCES attendance_requests (id) ON DELETE RESTRICT, 
+    FOREIGN KEY(event_id) REFERENCES attendance_events (id) ON DELETE RESTRICT, 
+    FOREIGN KEY(gap_id) REFERENCES attendance_coverage_gaps (id) ON DELETE RESTRICT
+)""",
+    'attendance_employee_references': """CREATE TABLE attendance_employee_references (
+    event_id VARCHAR(36) NOT NULL, 
+    employee_id INTEGER NOT NULL, 
+    employee_name VARCHAR(150) NOT NULL, 
+    PRIMARY KEY (event_id, employee_id), 
+    FOREIGN KEY(event_id) REFERENCES attendance_events (id) ON DELETE RESTRICT, 
+    FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT
+)""",
+    'attendance_events': """CREATE TABLE attendance_events (
+    id VARCHAR(36) NOT NULL, 
+    source_key VARCHAR NOT NULL, 
+    source VARCHAR(6) NOT NULL, 
+    camera_id INTEGER, 
+    camera_name VARCHAR(100), 
+    stream_id VARCHAR(36), 
+    tracking_generation VARCHAR(36), 
+    track_id INTEGER, 
+    crossing_index INTEGER, 
+    recorded_at DATETIME NOT NULL, 
+    raw JSON NOT NULL, 
+    employee_id INTEGER, 
+    employee_name VARCHAR(150), 
+    direction VARCHAR(5), 
+    occurred_at DATETIME NOT NULL, 
+    status VARCHAR(8) NOT NULL, 
+    revision INTEGER DEFAULT 0 NOT NULL, 
+    reason_codes JSON NOT NULL, 
+    projection_reasons JSON NOT NULL, 
+    PRIMARY KEY (id), 
+    CONSTRAINT ck_attendance_event_source CHECK (source IN ('CAMERA', 'MANUAL')), 
+    CONSTRAINT ck_attendance_event_direction CHECK (direction IS NULL OR direction IN ('ENTRY', 'EXIT')), 
+    CONSTRAINT ck_attendance_event_status CHECK (status IN ('ACCEPTED', 'REVIEW', 'VISITOR', 'VOID')), 
+    CONSTRAINT ck_attendance_event_revision CHECK (revision >= 0), 
+    CONSTRAINT ck_attendance_event_raw_version CHECK (json_valid(raw) AND json_type(raw, '$.version') IS 'integer' AND json_extract(raw, '$.version') = 1), 
+    UNIQUE (source_key), 
+    FOREIGN KEY(camera_id) REFERENCES cameras (id) ON DELETE RESTRICT, 
+    FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT
+)""",
+    'attendance_evidence': """CREATE TABLE attendance_evidence (
+    event_id VARCHAR(36) NOT NULL, 
+    before_jpeg BLOB, 
+    after_jpeg BLOB, 
+    face_jpeg BLOB, 
+    expires_at DATETIME NOT NULL, 
+    purged_at DATETIME, 
+    PRIMARY KEY (event_id), 
+    FOREIGN KEY(event_id) REFERENCES attendance_events (id) ON DELETE CASCADE
+)""",
+    'attendance_requests': """CREATE TABLE attendance_requests (
+    id VARCHAR(36) NOT NULL, 
+    operation VARCHAR(100) NOT NULL, 
+    payload JSON NOT NULL, 
+    result JSON NOT NULL, 
+    created_at DATETIME NOT NULL, 
+    PRIMARY KEY (id)
+)""",
+    'attendance_runtime': """CREATE TABLE attendance_runtime (
+    id INTEGER NOT NULL, 
+    schema_version INTEGER DEFAULT 2 NOT NULL, 
+    gallery_revision INTEGER DEFAULT 0 NOT NULL, 
+    commission_id INTEGER, 
+    monitoring_started_at DATETIME, 
+    heartbeat_at DATETIME, 
+    stopped_at DATETIME, 
+    PRIMARY KEY (id), 
+    CONSTRAINT ck_attendance_runtime_singleton CHECK (id = 1), 
+    CONSTRAINT ck_attendance_runtime_version CHECK (schema_version = 2), 
+    CONSTRAINT ck_attendance_runtime_gallery CHECK (gallery_revision >= 0), 
+    FOREIGN KEY(commission_id) REFERENCES attendance_commissions (id) ON DELETE RESTRICT
+)""",
+    'work_sessions': """CREATE TABLE work_sessions (
+    entry_event_id VARCHAR(36) NOT NULL, 
+    exit_event_id VARCHAR(36), 
+    employee_id INTEGER NOT NULL, 
+    employee_name VARCHAR(150) NOT NULL, 
+    started_at DATETIME NOT NULL, 
+    ended_at DATETIME, 
+    status VARCHAR(6) NOT NULL, 
+    reason_codes JSON NOT NULL, 
+    PRIMARY KEY (entry_event_id), 
+    CONSTRAINT ck_work_session_status CHECK (status IN ('OPEN', 'CLOSED', 'REVIEW')), 
+    CONSTRAINT ck_work_session_times CHECK (ended_at IS NULL OR ended_at >= started_at), 
+    FOREIGN KEY(entry_event_id) REFERENCES attendance_events (id) ON DELETE RESTRICT, 
+    UNIQUE (exit_event_id), 
+    FOREIGN KEY(exit_event_id) REFERENCES attendance_events (id) ON DELETE RESTRICT, 
+    FOREIGN KEY(employee_id) REFERENCES employees (id) ON DELETE RESTRICT
+)""",
+}
+V2_INDEXES: dict[str, str] = {
+    'uq_attendance_coverage_gaps_open': """CREATE UNIQUE INDEX uq_attendance_coverage_gaps_open ON attendance_coverage_gaps (singleton) WHERE ended_at IS NULL""",
+    'ix_attendance_evidence_expires_at': """CREATE INDEX ix_attendance_evidence_expires_at ON attendance_evidence (expires_at)""",
+    'ix_work_sessions_employee_id': """CREATE INDEX ix_work_sessions_employee_id ON work_sessions (employee_id)""",
+    'uq_work_sessions_open_employee': """CREATE UNIQUE INDEX uq_work_sessions_open_employee ON work_sessions (employee_id) WHERE ended_at IS NULL""",
+}
+
+V1_TABLES: dict[str, str] = {
+    **V2_TABLES,
+    "attendance_cameras": V1_ATTENDANCE_CAMERAS_DDL,
+    "attendance_runtime": V1_ATTENDANCE_RUNTIME_DDL,
+}
+V1_INDEXES: dict[str, str] = {**V2_INDEXES, "uq_attendance_cameras_enabled_role": V1_ROLE_INDEX_DDL}
