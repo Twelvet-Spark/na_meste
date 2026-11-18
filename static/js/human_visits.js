@@ -6,6 +6,7 @@
   const form = $('visits-filters');
   const labels = { PROVISIONAL: 'Предварительное', ACTIVE: 'Активное', CLOSED: 'Завершено',
     UNKNOWN: 'Неизвестный человек', FACE_CONFIRMED: 'Подтверждено лицом', CONFLICT: 'Конфликт личности',
+    OPERATOR_CONFIRMED: 'Подтверждено оператором', OPERATOR_UNKNOWN: 'Неизвестный · решение оператора',
     AVAILABLE: 'сохранено', MISSING: 'нет', EXPIRED: 'срок истёк', PURGED: 'удалено по сроку' };
   let active = '';
   let sequence = 0;
@@ -35,7 +36,7 @@
       link.textContent = visit.id.slice(0, 8); link.title = visit.id;
       link.setAttribute('aria-label', `Открыть наблюдение ${visit.id}`); id.append(link);
       const identity = cell(labels[visit.identity_state] || visit.identity_state);
-      if (visit.employee_id && visit.identity_state === 'FACE_CONFIRMED') {
+      if (visit.employee_id) {
         const employee = document.createElement('a');
         employee.href = `/employees/${visit.employee_id}`;
         employee.textContent = visit.employee_name || `Сотрудник #${visit.employee_id}`;

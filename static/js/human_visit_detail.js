@@ -1,4 +1,4 @@
-// The displayed face and append receipt stay frozen across uncertain retries.
+// Read-only evidence stays separate from independently retriable corrections.
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
@@ -6,11 +6,10 @@
   const root = $('visit-detail');
   if (!root) return;
   const endpoint = `/api/global-persons/visits/${encodeURIComponent(root.dataset.visitId)}`;
-  const form = $('sample-form');
-  const select = $('sample-employee');
   const labels = {
     PROVISIONAL: 'Предварительное', ACTIVE: 'Активное', CLOSED: 'Завершено',
     UNKNOWN: 'Неизвестный человек', FACE_CONFIRMED: 'Подтверждено лицом', CONFLICT: 'Конфликт личности',
+    OPERATOR_CONFIRMED: 'Подтверждено оператором', OPERATOR_UNKNOWN: 'Неизвестный · решение оператора',
     AVAILABLE: 'Сохранено', MISSING: 'Изображение не было сохранено',
     EXPIRED: 'Срок хранения истёк. Данные наблюдения сохранены.',
     PURGED: 'Изображение удалено по сроку хранения. Данные наблюдения сохранены.',
@@ -18,30 +17,14 @@
     IDENTITY_CONFLICT: 'Конфликт личности', LOST: 'Трек потерян', RECOVERED: 'Трек восстановлен',
     LINKED: 'Межкамерная связь по внешности',
   };
-  const reasons = {
-    FACE_MODEL_UNAVAILABLE: 'Модель лиц недоступна. Используйте обычное добавление фотографий после восстановления модели.',
-    VISIT_FACE_MISSING: 'Нет сохранённого подходящего лица. Добавьте обычную фотографию сотрудника.',
-    VISIT_FACE_EXPIRED: 'Срок хранения лица истёк. Добавьте обычную фотографию сотрудника.',
-    VISIT_FACE_INVALID: 'Сохранённое лицо не подходит для образца. Добавьте обычную фотографию сотрудника.',
-    VISIT_FACE_QUALITY: 'Недостаточное качество лица. Нужны исходный размер не менее 80 px, резкость и однозначная связь с человеком.',
-    FACE_LIMIT_REACHED: 'У сотрудника уже 15 образцов. Управляйте набором фотографий в карточке сотрудника.',
-    ENROLLMENT_BUSY: 'Другая обработка фотографий ещё выполняется. Подождите и повторите тот же запрос.',
-    GALLERY_CHANGED: 'Галерея изменилась во время проверки. Загрузите текущую версию сотрудника и проверьте выбор.',
-  };
   let visit = null;
-  let employee = null;
   let faceDigest = null;
-  let pending = null;
-  let busy = false;
-  let loading = false;
-  let employeeLoading = false;
-  let employeesReady = false;
-  let completed = false;
-  let needsReview = false;
   let expiryTimer = null;
   let version = 0;
-  let employeeVersion = 0;
   const urls = new Map();
+  let loading = false;
+  const digests = {};
+  const corrections = window.JournalCorrections;
 
   function time(value) { return value ? value.replace('T', ' ').replace(/Z$/, ' UTC') : '—'; }
   function duration(value) {
@@ -62,24 +45,13 @@
     const element = document.createElement('a'); element.href = href; element.textContent = text; return element;
   }
   function controls() {
-    const locked = busy || loading;
-    const eligible = visit?.employee_sample_eligible && faceDigest === visit?.face_sha256 && !needsReview;
-    $('sample-fields').disabled = locked || !employeesReady || (!eligible && !pending);
-    select.disabled = Boolean(pending) || employeeLoading;
-    $('sample-confirm').disabled = Boolean(pending) || employeeLoading;
-    $('sample-submit').disabled = locked || employeeLoading || completed ||
-      (!pending && (!eligible || !employee || employee.faces_count >= 15 || !$('sample-confirm').checked));
-    $('sample-submit').textContent = pending ? 'Повторить тот же запрос' : 'Добавить проверенный образец';
-    $('visit-refresh').disabled = locked || Boolean(pending);
-    $('sample-reconcile').disabled = locked || employeeLoading || Boolean(pending);
-    $('sample-retry-employees').disabled = locked || Boolean(pending);
+    $('visit-refresh').disabled = loading || corrections.locked();
     root.setAttribute('aria-busy', String(loading));
-    form.setAttribute('aria-busy', String(busy || employeeLoading));
   }
   function renderVisit() {
     $('visit-state').textContent = labels[visit.status] || visit.status;
     $('visit-state').className = 'status ' + (visit.status === 'ACTIVE' ? 'online' : visit.status === 'PROVISIONAL' ? 'connecting' : 'offline');
-    const identity = visit.employee_id && visit.identity_state === 'FACE_CONFIRMED'
+    const identity = visit.employee_id
       ? link(`/employees/${visit.employee_id}`, visit.employee_name || `Сотрудник #${visit.employee_id}`)
       : labels[visit.identity_state] || visit.identity_state;
     const global = visit.global_id ? link(`/global/${visit.global_id}`, `G#${visit.global_id} · связь по внешности`) : 'Нет межкамерной связи';
@@ -88,6 +60,9 @@
       ['Первое наблюдение', time(visit.started_at)], ['Последнее наблюдение', time(visit.last_seen_at)],
       ['Длительность наблюдений', duration(visit.duration_seconds)], ['Состояние', labels[visit.status] || visit.status],
       ['Личность', identity], ['Завершено', time(visit.ended_at)], ['Причина завершения', visit.end_reason || '—'],
+      ['Источник личности', visit.identity_source === 'OPERATOR' ? 'Оператор' : 'AI'],
+      ['Исходное решение AI', `${visit.ai_employee_name || 'Без сотрудника'} · ${labels[visit.ai_identity_state] || visit.ai_identity_state}`],
+      ['Версия исправления', visit.identity_revision],
       ['Межкамерный архив', global], ['Поколение трекера / трек', `${visit.tracking_generation} / ${visit.track_id}`],
       ['Версия источника / поток', `${visit.source_revision} / ${visit.stream_id}`],
     ]);
@@ -99,14 +74,11 @@
       ['Оценка детектора / резкость', `${quality.det_score ?? '—'} / ${quality.blur ?? '—'}`],
       ['Связь лица с человеком', quality.unambiguous === true ? 'Однозначная' : 'Не подтверждена'],
     ]);
-    const explanation = visit.employee_sample_eligible
-      ? 'После загрузки лица выберите сотрудника и подтвердите его вручную.'
-      : reasons[visit.employee_sample_reason] || 'Этот снимок не подходит для добавления. Используйте обычную загрузку фотографий в карточке сотрудника.';
-    UI.message($('sample-eligibility'), explanation);
   }
   function clearImage(kind) {
     const image = $(`visit-${kind}`); image.hidden = true; image.removeAttribute('src');
     if (urls.has(kind)) { URL.revokeObjectURL(urls.get(kind)); urls.delete(kind); }
+    delete digests[kind];
   }
   async function loadImage(kind, ticket) {
     clearImage(kind);
@@ -120,8 +92,8 @@
         throw error;
       }
       const digest = response.headers.get('ETag')?.replace(/^"|"$/g, '');
-      if (kind === 'face' && digest !== visit.face_sha256) {
-        throw new Error('Лицо изменилось после загрузки данных. Обновите наблюдение и проверьте новый снимок.');
+      if (digest !== visit[`${kind}_sha256`]) {
+        throw new Error('Изображение изменилось после загрузки данных. Обновите наблюдение и проверьте новый снимок.');
       }
       const blob = await response.blob();
       if (ticket !== version) return;
@@ -130,6 +102,7 @@
       await image.decode();
       if (ticket !== version) return;
       image.hidden = false;
+      digests[kind] = digest;
       if (kind === 'face') faceDigest = digest;
       UI.message($(`visit-${kind}-status`), 'Сохранённый снимок · ' + time(visit.image_expires_at) + ' — срок хранения');
     } catch (error) {
@@ -165,122 +138,57 @@
       expiryTimer = setTimeout(scheduleExpiry, Math.min(remaining, 2147483647));
       return;
     }
-    faceDigest = null; needsReview = true;
+    // Keep the exact already-displayed evidence only while its mutation is unresolved.
+    if (corrections.samplePending()) {
+      expiryTimer = setTimeout(scheduleExpiry, 1000);
+      return;
+    }
+    faceDigest = null;
     visit.employee_sample_eligible = false;
     visit.employee_sample_reason = 'VISIT_FACE_EXPIRED';
     for (const kind of ['photo', 'face']) {
       clearImage(kind); UI.message($(`visit-${kind}-status`), labels.EXPIRED);
     }
-    renderVisit(); controls();
+    renderVisit(); corrections.update(visit, digests); controls();
   }
 
   async function loadVisit() {
-    if (busy || loading || pending) return;
+    if (loading || corrections.locked()) return;
     const ticket = ++version;
     clearTimeout(expiryTimer);
-    loading = true; faceDigest = null; controls();
+    loading = true; faceDigest = null; corrections.setLoading(true); controls();
     UI.message($('visit-status'), 'Загружаем наблюдение…');
     try {
       const result = await UI.api(endpoint, { cache: 'no-store' });
       if (ticket !== version) return;
-      visit = result; completed = false; needsReview = false;
-      $('sample-confirm').checked = false;
+      visit = result;
       renderVisit();
       await Promise.all([loadImage('photo', ticket), loadImage('face', ticket), loadEvents(ticket)]);
       if (ticket !== version) return;
       renderVisit();
       scheduleExpiry();
-      if (visit.employee_sample_eligible && faceDigest) UI.message($('sample-eligibility'), 'Показанное лицо загружено. Выберите сотрудника и подтвердите его вручную.');
       UI.message($('visit-status'), '');
     } catch (error) {
       if (ticket === version) UI.message($('visit-status'), error.status === 404
         ? 'Наблюдение не найдено. Вернитесь к журналу.' : 'Не удалось загрузить наблюдение. ' + error.message + ' Повторите загрузку.', 'error');
-    } finally { if (ticket === version) { loading = false; controls(); } }
-  }
-  async function loadEmployee() {
-    if (pending || busy) return;
-    const ticket = ++employeeVersion;
-    employee = null; completed = false;
-    $('sample-confirm').checked = false;
-    $('sample-reconcile').hidden = true;
-    $('sample-enrollment').href = select.value ? `/employees/${select.value}#photos` : '/employees';
-    if (!select.value) { UI.message($('sample-employee-status'), ''); controls(); return; }
-    employeeLoading = true; controls();
-    UI.message($('sample-employee-status'), 'Загружаем текущую версию сотрудника…');
-    try {
-      const result = await UI.api(`/api/employees/${select.value}`, { cache: 'no-store' });
-      if (ticket !== employeeVersion) return;
-      employee = result;
-      UI.message($('sample-employee-status'), `${employee.name}. Сохранено образцов: ${employee.faces_count}/15. Версия: ${employee.revision}.` + (employee.faces_count >= 15 ? ' Набор заполнен — откройте карточку сотрудника.' : ''));
-    } catch (error) {
-      if (ticket !== employeeVersion) return;
-      UI.message($('sample-employee-status'), 'Версия сотрудника не загружена. ' + error.message, 'error');
-      $('sample-reconcile').hidden = false;
-    } finally { if (ticket === employeeVersion) { employeeLoading = false; controls(); } }
-  }
-  async function loadEmployees() {
-    if (pending || busy) return;
-    $('sample-retry-employees').hidden = true;
-    try {
-      const rows = await UI.api('/api/employees');
-      const chosen = select.value;
-      select.replaceChildren(new Option('Выберите сотрудника вручную', ''));
-      for (const row of rows) select.append(new Option(row.name + (row.active ? '' : ' (неактивен)'), String(row.id)));
-      select.value = chosen; employeesReady = true;
-    } catch (error) {
-      UI.message($('sample-status'), 'Список сотрудников не загружен. ' + error.message, 'error');
-      $('sample-retry-employees').hidden = false;
-    } finally { controls(); }
-  }
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    if (busy || loading || employeeLoading || completed) return;
-    if (!pending) {
-      if (!visit?.employee_sample_eligible || needsReview || !employee || !faceDigest || faceDigest !== visit.face_sha256 || !$('sample-confirm').checked || employee.faces_count >= 15) return;
-      pending = Object.freeze({ employee_id: employee.id, expected_revision: employee.revision,
-        request_id: UI.newRequestId(), face_sha256: faceDigest });
-    }
-    busy = true; controls();
-    UI.message($('sample-status'), 'Проверяем и добавляем образец… Не закрывайте страницу до подтверждения.');
-    try {
-      employee = await UI.api(`${endpoint}/employee-sample`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending) });
-      UI.message($('sample-employee-status'), `Результат операции: сохранено образцов ${employee.faces_count}/15. Версия: ${employee.revision}.`);
-      pending = null; completed = true; $('sample-confirm').checked = false;
-      UI.message($('sample-status'), 'Проверенный образец добавлен. Все прежние образцы сохранены. Откройте карточку сотрудника для просмотра набора.');
-    } catch (error) {
-      const code = error.detail?.code;
-      if (!error.status || error.status < 400 || error.status === 408 || error.status >= 500) {
-        UI.message($('sample-status'), (reasons[code] || error.message) + ' Результат не подтверждён. Выбор, снимок и номер запроса сохранены в этой странице. Повторите тот же запрос, не меняя сотрудника и не обновляя страницу.', 'error');
-      } else {
-        pending = null; $('sample-confirm').checked = false;
-        if (code === 'VISIT_FACE_CHANGED' || error.status === 410) {
-          needsReview = true;
-          UI.message($('sample-status'), code === 'VISIT_FACE_CHANGED'
-            ? 'Сохранённое лицо изменилось. Обновите наблюдение и вручную проверьте новый образец. Ничего не добавлено.'
-            : 'Срок хранения лица истёк. Ничего не добавлено. Используйте обычную загрузку фотографии.', 'error');
-        } else {
-          if (error.status === 409) {
-            employee = null;
-            $('sample-reconcile').hidden = false;
-          }
-          UI.message($('sample-status'), (reasons[code] || error.message) + ' Ничего не добавлено. Выбранный сотрудник сохранён; проверьте текущую версию перед новой попыткой.', 'error');
-        }
+    } finally {
+      if (ticket === version) {
+        loading = false; corrections.setLoading(false);
+        if (visit) corrections.update(visit, digests);
+        controls();
       }
-    } finally { busy = false; controls(); }
+    }
+  }
+  root.addEventListener('journal-identity', (event) => {
+    Object.assign(visit, event.detail); renderVisit();
   });
-  select.addEventListener('change', loadEmployee);
-  $('sample-confirm').addEventListener('change', controls);
-  $('sample-reconcile').addEventListener('click', loadEmployee);
-  $('sample-retry-employees').addEventListener('click', loadEmployees);
+  root.addEventListener('journal-lock', controls);
   $('visit-refresh').addEventListener('click', loadVisit);
-  window.addEventListener('beforeunload', (event) => {
-    if (pending || busy) { event.preventDefault(); event.returnValue = ''; }
-  });
   window.addEventListener('pagehide', (event) => {
     if (!event.persisted) {
       clearTimeout(expiryTimer);
       for (const url of urls.values()) URL.revokeObjectURL(url);
     }
   });
-  loadVisit(); loadEmployees();
+  loadVisit();
 })();

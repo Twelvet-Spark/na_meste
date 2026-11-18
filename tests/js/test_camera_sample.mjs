@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 const context = { window: {}, document: { getElementById: () => null }, console };
-vm.runInNewContext(fs.readFileSync(new URL('../../static/js/camera_sample.js', import.meta.url), 'utf8'), context);
+vm.runInNewContext(fs.readFileSync(new URL('../../static/js/image_crop.js', import.meta.url), 'utf8'), context);
 const crop = context.window.CameraCrop;
 const plain = (value) => value == null ? value : JSON.parse(JSON.stringify(value));
 assert.deepEqual(plain(crop.normalizeRect(.8, .9, .2, .1)), [.2, .1, .8, .9]);

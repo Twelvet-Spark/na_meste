@@ -2,7 +2,7 @@
 {% set active_page = 'global' %}
 
 {% block title %}Наблюдение человека{% endblock %}
-{% block topbar_right %}<span class="muted">Журнал людей · не рабочие часы</span>{% endblock %}
+{% block topbar_right %}<span class="muted">Журнал людей · проверка оператором</span>{% endblock %}
 
 {% block content %}
   <main class="container wide global-archive attendance-workspace employee-workspace" id="visit-detail" data-visit-id="{{ visit_id }}">
@@ -33,25 +33,97 @@
       </div>
       <dl class="attendance-facts" id="visit-image-facts"></dl>
     </section>
-    <section class="panel" aria-labelledby="sample-title" id="sample-panel">
-      <div class="panel-head"><h2 id="sample-title">Добавить проверенный образец сотрудника</h2></div>
-      <p class="archive-notice">Выберите сотрудника только после личной проверки лица на изображении. Образец будет добавлен к существующим фотографиям, а не заменит их. Модель не выбирает сотрудника за вас. Изменение галереи отменяет допуски камер к учёту рабочего времени до повторной проверки.</p>
-      <p id="sample-eligibility" class="form-status" role="status"></p>
-      <p><a id="sample-enrollment" href="/employees">Открыть обычное добавление фотографий сотрудника</a></p>
-      <form id="sample-form" autocomplete="off">
-        <fieldset id="sample-fields" class="plain-fieldset" disabled>
-          <legend class="sr-only">Проверенный образец сотрудника</legend>
-          <label class="field">Сотрудник<select id="sample-employee" required><option value="">Выберите сотрудника вручную</option></select></label>
-          <p id="sample-employee-status" class="field-help muted"></p>
-          <label class="setup-check"><input type="checkbox" id="sample-confirm" required> Я проверил(а), что на показанном образце именно выбранный сотрудник, и разрешаю добавить этот образец.</label>
-          <div class="form-actions">
-            <button class="btn primary" type="submit" id="sample-submit" disabled>Добавить проверенный образец</button>
-            <button class="btn" type="button" id="sample-reconcile" hidden>Загрузить текущую версию сотрудника</button>
-          </div>
+    <section class="panel" aria-labelledby="identity-title">
+      <div class="panel-head"><h2 id="identity-title">Кто на изображении</h2></div>
+      <p>Исправление относится только к этому наблюдению. Оно не обучает модель и не меняет часы. Можно исправлять даже без сохранённого лица.</p>
+      <form id="identity-form" autocomplete="off">
+        <fieldset id="identity-fields" class="plain-fieldset">
+          <legend class="sr-only">Решение оператора</legend>
+          <label class="field">Решение<select id="identity-mode"><option value="EMPLOYEE">Указать сотрудника</option><option value="UNKNOWN">Неизвестный человек</option><option value="AI">Использовать результат AI</option></select></label>
+          <label class="field">Поиск сотрудника<input type="search" id="identity-search" placeholder="Имя или фамилия"></label>
+          <label class="field">Сотрудник<select id="identity-employee"><option value="">Выберите сотрудника</option></select></label>
+          <p id="identity-employee-status" class="field-help"></p>
+          <label class="field">Оператор<input id="identity-actor" required maxlength="100" autocomplete="name"></label>
+          <label class="field">Причина исправления<textarea id="identity-reason" required maxlength="1000" rows="2"></textarea></label>
         </fieldset>
+        <button class="btn primary" id="identity-submit" type="submit">Сохранить личность</button>
+      </form>
+      <p id="identity-status" class="form-status" role="status" aria-live="polite"></p>
+      <button class="btn" id="employees-retry" type="button" hidden>Повторить загрузку сотрудников</button>
+      <details><summary>История личности и восстановление</summary><ol id="identity-history" class="attendance-audit"></ol></details>
+    </section>
+    <section class="panel camera-sample" aria-labelledby="sample-title" id="sample-panel">
+      <div class="panel-head"><h2 id="sample-title">Фото для следующих узнаваний</h2></div>
+      <p>Добавьте один проверенный образец, не заменяя прежние. Нужны одно чёткое лицо от 80 исходных пикселей и доступная модель. Подпись в журнале и прошлые часы не изменятся.</p>
+      <p id="sample-eligibility" class="form-status" role="status"></p>
+      <form id="sample-form" autocomplete="off">
+        <fieldset id="sample-fields" class="plain-fieldset">
+          <legend class="sr-only">Новый образец лица</legend>
+          <label class="field">Источник<select id="sample-source"><option value="ALIGNED_FACE">Сохранённое лицо</option><option value="PHOTO_CROP">Фрагмент снимка человека</option><option value="UPLOAD">Загрузить фотографию</option></select></label>
+          <div id="sample-crop" hidden>
+            <p>Выделите лицо мышью или задайте границы от 0 до 1. Система проверит исходные пиксели, без увеличения.</p>
+            <div class="sample-stage" id="sample-stage">
+              <img id="sample-image" alt="Исходный снимок для выделения лица" draggable="false">
+              <svg viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true"><rect id="sample-selection" hidden></rect></svg>
+            </div>
+            <div class="sample-bounds">
+              <label class="field">Слева<input id="sample-x1" type="number" min="0" max="1" step="any" value="0"></label>
+              <label class="field">Сверху<input id="sample-y1" type="number" min="0" max="1" step="any" value="0"></label>
+              <label class="field">Справа<input id="sample-x2" type="number" min="0" max="1" step="any" value="1"></label>
+              <label class="field">Снизу<input id="sample-y2" type="number" min="0" max="1" step="any" value="1"></label>
+            </div>
+            <div class="sample-result"><canvas id="sample-preview" hidden></canvas><p id="sample-crop-info"></p></div>
+          </div>
+          <div id="sample-upload" hidden>
+            <label class="field">JPEG или PNG, до 15 МиБ<input id="sample-file" type="file" accept="image/jpeg,image/png"></label>
+            <img id="sample-upload-preview" class="journal-upload-preview" alt="Выбранная фотография для проверки" hidden>
+          </div>
+          <label class="field">Поиск сотрудника<input type="search" id="sample-search" placeholder="Имя или фамилия"></label>
+          <label class="field">Сотрудник<select id="sample-employee"><option value="">Выберите сотрудника вручную</option></select></label>
+          <p id="sample-employee-status" class="field-help muted"></p>
+          <label class="field">Оператор<input id="sample-actor" required maxlength="100"></label>
+          <label class="field">Причина добавления или удаления<textarea id="sample-reason" required maxlength="1000" rows="2"></textarea></label>
+          <label class="setup-check"><input type="checkbox" id="sample-confirm"> Я проверил(а) лицо на выбранном образце: это именно выбранный сотрудник.</label>
+        </fieldset>
+        <div class="form-actions">
+          <button class="btn primary" type="submit" id="sample-submit" disabled>Добавить образец</button>
+          <button class="btn" type="button" id="sample-reconcile">Обновить версию сотрудника</button>
+        </div>
       </form>
       <p id="sample-status" class="form-status" role="status" aria-live="polite"></p>
-      <button class="btn" type="button" id="sample-retry-employees" hidden>Загрузить список сотрудников</button>
+      <p><a id="sample-enrollment" href="/employees">Управлять всеми фотографиями сотрудника</a></p>
+      <details><summary>Добавленные здесь образцы и удаление</summary><ol id="sample-history" class="attendance-audit"></ol></details>
+    </section>
+    <section class="panel" aria-labelledby="time-title">
+      <div class="panel-head"><h2 id="time-title">Исправить рабочее время отдельно</h2></div>
+      <p>По умолчанию часы не меняются. Ручной интервал засчитывает всё выбранное время, включая пропуски наблюдений.</p>
+      <label class="setup-check"><input id="time-enabled" type="checkbox"> Подготовить исправление часов для указанного в журнале сотрудника</label>
+      <form id="time-form" autocomplete="off" hidden>
+        <fieldset id="time-fields" class="plain-fieldset">
+          <legend class="sr-only">Интервал рабочего времени</legend>
+          <p id="time-owner"></p>
+          <div class="journal-time-bounds">
+            <label class="field">Начало<input id="time-start" type="datetime-local" step="0.001" required></label>
+            <label class="field">Конец<input id="time-end" type="datetime-local" step="0.001" required></label>
+          </div>
+          <p id="time-zone" class="field-help"></p>
+          <label class="field">Исключить ошибочное автоматическое время другого сотрудника<select id="time-exclude"><option value="">Не исключать</option></select></label>
+          <p class="field-help">Исключение действует на все камеры. Ручные интервалы другого сотрудника останутся.</p>
+          <label class="field">Оператор<input id="time-actor" required maxlength="100"></label>
+          <label class="field">Причина исправления или отмены<textarea id="time-reason" required maxlength="1000" rows="2"></textarea></label>
+        </fieldset>
+        <button class="btn" id="time-preview" type="submit">Рассчитать изменение</button>
+        <div id="time-result" hidden>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="Дневные итоги, таблицу можно прокручивать"><table class="table"><caption>Изменение дневных итогов</caption><thead><tr><th>Сотрудник / дата</th><th>Метод</th><th>До</th><th>После</th><th>Разница</th></tr></thead><tbody id="time-rows"></tbody></table></div>
+          <p>Итоги включают объединение близких интервалов: изменение может быть больше выбранной длительности. При изменении исходных данных потребуется новый расчёт.</p>
+          <label class="setup-check"><input id="time-confirm" type="checkbox"> Подтверждаю показанное изменение часов</label>
+          <button class="btn primary" id="time-apply" type="button" disabled>Применить изменение часов</button>
+        </div>
+      </form>
+      <p id="time-status" class="form-status" role="status" aria-live="polite"></p>
+      <button class="btn" id="time-retry" type="button" hidden>Повторить тот же запрос часов</button>
+      <details><summary>История исправлений часов и отмена</summary><ol id="time-history" class="attendance-audit"></ol></details>
+      <p><a href="/presence">Проверить итоговый отчёт рабочего времени</a></p>
     </section>
     <section class="panel" aria-labelledby="visit-events-title">
       <div class="panel-head"><h2 id="visit-events-title">События наблюдения</h2><span class="muted">Время в UTC</span></div>
@@ -61,4 +133,8 @@
   </main>
 {% endblock %}
 
-{% block scripts %}<script src="/static/js/human_visit_detail.js"></script>{% endblock %}
+{% block scripts %}
+<script src="/static/js/image_crop.js"></script>
+<script src="/static/js/journal_corrections.js"></script>
+<script src="/static/js/human_visit_detail.js"></script>
+{% endblock %}

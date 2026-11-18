@@ -47,7 +47,7 @@ class SampleBoundary:
     def eligibility(self, visit):
         return bool(visit.face_thumbnail), None if visit.face_thumbnail else "VISIT_FACE_MISSING"
 
-    def append(self, visit_id, *, employee_id, expected_revision, request_id, face_sha256):
+    def append(self, visit_id, *, employee_id, expected_revision, request_id, face_sha256, actor, reason):
         # Native preparation must never block FastAPI's event loop.
         try:
             asyncio.get_running_loop()
@@ -59,7 +59,7 @@ class SampleBoundary:
         if self.error:
             raise HTTPException(*self.error)
         return dict(visit_id=visit_id, employee_id=employee_id, expected_revision=expected_revision,
-                    request_id=str(request_id), face_sha256=face_sha256)
+                    request_id=str(request_id), face_sha256=face_sha256, actor=actor, reason=reason)
 
 
 @contextmanager
@@ -106,7 +106,7 @@ def visit(engine, number=1, **changes):
 
 def payload(**changes):
     values = dict(employee_id=7, expected_revision=4, request_id=str(uuid4()),
-                  face_sha256=hashlib.sha256(FACE).hexdigest())
+                  face_sha256=hashlib.sha256(FACE).hexdigest(), actor="Проверяющий", reason="Лицо проверено")
     values.update(changes)
     return values
 
