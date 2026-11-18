@@ -144,7 +144,7 @@ class VisitTimeTests(unittest.TestCase):
         for mutation in ('presence', 'settings', 'identity', 'boundary', 'midnight'):
             with self.subTest(mutation=mutation), fixture(now=local(23)) as (client, engine, identifier, clock, _):
                 _, payload = prepared(client, identifier, selection())
-                if mutation == 'presence': seed(engine, 1, local(10), local(11))
+                if mutation == 'presence': seed(engine, 1, local(9,15), local(9,45))
                 if mutation == 'settings': settings.attendance_day_gap_minutes = 130
                 if mutation == 'identity':
                     client.json('POST', f'/api/global-persons/visits/{identifier}/identity',
@@ -212,6 +212,41 @@ class VisitTimeTests(unittest.TestCase):
             with Session(engine) as db:
                 row = db.query(ManualPresenceInterval).one()
                 self.assertEqual((row.started_at, row.ended_at), (local(9), local(10)))
+
+    def test_live_presence_growth_keeps_the_confirmed_delta_applicable(self):
+        for now, first, last, extended, growth in (
+            (local(20), local(12), local(13), local(14), 3600000),
+            (local(36), local(23), local(25), local(26), 0),
+        ):
+            with self.subTest(now=now), fixture(now=now) as (client, engine, identifier, _, _):
+                seed(engine, 1, first, last)
+                seed(engine, 2, local(8), last)
+                preview, payload = prepared(client, identifier, selection(exclude_employee_id=2))
+                with immediate_session(engine) as db:
+                    for segment in db.query(PresenceSegment):
+                        segment.last_seen_at = extended
+                applied = client.json('POST', url(identifier, 'apply'), payload)
+                self.assertEqual([row['delta_ms'] for row in applied['rows']],
+                                 [row['delta_ms'] for row in preview['rows']])
+                report = client.json('GET', '/api/attendance/report?from_date=2026-03-10&to_date=2026-03-10')
+                totals = {row['employee_id']: row['worked_ms'] for row in report['totals']}
+                for row in preview['rows']:
+                    self.assertEqual(totals[row['employee_id']], row['after_ms'] + growth)
+                self.assertEqual(counts(engine), (1, 1, 2))
+
+    def test_changed_manual_or_exclusion_requires_new_preview_even_with_same_delta(self):
+        for kind in ('manual', 'exclusion'):
+            with self.subTest(kind=kind), fixture(now=local(20)) as (client, engine, identifier, _, _):
+                seed(engine, 1, local(12), local(13))
+                preview, payload = prepared(client, identifier, selection())
+                data = dict(request_id=str(uuid4()), actor='Other', reason='Independent correction',
+                            employee_id=1, started_at=iso(local(12,10)), ended_at=iso(local(12,20)))
+                client.json('POST', f'/api/attendance/corrections/{kind}', data)
+                updated, _ = prepared(client, identifier, selection())
+                self.assertEqual(updated['rows'][0]['delta_ms'], preview['rows'][0]['delta_ms'])
+                before = counts(engine)
+                client.json('POST', url(identifier, 'apply'), payload, status=409)
+                self.assertEqual(counts(engine), before)
 
 if __name__ == '__main__':
     unittest.main()

@@ -135,12 +135,18 @@ class VisitTimeService:
                 rows.append(dict(employee_id=employee_id, employee_name=names[employee_id], date=day.isoformat(),
                                  method=before.method, before_ms=before_ms, after_ms=after_ms,
                                  delta_ms=after_ms-before_ms))
-        evidence = {str(employee_id): {kind: sorted(values, key=_json) for kind, values in asdict(data).items()}
-                    for employee_id, data in inputs.items()}
-        # Extending a live visit beyond the frozen selection does not change that
-        # selection. Shrinking its containing bounds was rejected above.
+        evidence = {
+            str(employee_id): {
+                kind: sorted((asdict(value) for value in getattr(data, kind)), key=_json)
+                for kind in ("manual", "exclusions", "crossings")
+            }
+            for employee_id, data in inputs.items()
+        }
+        # Live totals may grow while the operator reads. Confirm the correction's
+        # effect, not raw segment ends; changed deltas or explicit evidence conflict.
         fingerprint = dict(visit_id=visit_id, selection=_selection(payload), inputs=evidence,
-                           methods=[(row["date"], row["method"]) for row in rows],
+                           effects=[(row["employee_id"], row["date"], row["method"], row["delta_ms"])
+                                    for row in rows],
                            live_gap_minutes=settings.attendance_live_gap_minutes,
                            day_gap_minutes=settings.attendance_day_gap_minutes,
                            utc_offset_minutes=settings.attendance_utc_offset_minutes)
@@ -190,7 +196,7 @@ class VisitTimeService:
                         row["correction_request_id"] = str(correction.request_id)
                         created.append(row)
                 result = dict(operation_id=str(payload.request_id), visit_id=visit_id,
-                              selection=preview["selection"], created=created, actor=payload.actor,
+                              selection=preview["selection"], rows=preview["rows"], created=created, actor=payload.actor,
                               reason=payload.reason, created_at=attendance_iso(now))
                 db.add(OperatorRequest(id=str(payload.request_id), operation=APPLY, payload_sha256=digest,
                                        created_at=now, result=result))
