@@ -4,67 +4,20 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
-from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.formparsers import MultiPartException
 
 from app.api.operator_security import require_operator_request
+from app.api.photo_upload import MAX_PHOTO_BYTES, PhotoUploadRoute
 from app.database.database import get_db
 from app.database.models import AttendanceRuntime
 from app.services import employee_service as service
 
-MAX_PHOTO_BYTES = 15 * 1024 * 1024
-MAX_BODY_BYTES = 226 * 1024 * 1024
 
 
-class EmployeeRoute(APIRoute):
-    """Bound receive before multipart spooling; parser owns upload cleanup."""
-    def get_route_handler(self):
-        handler = super().get_route_handler()
-
-        async def bounded(request):
-            upload = ((request.method == "POST" and self.path == "/api/employees")
-                      or (request.method == "PUT" and self.path.endswith("/faces")))
-            if not upload:
-                return await handler(request)
-            require_operator_request(request)
-            length = request.headers.get("content-length")
-            if length is not None:
-                try:
-                    declared = int(length)
-                    if declared < 0:
-                        raise ValueError
-                except ValueError as exc:
-                    raise HTTPException(400, "Некорректный размер запроса") from exc
-                if declared > MAX_BODY_BYTES:
-                    raise HTTPException(413, "Запрос превышает 226 МиБ")
-            received, exceeded = 0, False
-
-            async def receive():
-                nonlocal received, exceeded
-                message = await request.receive()
-                received += len(message.get("body", b""))
-                if received > MAX_BODY_BYTES:
-                    exceeded = True
-                    # Starlette closes all spooled uploads on MultiPartException.
-                    raise MultiPartException("Request exceeds 226 MiB")
-                return message
-
-            limited = Request(request.scope, receive=receive)
-            try:
-                return await handler(limited)
-            except StarletteHTTPException as exc:
-                if exceeded:
-                    raise HTTPException(413, "Запрос превышает 226 МиБ") from exc
-                raise
-        return bounded
-
-
-router = APIRouter(prefix="/api/employees", tags=["employees"], route_class=EmployeeRoute)
+router = APIRouter(prefix="/api/employees", tags=["employees"], route_class=PhotoUploadRoute)
 
 
 def _employee_or_404(db, employee_id):

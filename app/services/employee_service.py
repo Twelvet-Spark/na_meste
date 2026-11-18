@@ -185,7 +185,7 @@ def photo_failure(errors):
     return HTTPException(422, {"code": "PHOTO_VALIDATION_FAILED", "committed": False, "files": errors})
 
 
-def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace | FaceEnrollResult:
+def decode_photo(image_bytes: bytes, filename: str) -> np.ndarray | FaceEnrollResult:
     def failed(message):
         return FaceEnrollResult(filename=filename, success=False, error=message)
 
@@ -209,6 +209,17 @@ def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace
         return failed("Не удалось прочитать изображение")
     if image is None:
         return failed("Не удалось прочитать изображение")
+    return image
+
+
+def prepare_face(image_bytes: bytes, face_engine, filename: str) -> PreparedFace | FaceEnrollResult:
+    image = decode_photo(image_bytes, filename)
+    if isinstance(image, FaceEnrollResult):
+        return image
+
+    def failed(message):
+        return FaceEnrollResult(filename=filename, success=False, error=message)
+
     observations = face_engine.detect(image)
     if len(observations) != 1:
         return failed("На фотографии должно быть ровно одно лицо")

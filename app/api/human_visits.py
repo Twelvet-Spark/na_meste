@@ -9,18 +9,22 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 from sqlalchemy import and_, or_, case, func, select
 from sqlalchemy.orm import Session, aliased
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.operator_security import require_operator_request
+from app.api.photo_upload import MAX_PHOTO_BYTES, PhotoUploadRoute
 from app.database.database import get_db
 from app.database.models import Camera, Employee, HumanVisit, HumanVisitEvent, HumanVisitIdentityRevision
 from app.services.visit_identity_service import IdentityInput, RestoreIdentityInput, VisitIdentityService
+from app.services.visit_sample_service import VisitPhotoInput, RemoveVisitSampleInput
 from app.time_utils import utcnow
 
-router = APIRouter(prefix="/visits", tags=["human-visits"])
+router = APIRouter(prefix="/visits", tags=["human-visits"], route_class=PhotoUploadRoute)
 
 # Explicit projections keep even the largest list independent of image BLOB size.
 _METADATA = (
@@ -212,6 +216,8 @@ def api_get_visit(visit_id: UUID, request: Request, db: Session = Depends(get_db
                                if result["face_status"] == "AVAILABLE" and visit.face_thumbnail else None),
                   face_quality=_public_scalars(visit.face_quality, _FACE_QUALITY),
                   employee_sample_eligible=eligible, employee_sample_reason=reason)
+    result["photo_sha256"] = (hashlib.sha256(visit.snapshot).hexdigest()
+                              if result["photo_status"] == "AVAILABLE" and visit.snapshot else None)
     return result
 
 
@@ -275,3 +281,50 @@ def api_restore_identity(visit_id: UUID, payload: RestoreIdentityInput, db: Sess
 @router.get("/{visit_id}/identity/history")
 def api_identity_history(visit_id: UUID, db: Session = Depends(get_db)):
     return VisitIdentityService(db.get_bind()).history(visit_id)
+
+
+def _sample_service(request):
+    service = getattr(request.app.state, "visit_sample_service", None)
+    if service is None:
+        raise HTTPException(503, {"code": "FACE_MODEL_UNAVAILABLE"})
+    return service
+
+
+@router.post("/{visit_id}/employee-photo", dependencies=[Depends(require_operator_request)])
+async def api_append_visit_photo(visit_id: UUID, request: Request):
+    service = _sample_service(request)
+    if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+        raise HTTPException(415, "Отправьте metadata и фотографию как multipart/form-data")
+    try:
+        async with request.form(max_files=1, max_fields=1, max_part_size=64 * 1024) as form:
+            values = form.getlist("metadata")
+            if (len(values) != 1 or not isinstance(values[0], str)
+                    or len(values[0].encode()) > 64 * 1024 or any(key not in {"metadata", "file"} for key in form)):
+                raise HTTPException(422, "Ожидаются metadata и один file")
+            try:
+                payload = VisitPhotoInput.model_validate_json(values[0])
+            except ValidationError as exc:
+                errors = [{"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]}
+                          for item in exc.errors(include_input=False, include_context=False)]
+                raise HTTPException(422, errors) from exc
+            files = form.getlist("file")
+            if len(files) != (1 if payload.source == "UPLOAD" else 0) or any(
+                    not isinstance(item, UploadFile) for item in files):
+                raise HTTPException(422, "Загрузите ровно один файл или выберите область сохранённого снимка")
+            upload = ((files[0].filename or "photo", await files[0].read(MAX_PHOTO_BYTES + 1))
+                      if files else None)
+    except StarletteHTTPException as exc:
+        if exc.status_code == 400:
+            raise HTTPException(422, "Некорректная форма фотографии") from exc
+        raise
+    return await run_in_threadpool(service.append_photo, str(visit_id), payload, upload)
+
+
+@router.post("/{visit_id}/employee-sample/remove", dependencies=[Depends(require_operator_request)])
+async def api_remove_visit_sample(visit_id: UUID, payload: RemoveVisitSampleInput, request: Request):
+    return await run_in_threadpool(_sample_service(request).remove_sample, str(visit_id), payload)
+
+
+@router.get("/{visit_id}/employee-samples")
+async def api_visit_samples(visit_id: UUID, request: Request):
+    return await run_in_threadpool(_sample_service(request).samples, str(visit_id))
