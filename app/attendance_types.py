@@ -39,6 +39,8 @@ class _Audited(BaseModel):
     def not_blank(cls, value):
         if not value.strip():
             raise ValueError("An operator and reason are required")
+        if "\0" in value:
+            raise ValueError("Audit text must not contain NUL characters")
         return value.strip()
 
 

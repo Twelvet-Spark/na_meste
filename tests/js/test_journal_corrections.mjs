@@ -106,6 +106,7 @@ assert.equal(attempts.length, 2);
 assert.equal(attempts[0], attempts[1], 'Retry must retain the complete original payload and request ID');
 assert.equal(JSON.parse(attempts[1]).mode, 'UNKNOWN');
 assert.match(get('identity-status').textContent, /Связанное обучение отменено/);
+assert.match(get('identity-status').textContent, /Образец лица удалён из галереи/);
 assert.doesNotMatch(get('identity-status').textContent, /Фотографии и часы не изменены/);
 assert.equal(controller.locked(), false);
 console.log('Journal millisecond inputs, refresh ownership, independent expiry, and frozen retry checks passed.');

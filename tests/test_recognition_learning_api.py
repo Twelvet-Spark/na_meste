@@ -125,6 +125,22 @@ def multipart_marker_limits_spool_cleanup_and_read_only_preparation():
 
 
 @test
+def null_in_audit_text_returns_a_definitive_validation_error():
+    with api() as (client, engine, _, body, _):
+        source = saved_photo(engine)
+        scan = post(client, '/analyze', source)
+        payload = dict(source, action='ACCEPT', employee_id=1, person_confirmed=True,
+                       request_id=str(uuid4()), actor='Audit\0operator', reason='Reviewed',
+                       expected_employee_revision=0, expected_identity_revision=scan['identity_revision'],
+                       expected_learning_revision=scan['learning_revision'], expected_gallery_revision=scan['gallery_revision'],
+                       expected_body_model_id=scan['body_model_id'], expected_face_model_id=scan['face_model_id'],
+                       expected_image_sha256=scan['evidence']['image_sha256'])
+        error = post(client, '/feedback', payload, status=422)
+        assert error['detail'][0]['loc'] == ['actor']
+        assert len(body.images) == 1 and feedback_counts(engine) == (0, 0, 0, 0, 0, 0)
+
+
+@test
 def saved_photo_relabels_with_exact_history_media_and_undo():
     with api() as (client, engine, service, _, clock):
         source = saved_photo(engine)

@@ -140,8 +140,11 @@
       Object.assign(visit, result); root.dispatchEvent(new CustomEvent('journal-identity', { detail: result }));
       invalidatePreview();
       window.JournalLearning?.invalidate();
+      const removedFaces = result.removed_face_ids?.length || 0;
+      const faceNotice = removedFaces === 1 ? ' Образец лица удалён из галереи.'
+        : removedFaces > 1 ? ` Из галереи удалены образцы лица: ${removedFaces}.` : '';
       message(name, result.revoked_feedback_ids?.length
-        ? 'Личность в журнале сохранена. Связанное обучение отменено. Прошлые часы не изменены.'
+        ? 'Личность в журнале сохранена. Связанное обучение отменено.' + faceNotice + ' Прошлые часы не изменены.'
         : 'Личность в журнале сохранена. Фотографии и часы не изменены.');
     } else if (name === 'sample') {
       $('sample-confirm').checked = false;
