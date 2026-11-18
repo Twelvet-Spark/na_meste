@@ -61,12 +61,13 @@ def inside(point, box):
 
 
 @test
-def floor_prompts_avoid_every_detection_and_negatives_are_the_best_objects():
+def floor_prompts_avoid_things_standing_on_the_floor_but_not_corridors():
     desk = det("OBJECT", [.1, .7, .45, .98], .8)
     person = det("PERSON", [.55, .6, .75, 1.], .95)
     door = det("DOOR", [.45, .1, .55, .75], .7)
+    corridor = det("PASSAGE", [0., .5, 1., 1.], .6, "Коридор")
     segmenter = FakeSegmenter(floor=FLOOR)
-    draft = analyze(SNAPSHOT, FakeDetector([person, desk, door]), segmenter)
+    draft = analyze(SNAPSHOT, FakeDetector([person, desk, door, corridor]), segmenter)
     (positive, negative), = segmenter.floor_calls
     assert positive and not any(inside(p, box.box) for p in positive for box in (desk, person, door))
     assert all(0 <= x <= 1 and 0 <= y <= 1 for x, y in positive)

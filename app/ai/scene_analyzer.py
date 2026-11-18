@@ -37,7 +37,9 @@ def _inside(point, box):
 
 
 def _floor(snapshot, segmenter, detections):
-    positive = [point for point in FLOOR_CANDIDATES if not any(_inside(point, item.box) for item in detections)]
+    # A corridor box is mostly floor, so only things standing on it (or in its wall) rule a point out.
+    blocking = [item for item in detections if item.kind != 'PASSAGE']
+    positive = [point for point in FLOOR_CANDIDATES if not any(_inside(point, item.box) for item in blocking)]
     if not positive:
         return None
     negative = [[(item.box[0] + item.box[2]) / 2, (item.box[1] + item.box[3]) / 2]
