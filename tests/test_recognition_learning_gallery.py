@@ -9,6 +9,7 @@ import numpy as np
 
 from test_attendance_recognition import ALIGNMENT_ID, MODEL_ID, STAMP, database, detection, load_store, recognition
 from sqlalchemy.orm import Session
+from fastapi import HTTPException
 from app.ai.employee_appearance import EmployeeAppearanceGallery
 from app.database.database import immediate_session
 from app.database.models import (
@@ -184,6 +185,19 @@ def face_feedback_veto_never_promotes_runner_or_weakens_enrollment_overlap_check
         assert [(r.employee_id, r.rejected) for r in ranked] == [(1, True), (2, False)]
         assert store.match(direction()).employee_id is None
         assert store.match(direction(), use_feedback=False).employee_id == 1
+    from app.services.employee_service import PreparedFace, check_prepared_faces
+    with examples_db([(1, direction()), (2, direction(.80, 2))]) as engine:
+        with immediate_session(engine) as db:
+            add_example(db, 1, direction(), model=MODEL_ID, modality='FACE',
+                        alignment=ALIGNMENT_ID, negative=True)
+        with Session(engine) as db:
+            sample = PreparedFace('candidate.jpg', direction().tobytes(), b'', MODEL_ID, ALIGNMENT_ID)
+            try:
+                check_prepared_faces(db, 3, [sample], MODEL_ID)
+            except HTTPException as error:
+                assert error.status_code == 422 and error.detail['code'] == 'PHOTO_VALIDATION_FAILED'
+            else:
+                raise AssertionError('operator rejection hid a cross-owner enrollment conflict')
 
 
 @test
