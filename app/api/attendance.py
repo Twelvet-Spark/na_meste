@@ -232,20 +232,38 @@ def attendance_active(request: Request):
 
 @router.get("/report")
 def attendance_report(request: Request, from_date: AttendanceDate, to_date: AttendanceDate,
-                      employee_id: int | None = None):
+                      employee_id: int | None = None, workplace_id: int | None = None,
+                      employee_status: Literal["ALL", "ACTIVE", "INACTIVE"] = "ALL"):
     as_of = _now()
-    return _read(request, lambda db: reports.build_report(db, from_date, to_date, employee_id, as_of))
+    return _read(request, lambda db: reports.build_report(
+        db, from_date, to_date, employee_id, as_of, workplace_id=workplace_id, employee_status=employee_status))
 
 
 @router.get("/report.csv")
 def attendance_report_csv(request: Request, from_date: AttendanceDate, to_date: AttendanceDate,
-                          employee_id: int | None = None):
+                          employee_id: int | None = None, workplace_id: int | None = None,
+                          employee_status: Literal["ALL", "ACTIVE", "INACTIVE"] = "ALL"):
     as_of = _now()
-    report = _read(request, lambda db: reports.build_report(db, from_date, to_date, employee_id, as_of))
+    report = _read(request, lambda db: reports.build_report(
+        db, from_date, to_date, employee_id, as_of, workplace_id=workplace_id, employee_status=employee_status))
     return Response(reports.report_csv(report), media_type="text/csv; charset=utf-8", headers={
         "Content-Disposition": f'attachment; filename="work-time-{from_date}-{to_date}.csv"',
         "Cache-Control": "no-store",
     })
+
+
+@router.get("/report.xlsx")
+def attendance_report_xlsx(request: Request, from_date: AttendanceDate, to_date: AttendanceDate,
+                           employee_id: int | None = None, workplace_id: int | None = None,
+                           employee_status: Literal["ALL", "ACTIVE", "INACTIVE"] = "ALL"):
+    as_of = _now()
+    report = _read(request, lambda db: reports.build_report(
+        db, from_date, to_date, employee_id, as_of, workplace_id=workplace_id, employee_status=employee_status))
+    return Response(reports.report_xlsx(report),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={
+                        "Content-Disposition": f'attachment; filename="work-time-{from_date}-{to_date}.xlsx"',
+                        "Cache-Control": "no-store",
+                    })
 
 
 @router.get("/timeline")

@@ -30,9 +30,13 @@
       <label class="field">С даты<input type="date" name="from_date" required></label>
       <label class="field">По дату включительно<input type="date" name="to_date" required></label>
       <label class="field">Сотрудник<select name="employee_id"></select></label>
+      <label class="field">Рабочее место<select name="workplace_id"><option value="">Все</option></select></label>
+      <label class="field">Статус сотрудников<select name="employee_status"><option value="ALL">Все</option><option value="ACTIVE">Активные</option><option value="INACTIVE">Отключённые</option></select></label>
       <button class="btn primary" type="submit">Сформировать</button>
+      <a id="report-xlsx" class="btn" hidden>Скачать Excel</a>
       <a id="report-csv" class="btn" hidden>Скачать CSV</a>
     </form>
+    <p class="muted small">Рабочее место отбирает сотрудников; в отчёт входят все их посчитанные часы. Excel: сотрудник в строке, даты в столбцах и итог. Текущий день — предварительный.</p>
     <div id="report-error" class="test-result err" role="alert" hidden></div>
     <p id="report-summary" class="muted" role="status">Выберите период — до 366 дней.</p>
     <div id="report-results"></div>

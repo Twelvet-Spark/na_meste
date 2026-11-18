@@ -10,13 +10,19 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from fastapi import HTTPException
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from sqlalchemy.orm import Session
 
 from app.attendance_types import CorrectionInput, RevokeInput, milliseconds
 from app.config import settings
 from app.database.database import immediate_session
 from app.database.models import (
-    Camera, DoorCrossing, Employee, ManualPresenceInterval, PresenceExclusion, PresenceSegment,
+    Camera, DoorCrossing, Employee, EmployeeWorkplace, ManualPresenceInterval, PresenceExclusion,
+    PresenceSegment, Workplace,
 )
 from app.services.work_time import Crossing, DayResult, Mark, Span, compute_day, subtract
 from app.time_utils import attendance_iso, day_bounds, local_date
@@ -35,11 +41,14 @@ class EmployeeInputs:
     exclusions: list[Span] = field(default_factory=list)
 
 
-def _inputs(db: Session, lower: datetime, upper: datetime, employee_id: int | None = None) -> dict[int, EmployeeInputs]:
+def _inputs(db: Session, lower: datetime, upper: datetime, employee_id: int | None = None, *,
+            employee_ids: list[int] | None = None) -> dict[int, EmployeeInputs]:
     """Everything overlapping [lower, upper), grouped by employee; revoked corrections are ignored."""
     result: dict[int, EmployeeInputs] = defaultdict(EmployeeInputs)
 
     def scoped(query, model):
+        if employee_ids is not None:
+            return query.filter(model.employee_id.in_(employee_ids))
         return query.filter(model.employee_id == employee_id) if employee_id is not None else query
 
     for row in scoped(db.query(PresenceSegment), PresenceSegment).filter(
@@ -104,15 +113,40 @@ def active_view(db: Session, as_of: datetime) -> dict:
     return {"as_of": attendance_iso(as_of), "items": items}
 
 
-def build_report(db: Session, from_date: date, to_date: date, employee_id: int | None, as_of: datetime) -> dict:
+def build_report(db: Session, from_date: date, to_date: date, employee_id: int | None, as_of: datetime, *,
+                 workplace_id: int | None = None, employee_status: str = "ALL") -> dict:
     days = (to_date - from_date).days + 1
     if not 1 <= days <= MAX_REPORT_DAYS:
         raise HTTPException(422, _RANGE_ERROR)
     if employee_id is not None and db.get(Employee, employee_id) is None:
         raise HTTPException(404, "Сотрудник не найден")
+    if employee_status not in ("ALL", "ACTIVE", "INACTIVE"):
+        raise HTTPException(422, "Недопустимый статус сотрудников")
+    workplace = db.get(Workplace, workplace_id) if workplace_id is not None else None
+    if workplace_id is not None and workplace is None:
+        raise HTTPException(404, "Рабочее место не найдено")
+    selected = db.query(Employee)
+    if employee_id is not None:
+        selected = selected.filter(Employee.id == employee_id)
+    if employee_status != "ALL":
+        selected = selected.filter(Employee.active.is_(employee_status == "ACTIVE"))
+    if workplace_id is not None:
+        selected = selected.filter(Employee.id.in_(db.query(EmployeeWorkplace.employee_id).filter(
+            EmployeeWorkplace.workplace_id == workplace_id)))
+    selected = selected.order_by(Employee.last_name, Employee.first_name, Employee.name, Employee.id).all()
+    ids = [employee.id for employee in selected]
+    places = defaultdict(list)
+    if ids:
+        for owner, place_id, name in db.query(EmployeeWorkplace.employee_id, Workplace.id, Workplace.name).join(
+                Workplace, Workplace.id == EmployeeWorkplace.workplace_id).filter(
+                    EmployeeWorkplace.employee_id.in_(ids)).order_by(Workplace.name, Workplace.id):
+            places[owner].append({"id": place_id, "name": name})
+    employees = [{"id": employee.id, "name": employee.name, "first_name": employee.first_name,
+                  "last_name": employee.last_name, "active": employee.active,
+                  "workplaces": places[employee.id]} for employee in selected]
     lower, upper = day_bounds(from_date)[0], day_bounds(to_date)[1]
-    inputs = _inputs(db, lower, upper, employee_id)
-    names = _names(db, inputs)
+    inputs = _inputs(db, lower, upper, employee_ids=ids) if ids else {}
+    names = {employee.id: employee.name for employee in selected}
     rows, totals = [], {}
     for offset in range(days):
         day = from_date + timedelta(days=offset)
@@ -144,6 +178,10 @@ def build_report(db: Session, from_date: date, to_date: date, employee_id: int |
             "utc_offset_minutes": settings.attendance_utc_offset_minutes, "as_of": attendance_iso(as_of),
             "live_gap_minutes": settings.attendance_live_gap_minutes,
             "day_gap_minutes": settings.attendance_day_gap_minutes,
+            "employees": employees,
+            "filters": {"employee_id": employee_id, "workplace_id": workplace_id,
+                        "workplace_name": workplace.name if workplace is not None else None,
+                        "employee_status": employee_status},
             "rows": rows, "totals": sorted(totals.values(), key=lambda t: (t["employee_name"], t["employee_id"]))}
 
 
@@ -174,6 +212,72 @@ def report_csv(report: dict) -> bytes:
                          row["first_seen_at"][11:16], row["last_seen_at"][11:16], row["sessions"],
                          "Итог дня" if row["method"] == "FINAL" else "День идёт", ", ".join(notes)))
     return output.getvalue().encode("utf-8-sig")
+
+
+def report_xlsx(report: dict) -> bytes:
+    """A streamed employee × local-day matrix from the same counted report, never new accounting."""
+    book = Workbook(write_only=True)
+    sheet = book.create_sheet("Рабочее время")
+    lower, upper = date.fromisoformat(report["from_date"]), date.fromisoformat(report["to_date"])
+    dates = [lower + timedelta(days=offset) for offset in range((upper - lower).days + 1)]
+    today = date.fromisoformat(report["as_of"][:10])
+    bold = Font(bold=True)
+
+    def cell(target, value, *, header=False):
+        if isinstance(value, str):
+            value = ILLEGAL_CHARACTERS_RE.sub("", value).replace("\ufffe", "").replace("\uffff", "")
+        result = WriteOnlyCell(target, value=value)
+        if isinstance(value, str):
+            # Do not turn employee/workplace names into formulas or Excel error cells.
+            result.data_type = "s"
+        elif isinstance(value, timedelta):
+            result.number_format = "[h]:mm"
+        elif isinstance(value, date):
+            result.number_format = "dd.mm.yyyy"
+        if header:
+            result.font = bold
+        return result
+
+    headers = ["Фамилия", "Имя", "Сотрудник", "Рабочие места", *dates, "Итого"]
+    sheet.freeze_panes = "E2"
+    for index in range(1, len(headers) + 1):
+        sheet.column_dimensions[get_column_letter(index)].width = 26 if index <= 4 else 13
+    sheet.print_options.horizontalCentered = True
+    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+    sheet.page_setup.orientation = "landscape"
+    sheet.page_setup.fitToWidth, sheet.page_setup.fitToHeight = 1, 0
+    sheet.print_title_rows = "1:1"
+    sheet.append([cell(sheet, value, header=True) for value in headers])
+    counted = {(row["employee_id"], row["date"]): row["worked_ms"] for row in report["rows"]}
+    totals = {row["employee_id"]: row["worked_ms"] for row in report["totals"]}
+    for employee in report["employees"]:
+        values = [employee["last_name"] or "", employee["first_name"] or "", employee["name"],
+                  ", ".join(place["name"] for place in employee["workplaces"])]
+        values.extend(timedelta(milliseconds=counted.get((employee["id"], day.isoformat()), 0))
+                      if day <= today else None for day in dates)
+        values.append(timedelta(milliseconds=totals.get(employee["id"], 0)))
+        sheet.append([cell(sheet, value) for value in values])
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(report['employees']) + 1}"
+
+    metadata = book.create_sheet("Параметры")
+    metadata.column_dimensions["A"].width = 32
+    metadata.column_dimensions["B"].width = 100
+    info = [
+        ("Период с", report["from_date"]), ("Период по", report["to_date"]), ("На момент", report["as_of"]),
+        ("Смещение UTC, мин", report["utc_offset_minutes"]),
+        ("Текущий перерыв, мин", report["live_gap_minutes"]), ("Итоговый перерыв, мин", report["day_gap_minutes"]),
+        ("Рабочее место", report["filters"]["workplace_name"] or "Все"),
+        ("Статус сотрудников", report["filters"]["employee_status"]),
+        ("Сотрудник ID", report["filters"]["employee_id"] or "Все"),
+        ("Правило отбора", "Рабочее место отбирает сотрудников; учитываются все их посчитанные часы."),
+        ("Текущий день", "Предварительный расчёт «День идёт»; будущие даты пустые, отсутствие появлений — 0."),
+        ("Суммы", "Числа — интервалы Excel [h]:mm; итог может превышать 24 часа."),
+    ]
+    for key, value in info:
+        metadata.append([cell(metadata, key), cell(metadata, value)])
+    output = io.BytesIO()
+    book.save(output)
+    return output.getvalue()
 
 
 def _correction_view(kind: str, row, employee_name: str | None) -> dict:

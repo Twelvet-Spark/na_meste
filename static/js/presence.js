@@ -88,6 +88,17 @@ async function loadEmployees() {
   } catch (error) { showError('report-error', error); }
 }
 
+async function loadWorkplaces() {
+  const select = $('report-filter').elements.workplace_id;
+  try {
+    for (const place of await api('/api/workplaces')) {
+      const option = el('option', `${place.name}${place.active ? '' : ' (архив)'}`);
+      option.value = String(place.id);
+      select.append(option);
+    }
+  } catch (error) { showError('report-error', error); }
+}
+
 // ---------- tab: now ----------
 async function loadActive() {
   const load = ++state.activeLoad;
@@ -109,7 +120,7 @@ async function loadActive() {
 function reportParams() {
   const form = $('report-filter');
   const params = new URLSearchParams();
-  for (const name of ['from_date', 'to_date', 'employee_id']) if (form.elements[name].value) params.set(name, form.elements[name].value);
+  for (const name of ['from_date', 'to_date', 'employee_id', 'workplace_id', 'employee_status']) if (form.elements[name].value) params.set(name, form.elements[name].value);
   return params;
 }
 function table(headers, bodyRows) {
@@ -135,6 +146,7 @@ async function loadReport() {
   const params = reportParams();
   UI.setBusy(form, true);
   $('report-csv').hidden = true;
+  $('report-xlsx').hidden = true;
   $('report-results').replaceChildren();
   $('report-summary').textContent = 'Загрузка отчёта…';
   showError('report-error', null);
@@ -142,7 +154,8 @@ async function loadReport() {
     const data = await api(`/api/attendance/report?${params}`);
     if (load !== state.reportLoad) return;
     state.reportLoaded = true;
-    $('report-summary').textContent = `${data.from_date} — ${data.to_date} · на ${stamp(data.as_of)}`;
+    $('report-summary').textContent = `${data.from_date} — ${data.to_date} · на ${stamp(data.as_of)} · сотрудников: ${data.employees.length}`;
+    history.replaceState(null, '', `${location.pathname}?${params}${location.hash}`);
     const results = $('report-results');
     results.replaceChildren(table(
       ['Дата', 'Сотрудник', 'Отработано', 'Первое', 'Последнее', 'Сессий', 'Расчёт', 'Примечания'],
@@ -153,6 +166,8 @@ async function loadReport() {
       data.totals.map((item) => row([employeeLink(item), hm(item.worked_ms), item.days]))));
     $('report-csv').href = `/api/attendance/report.csv?${params}`;
     $('report-csv').hidden = false;
+    $('report-xlsx').href = `/api/attendance/report.xlsx?${params}`;
+    $('report-xlsx').hidden = false;
   } catch (error) {
     if (load !== state.reportLoad) return;
     state.reportLoaded = false;
@@ -340,12 +355,18 @@ function tabChanged(name) {
   else if (name === 'corrections') loadCorrections();
 }
 async function start() {
-  await Promise.all([loadEmployees(), loadStatus()]);
+  await Promise.all([loadEmployees(), loadWorkplaces(), loadStatus()]);
   const report = $('report-filter').elements;
   const params = new URLSearchParams(location.search);
   report.from_date.value = params.get('from_date') || `${today().slice(0, 8)}01`;
   report.to_date.value = params.get('to_date') || today();
-  if (params.get('employee_id')) report.employee_id.value = params.get('employee_id');
+  for (const name of ['employee_id', 'workplace_id', 'employee_status']) {
+    if (params.has(name)) report[name].value = params.get(name);
+  }
+  $('report-filter').addEventListener('change', () => {
+    state.reportLoaded = false;
+    $('report-csv').hidden = $('report-xlsx').hidden = true;
+  });
   correctionForm.elements.date.value = today();
   UI.tabs(document.querySelector('[role="tablist"]'), { onChange: tabChanged });
 }
