@@ -4,8 +4,8 @@
   const $ = (id) => document.getElementById(id);
   const reasons = {
     AI_UNAVAILABLE: 'Модели AI не готовы. Проверьте загруженные провайдеры и настройки развёртывания.',
-    AI_EXCLUDED: 'Камера исключена из обработки AI. Проверьте список камер в настройках.',
-    CAMERA_UNCONFIGURED: 'Не настроены обе роли входа и выхода. Откройте калибровку камер.',
+    AI_EXCLUDED: 'AI-анализ камеры выключен. Проверьте настройки камеры на вкладке «Обзор».',
+    CAMERA_UNCONFIGURED: 'Камеры учёта не покрывают вход и выход. Настройте проходы и направления учёта.',
     CAMERA_OFFLINE: 'Камера недоступна. Проверьте питание, сеть и подключение.',
     COMMISSIONING_REQUIRED: 'Нужен ввод системы в эксплуатацию. Проверьте калибровку и критерии на странице рабочего времени.',
     CLOCK_DISCONTINUITY: 'Обнаружено изменение часов. Требуется проверка временных разрывов; история не сбрасывается.',
@@ -55,7 +55,7 @@
     PREPARING: 'Подготовка', READY: 'Готово', ENDED: 'Завершено', CANCELLED: 'Отменено', EXPIRED: 'Истекло' };
   const providerNames = { person_detection: 'Детектор людей', live_face_detection: 'Детектор лиц в потоке', live_face_recognition: 'Распознавание лиц в потоке',
     enroll_face_detection: 'Детектор лиц при добавлении фото', enroll_face_recognition: 'Распознавание при добавлении фото', reid: 'Межкамерное сопоставление',
-    scene_encoder: 'Сегментация сцены — энкодер (CPU)', scene_decoder: 'Сегментация сцены — декодер (CPU)' };
+    scene_encoder: 'Сегментация сцены — энкодер (CPU)', scene_decoder: 'Сегментация сцены — декодер (CPU)', scene_detector: 'Распознавание сцены' };
   let loading = false, sequence = 0, lastUpdate = null, generation = 0;
   const events = [];
   const text = (value) => value === null || value === undefined ? 'Нет данных' : String(value);
@@ -63,6 +63,9 @@
   const time = (value) => value ? new Date(value).toLocaleString('ru-RU') : 'Нет данных';
   const gb = (value) => value === null || value === undefined ? 'Нет данных' : `${(value / 1e9).toLocaleString('ru-RU', { maximumFractionDigits: 3 })} ГБ`;
   const why = (code) => reasons[code] || `Код ${code}. Проверьте состояние модуля и передайте отчёт администратору.`;
+  function roleLabel(role) {
+    return ({ BOTH: 'вход и выход', ENTRY: 'только вход', EXIT: 'только выход' })[role] || 'не настроен';
+  }
   function facts(target, entries) {
     target.replaceChildren();
     for (const [label, value] of entries) {
@@ -87,10 +90,10 @@
     for (const code of attendance.reasons || []) { const li = document.createElement('li'); li.textContent = why(code); reasonList.append(li); }
     facts($('debug-attendance'), [['Техническая готовность', attendance.technical_ready ? 'Готово' : 'Не готово'],
       ['Ожидающие сообщения о разрывах', attendance.pending_fault_count], ['Ожидающие записи', attendance.pending_write_count]]);
-    const roles = $('debug-roles'); roles.replaceChildren();
-    for (const [name, role] of Object.entries(attendance.roles || {})) {
-      row(roles, `${name === 'ENTRY' ? 'Вход' : 'Выход'} — ${role.camera_id == null ? 'камера не настроена' : `камера №${role.camera_id}`}`,
-        `Обработка: ${text(role.processed_fps)} кадров/с. Возраст кадра: ${text(role.frame_age_seconds)} с. Задержка p95: ${text(role.processing_age_p95_seconds)} с; завершение p95: ${text(role.completion_age_p95_seconds)} с.`);
+    const cameraMetrics = $('debug-attendance-cameras'); cameraMetrics.replaceChildren();
+    for (const camera of attendance.cameras || []) {
+      row(cameraMetrics, `Камера #${camera.camera_id} — ${roleLabel(camera.role)}`,
+        `Обработка: ${text(camera.processed_fps)} кадров/с. Возраст кадра: ${text(camera.frame_age_seconds)} с. Задержка p95: ${text(camera.processing_age_p95_seconds)} с; завершение p95: ${text(camera.completion_age_p95_seconds)} с. ${(camera.reasons || []).map(why).join(' ')}`);
     }
     facts($('debug-tools'), [['FFmpeg', view.tools.error_code ? 'Нет данных' : view.tools.ffmpeg_available ? 'Найден' : 'Не найден'], ['ffprobe', view.tools.error_code ? 'Нет данных' : view.tools.ffprobe_available ? 'Найден' : 'Не найден'],
       ['AI в настройках текущего запуска', view.ai.enabled ? 'Включён' : 'Отключён'],
@@ -118,7 +121,7 @@
     for (const camera of view.cameras) {
       row(cameras, `Камера №${camera.id} — ${stateNames[camera.status] || camera.status}${camera.enabled ? '' : ' (выключена)'}`,
         `Кадров/с: ${text(camera.current_fps)}. Возраст кадра: ${text(camera.seconds_since_last_frame)} с. Переподключений: ${text(camera.reconnect_count)}. ${camera.resolution || ''} ${camera.codec || ''}. ${camera.error ? why(camera.error) : ''}`,
-        [['Подключение и тест', `/cameras/${camera.id}`], ['Калибровка', `/cameras/${camera.id}#calibration-heading`]]);
+        [['Подключение и тест', `/cameras/${camera.id}`], ['Разметка', `/cameras/${camera.id}#mapping`]]);
       row(cameras, `Декодирование №${camera.id}`,
         `Режим: ${{ cuda: 'CUDA', software: 'программный' }[camera.decoder_mode] || 'нет данных'}. Запрошено: ${camera.decoder_requested || 'нет данных'}.${camera.decoder_warning ? ' ' + why(camera.decoder_warning) : ''}`);
       const inference = camera.inference;

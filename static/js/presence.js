@@ -3,11 +3,11 @@
 const $ = (id) => document.getElementById(id);
 const state = { tab: 'active', employees: [], status: null, event: null, gap: null,
   offsets: { events: 0, review: 0, legacy: 0 }, selected: new Map(), imageUrls: [], eventLoad: 0,
-  eventReady: false, gapReady: false };
+  eventReady: false, gapReady: false, commissionCameras: [] };
 const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принято', REVIEW: 'На проверке',
   VISITOR: 'Посетитель', VOID: 'Аннулировано', OPEN: 'Открыт — предварительно', CLOSED: 'Закрыт',
   FRAME_GAP: 'Пропуск кадров', STREAM_RESET: 'Переподключение потока', CLOCK_DISCONTINUITY: 'Скачок часов',
-  COMMISSIONING_REQUIRED: 'Нужен ввод в эксплуатацию', CAMERA_UNCONFIGURED: 'Не настроены обе роли камер',
+  COMMISSIONING_REQUIRED: 'Нужен ввод в эксплуатацию', CAMERA_UNCONFIGURED: 'Камеры не покрывают вход и выход',
   CAMERA_OFFLINE: 'Камера недоступна', AI_UNAVAILABLE: 'AI-модели недоступны', AI_EXCLUDED: 'Камера исключена из AI',
   PERFORMANCE_WARMUP: 'Измеряется производительность', PERFORMANCE_DEGRADED: 'Недостаточная производительность',
   PERSISTENCE_ERROR: 'Ошибка сохранения', COVERAGE_UNAVAILABLE: 'Нет надёжного наблюдения',
@@ -22,6 +22,12 @@ const labels = { ENTRY: 'Вход', EXIT: 'Выход', ACCEPTED: 'Принят�
   UNMONITORED: 'Период до начала наблюдения', FUTURE_DATE: 'Будущая дата — наблюдение ещё не завершено',
   SESSION_REVIEW: 'Спорный рабочий интервал', RUNNING: 'Предварительно', CONFIRMED: 'Подтверждено' };
 const label = (value) => labels[value] || value || '—';
+function roleLabel(role) {
+  return ({ BOTH: 'вход и выход', ENTRY: 'только вход', EXIT: 'только выход' })[role] || 'не настроен';
+}
+function coversDirections(configs) {
+  return ['ENTRY', 'EXIT'].every((direction) => configs.some((item) => item.role === 'BOTH' || item.role === direction));
+}
 const reasons = (values) => (values || []).map(label).join('; ') || '—';
 const time = (iso) => iso ? iso.replace('T', ' ') : '—';
 const hms = (ms) => { const s = Math.floor(Math.max(0, ms || 0) / 1000); return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
@@ -44,7 +50,9 @@ function recordingLink(item) {
 function requestId() { const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128; const hex = Array.from(bytes, (v) => v.toString(16).padStart(2, '0')).join(''); return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`; }
 async function api(path, options = {}) {
   let response;
-  try { response = await fetch(path, { cache: 'no-store', ...options }); }
+  const headers = new Headers(options.headers);
+  if (options.method && !['GET', 'HEAD'].includes(options.method.toUpperCase())) headers.set('X-Operator-Request', '1');
+  try { response = await fetch(path, { cache: 'no-store', ...options, headers }); }
   catch (cause) { const error = new Error('Нет связи с сервером. Поля сохранены: повторите тот же запрос.'); error.status = 0; throw error; }
   if (!response.ok) {
     let detail = '';
@@ -89,8 +97,9 @@ async function loadEmployees() {
   } catch (error) { showError('manual-error', error); }
 }
 function commissionVersions() {
-  const f = fields($('commission-form'));
-  for (const role of ['ENTRY', 'EXIT']) { const config = state.status?.configuration.find((item) => item.enabled && item.role === role); f[role === 'ENTRY' ? 'expected_entry_revision' : 'expected_exit_revision'].value = config?.revision ?? ''; }
+  if (!state.status) return;
+  state.commissionCameras = state.status.configuration.filter((item) => item.enabled)
+    .map(({ camera_id, revision }) => ({ camera_id, revision }));
   $('commission-form').dataset.versionsSet = 'true';
 }
 async function loadStatus() {
@@ -106,9 +115,15 @@ async function loadStatus() {
     const alerts = $('attendance-alerts'); alerts.replaceChildren();
     alerts.append(link(`Неопознанных/нерешённых проходов: ${status.unresolved_crossings}`, '/presence?kind=event#review'), document.createTextNode(' · '), link(`Потерь наблюдения: ${status.unreviewed_gaps}`, '/presence?kind=gap#review'), document.createTextNode(` · Конфликтов порядка: ${status.projection_conflicts}`));
     const configs = status.configuration.filter((item) => item.enabled);
-    $('configuration-state').textContent = ['ENTRY', 'EXIT'].every((role) => configs.some((item) => item.role === role)) ? configs.map((item) => `${label(item.role)}: камера #${item.camera_id}, калибровка ${item.revision}, источник ${item.source_revision}`).join(' · ') : 'Не настроены обе направленные камеры. Калибруйте линию прохода и сторону помещения; ручная работа и проверка остаются доступны.';
+    $('configuration-state').textContent = coversDirections(configs)
+      ? configs.map((item) => `Камера #${item.camera_id} — ${roleLabel(item.role)}, калибровка ${item.revision}, источник ${item.source_revision}`).join(' · ')
+      : 'Камеры учёта не покрывают и вход, и выход. Настройте проходы и направления учёта; ручная работа и проверка остаются доступны.';
     const metrics = $('role-metrics'); metrics.replaceChildren();
-    for (const role of ['ENTRY', 'EXIT']) { const data = status.roles[role]; metrics.append(row(data ? [`${label(role)} / #${data.camera_id}`, data.processed_fps.toFixed(1), data.frame_age_seconds?.toFixed(3) ?? '—', `${data.processing_age_p95_seconds?.toFixed(3) ?? '—'} / ${data.completion_age_p95_seconds?.toFixed(3) ?? '—'}`, reasons(data.reasons)] : [label(role), '—', '—', '—', 'Не настроена'])); }
+    for (const data of status.cameras) {
+      metrics.append(row([`${roleLabel(data.role)} / #${data.camera_id}`, data.processed_fps?.toFixed(1) ?? '—',
+        data.frame_age_seconds?.toFixed(3) ?? '—',
+        `${data.processing_age_p95_seconds?.toFixed(3) ?? '—'} / ${data.completion_age_p95_seconds?.toFixed(3) ?? '—'}`, reasons(data.reasons)]));
+    }
     const providers = $('provider-list'); providers.replaceChildren(); for (const [name, values] of Object.entries(status.providers)) providers.append(el('dt', name), el('dd', values.length ? values.join(', ') : 'Не загружен'));
     $('commission-state').textContent = status.commission ? `Последнее подтверждение #${status.commission.id}: ${time(status.commission.created_at)}, ${status.commission.actor}. ${status.commissioning_required ? 'Текущая конфигурация не подтверждена.' : 'Текущая конфигурация подтверждена.'}` : 'Испытания не подтверждены: автоматические проходы сохраняются на проверку.';
     if (!$('commission-form').dataset.versionsSet) commissionVersions();
@@ -160,15 +175,10 @@ async function loadPage(name) {
   } catch (error) { showError(`${name}-error`, error); }
 }
 function selectionCount() { $('bulk-count').textContent = `Выбрано: ${state.selected.size} (включая другие страницы)`; }
-function activate(name, { focus = false } = {}) {
-  if (!['active', 'events', 'review', 'report', 'legacy'].includes(name)) name = 'active'; state.tab = name;
-  document.querySelectorAll('[data-tab]').forEach((node) => { const active = node.dataset.tab === name; node.setAttribute('aria-selected', String(active)); node.tabIndex = active ? 0 : -1; });
-  document.querySelectorAll('.attendance-tabpanel').forEach((node) => { node.hidden = node.id !== `panel-${name}`; });
-  if (focus) $(`tab-${name}`).focus();
-  if (name === 'active') loadActive(); else if (name !== 'report') loadPage(name);
+function tabChanged(name) {
+  state.tab = name;
+  if (name === 'active') loadActive(); else if (name && name !== 'report') loadPage(name);
 }
-document.querySelectorAll('[data-tab]').forEach((node) => { node.onclick = () => { location.hash = node.dataset.tab; }; node.onkeydown = (event) => { const tabs = [...document.querySelectorAll('[data-tab]')]; let index = tabs.indexOf(node); if (event.key === 'ArrowRight') index = (index + 1) % tabs.length; else if (event.key === 'ArrowLeft') index = (index + tabs.length - 1) % tabs.length; else if (event.key === 'Home') index = 0; else if (event.key === 'End') index = tabs.length - 1; else return; event.preventDefault(); location.hash = tabs[index].dataset.tab; activate(tabs[index].dataset.tab, { focus: true }); }; });
-window.addEventListener('hashchange', () => activate(location.hash.slice(1)));
 for (const name of ['events', 'review', 'legacy']) $(`${name}-filter`).onsubmit = (event) => { event.preventDefault(); state.offsets[name] = 0; if (name === 'review') { state.selected.clear(); selectionCount(); } loadPage(name); };
 function beginEditor(kind) {
   state.eventReady = false;
@@ -498,14 +508,13 @@ $('commission-form').onsubmit = async (event) => {
     acceptance_record[name] = Number(f[name].value);
   }
   acceptance_record.site_confirmed = f.site_confirmed.checked;
-  if (!f.expected_entry_revision.value || !f.expected_exit_revision.value) {
-    showError('commission-error', new Error('Сначала настройте обе камеры и обновите версии конфигурации.'));
+  if (!state.commissionCameras.length) {
+    showError('commission-error', new Error('Настройте камеры учёта'));
     return;
   }
   try {
     const result = await write(form, '/api/attendance/commission', {
-      ...human(form), expected_entry_revision: Number(f.expected_entry_revision.value),
-      expected_exit_revision: Number(f.expected_exit_revision.value), acceptance_record,
+      ...human(form), expected_cameras: state.commissionCameras, acceptance_record,
     });
     showError('commission-error', null);
     $('commission-result').textContent = `Подтверждение #${result.commission_id} сохранено. Прежние пробные события остаются на проверке; аннулируйте испытательные записи с явным основанием.`;
@@ -595,7 +604,7 @@ async function start() {
     }
   }
   if (params.get('kind')) fields($('review-filter')).kind.value = params.get('kind');
-  activate(location.hash.slice(1) || 'active');
+  window.OperatorUI.tabs(document.querySelector('[role="tablist"]'), { onChange: tabChanged });
   if (params.get('event_id')) openEvent(params.get('event_id'));
 }
 start();

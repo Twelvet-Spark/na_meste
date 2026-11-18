@@ -21,7 +21,6 @@
         <summary>Подтвердить испытания на месте</summary>
         <p class="muted">Это заявление оператора, а не автоматическая проверка точности. Нужны реальные CUDA-сессии, 10 технически здоровых секунд, 15 минут измерений на целевом оборудовании, видимые стопы при пересечении и проверенные часы/задержка источников. При неудаче доступны ручные события и проверка.</p>
         <form id="commission-form" class="attendance-form">
-          <input type="hidden" name="expected_entry_revision"><input type="hidden" name="expected_exit_revision">
           <div class="attendance-fields">
             <label class="field">Входов (не менее 30)<input type="number" name="entry_trials" min="30" step="1" required></label>
             <label class="field">Выходов (не менее 30)<input type="number" name="exit_trials" min="30" step="1" required></label>
@@ -44,12 +43,12 @@
     </details>
   </section>
 
-  <nav class="attendance-tabs" role="tablist" aria-label="Рабочее время">
-    <button class="btn" id="tab-active" role="tab" aria-selected="true" aria-controls="panel-active" data-tab="active">На работе</button>
-    <button class="btn" id="tab-events" role="tab" aria-selected="false" aria-controls="panel-events" data-tab="events" tabindex="-1">События</button>
-    <button class="btn" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review" tabindex="-1">На проверке</button>
-    <button class="btn" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report" data-tab="report" tabindex="-1">Отчёт</button>
-    <button class="btn" id="tab-legacy" role="tab" aria-selected="false" aria-controls="panel-legacy" data-tab="legacy" tabindex="-1">Архив наблюдений</button>
+  <nav class="tabs" role="tablist" aria-label="Рабочее время">
+    <button type="button" id="tab-active" role="tab" aria-selected="true" aria-controls="panel-active" data-tab="active">На работе</button>
+    <button type="button" id="tab-events" role="tab" aria-selected="false" aria-controls="panel-events" data-tab="events" tabindex="-1">События</button>
+    <button type="button" id="tab-review" role="tab" aria-selected="false" aria-controls="panel-review" data-tab="review" tabindex="-1">На проверке</button>
+    <button type="button" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report" data-tab="report" tabindex="-1">Отчёт</button>
+    <button type="button" id="tab-legacy" role="tab" aria-selected="false" aria-controls="panel-legacy" data-tab="legacy" tabindex="-1">Архив наблюдений</button>
   </nav>
 
   <section class="panel attendance-tabpanel" id="panel-active" role="tabpanel" aria-labelledby="tab-active">

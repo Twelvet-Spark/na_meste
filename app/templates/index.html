@@ -17,8 +17,40 @@
         <p id="summary" class="muted" role="status" aria-live="polite">Загрузка камер…</p>
         <button id="camera-retry" class="btn" type="button" hidden>Повторить загрузку</button>
       </div>
-      <div id="camera-grid" class="camera-grid"></div>
+      <nav id="camera-tabs" class="tabs" role="tablist" aria-label="Рабочие места камер"></nav>
+      <div id="camera-directory-panel" role="tabpanel">
+        <section id="camera-entrances" class="camera-zone" aria-labelledby="camera-entrances-heading" hidden>
+          <h2 id="camera-entrances-heading">Входы <span id="camera-entrances-count" class="tab-count">0</span></h2>
+          <div id="camera-entrances-grid" class="camera-grid"></div>
+        </section>
+        <section id="camera-interior" class="camera-zone" aria-labelledby="camera-interior-heading" hidden>
+          <h2 id="camera-interior-heading">Внутренние <span id="camera-interior-count" class="tab-count">0</span></h2>
+          <div id="camera-interior-grid" class="camera-grid"></div>
+        </section>
+        <p id="camera-tab-empty" class="empty" hidden>В этой группе пока нет камер. Выберите камеры во вкладке «Все» и назначьте им рабочее место.</p>
+      </div>
+      <div id="camera-card-store" hidden></div>
       <div id="empty" class="empty" hidden><p>Добавьте первую камеру Dahua или несколько каналов регистратора.</p><button id="camera-empty-add" class="btn primary" type="button">Добавить устройство</button></div>
+    </section>
+    <section id="camera-bulk" class="camera-bulk" aria-label="Действия с выбранными камерами" hidden>
+      <div class="camera-bulk-heading">
+        <strong id="camera-selected-count">Выбрано: 0</strong>
+        <button id="camera-selection-clear" class="btn ghost" type="button">Снять выбор</button>
+      </div>
+      <div class="camera-bulk-assignment">
+        <label class="field">Рабочее место<select id="camera-bulk-workplace"><option value="">Без рабочего места</option></select></label>
+        <button id="camera-bulk-assign" class="btn" type="button">Назначить</button>
+      </div>
+      <div id="camera-bulk-actions" class="camera-bulk-actions">
+        <button class="btn" type="button" data-camera-action="SET_ENTRANCE">Сделать входами</button>
+        <button class="btn" type="button" data-camera-action="SET_INTERIOR">Сделать внутренними</button>
+        <button class="btn" type="button" data-camera-action="AI_ON">AI вкл</button>
+        <button class="btn" type="button" data-camera-action="AI_OFF">AI выкл</button>
+        <button class="btn" type="button" data-camera-action="ENABLE">Включить</button>
+        <button class="btn" type="button" data-camera-action="DISABLE">Отключить</button>
+      </div>
+      <p id="camera-bulk-result" role="status" aria-live="polite"></p>
+      <ul id="camera-bulk-failures" class="camera-bulk-failures" hidden></ul>
     </section>
   </main>
 
