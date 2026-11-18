@@ -95,6 +95,7 @@ class FrameOutcome:
     face_deferred: int = 0
     stage_times_ms: dict[str, float] = field(default_factory=dict)
     face_unavailable: bool = False
+    person_scores: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -274,6 +275,7 @@ class RecognitionService:
                 height, width = packet.frame.shape[:2]
                 outcome.person_regions = [self._normalized_box(bbox, width, height)
                                           for bbox, _score in persons]
+                outcome.person_scores = [float(score) for _bbox, score in persons]
                 current.tracks = tracker.update(persons, now=packet.received_mono)
                 current.observed = True
                 outcome.track_lifecycle = tracker.lifecycle

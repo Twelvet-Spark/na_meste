@@ -56,3 +56,15 @@ test('Stalled detection requests abort and release their deadline', async () => 
   await assert.rejects(pending, /Aborted/);
   assert.equal(cleared, true);
 });
+test('Unassociated real people render without fabricated track IDs or scene controls', () => {
+  const person = { track_id: null, employee_id: null, state: 'detecting', person_score: .91, bbox: [.1, .1, .2, .3] };
+  assert.doesNotMatch(overlay.label(person), /Tnull|Tundefined/);
+  for (const compact of [false, true]) {
+    const boxes = new Element();
+    overlay.render(boxes, [person], { compact, metrics: true });
+    const rectangle = boxes.children[0];
+    assert.equal(rectangle.className, 'bbox detecting');
+    assert.equal(rectangle.children.length, 1); // Label only; no stable scene-track controls.
+    if (compact) assert.match(rectangle.children[0].children[0].textContent, /91%/);
+  }
+});

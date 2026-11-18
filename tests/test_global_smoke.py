@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
+from types import SimpleNamespace
 import traceback
 from unittest.mock import patch
 
@@ -156,6 +158,40 @@ def reference(crop, chunk_size):
 
 
 @test
+def first_live_crop_does_not_charge_cuda_startup_to_appearance_budget():
+    # CUDA initialization is thread-local: warming the construction thread does
+    # not protect the inference owner's first live appearance deadline.
+    from app.ai.worker import AIWorker
+    elapsed = [0.]
+    initialized = set()
+    native_run = ort.InferenceSession.run
+    live_costs = []
+    def timed_run(session, *args, **kwargs):
+        key = (id(session), threading.get_ident())
+        elapsed[0] += .009 if key in initialized else .835
+        initialized.add(key)
+        return native_run(session, *args, **kwargs)
+    class ProbeWorker(AIWorker):
+        def step(self):
+            started = elapsed[0]
+            vectors = self.reid.embed(crops(1))
+            live_costs.append((elapsed[0] - started, vectors.shape))
+            self._stop_event.set()
+            return True
+        def flush(self, reason):
+            pass
+    with tempfile.TemporaryDirectory() as directory, patch.object(ort.InferenceSession, "run", timed_run):
+        reid = adapter(fixture_at(Path(directory)))
+        worker = ProbeWorker(None, SimpleNamespace(store=None), None, None, reid=reid)
+        worker.start()
+        worker.join()
+        assert len(live_costs) == 1
+        cost, shape = live_costs[0]
+        assert cost < .02, 'cold-start cost must not permanently exhaust the live appearance budget'
+        assert shape == (1, 512)
+
+
+@test
 def empty_input_returns_typed_empty_embeddings_without_native_inference():
     with tempfile.TemporaryDirectory() as directory:
         reid = adapter(fixture_at(Path(directory)))
@@ -266,8 +302,8 @@ def actual_session_metadata_mismatches_fail_closed():
 @test
 def actual_inference_cannot_silently_drop_a_row():
     with tempfile.TemporaryDirectory() as directory:
-        reid = adapter(fixture_at(Path(directory), mode="missing_row"))
-        expect_body_error(lambda: reid.embed(crops(4)))
+        fixture = fixture_at(Path(directory), mode="missing_row")
+        expect_body_error(lambda: adapter(fixture).embed(crops(4)))
 
 
 @test
@@ -276,8 +312,7 @@ def actual_nonfinite_and_zero_norm_outputs_are_rejected():
         fixture = fixture_at(Path(directory))
         for mode in ("nan", "inf", "zero"):
             replace_body(fixture, body_graph(mode=mode))
-            reid = adapter(fixture)
-            expect_body_error(lambda: reid.embed(crops(1)))
+            expect_body_error(lambda: adapter(fixture).embed(crops(1)))
 
 
 @test

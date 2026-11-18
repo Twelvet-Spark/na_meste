@@ -81,8 +81,7 @@ async function refresh() {
     if (ticket === refreshSequence) showCamera(cam);
   } catch (_) {
     if (ticket !== refreshSequence) return;
-    $('video-overlay').hidden = false;
-    $('video-overlay').textContent = 'Не удалось обновить камеру. Проверьте сеть; последние данные сохранены.';
+    $('st-error').textContent = 'Не удалось обновить данные камеры. Проверьте сеть; последние данные сохранены.';
   }
 }
 async function loadWorkplaces() {

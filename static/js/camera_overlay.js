@@ -12,7 +12,7 @@
     if (known) parts.push(track.identity_source === 'REID' ? 'по внешности' : 'по лицу');
     if (score(track.person_score)) parts.push(`человек ${Math.round(track.person_score * 100)}%`);
     if (known && track.identity_source !== 'REID' && score(track.face_similarity)) parts.push(`сходство лица ${track.face_similarity.toFixed(2)}`);
-    parts.push(`T${track.track_id}${track.global_id ? `·G${track.global_id}` : ''}`);
+    if (Number.isInteger(track.track_id)) parts.push(`T${track.track_id}`);
     return parts.join(' · ');
   }
   function fitRect(width, height, nativeWidth, nativeHeight, fit = 'contain') {
@@ -63,8 +63,9 @@
       text.className = 'bbox-label';
       if (compact) {
         text.title = label(track);
-        const lines = [identityLabel(track)];
-        if (score(track.person_score)) lines.push(`чел. ${Math.round(track.person_score * 100)}%`);
+        const lines = track.employee_id != null ? [identityLabel(track)] : [];
+        const marker = Number.isInteger(track.track_id) ? `T${track.track_id}` : 'Человек';
+        lines.push(`${marker}${score(track.person_score) ? ` · ${Math.round(track.person_score * 100)}%` : ''}`);
         if (track.employee_id != null) {
           if (track.identity_source === 'REID') lines.push('по внешности');
           else if (score(track.face_similarity)) lines.push(`лицо ${track.face_similarity.toFixed(2)}`);
@@ -79,11 +80,14 @@
         text.style.pointerEvents = 'auto';
         text.title = 'Открыть сохранённый визит — не запись рабочего времени';
       }
-      if (y1 * container.clientHeight < 24) text.style.top = '0';
+      if (y1 * container.clientHeight < (compact ? 46 : 24)) {
+        text.style.top = '0';
+        text.style.bottom = 'auto';
+      }
       const reasons = Array.isArray(track.identity_reason_codes) ? track.identity_reason_codes.join(', ') : '';
       if (reasons) text.title += `${text.title ? '. ' : ''}Причина состояния личности: ${reasons}`;
       box.append(text);
-      if (metrics) {
+      if (metrics && Number.isInteger(track.track_id)) {
         const foot = document.createElement('span'); foot.className = 'bbox-footpoint';
         foot.title = 'Точка пересечения: низ рамки по центру';
         const metric = document.createElement('span'); metric.className = 'bbox-metric';

@@ -338,11 +338,11 @@ def test_tracker_receives_each_packets_receipt_monotonic_not_loop_time():
 
 
 @test
-def test_continuity_gap_resets_same_stream_generation_and_detection_state():
+def test_door_continuity_gap_resets_same_stream_generation_and_detection_state():
     _service, _state, outcomes = run_worker([
         (FrameReader("a", 1, 100.0), 100.0),
         (FrameReader("a", 2, 100.8), 100.8),
-    ])
+    ], attendance=True)
     assert len(outcomes) == 2
     assert outcomes[0].tracking_generation != outcomes[1].tracking_generation
     assert outcomes[1].detections[0].track_id == 1

@@ -83,7 +83,11 @@ def test_first_hit_provisional_without_face_or_body_and_ack_only_live_link():
         with journal._condition:
             publish(manager, clock, 3)
             assert worker.step()
-            assert worker.state.camera(3)['tracks'] == []
+            anonymous = worker.state.camera(3)['tracks']
+            assert len(anonymous) == 1
+            assert anonymous[0]['track_id'] is None
+            assert anonymous[0]['visit_id'] is None
+            assert anonymous[0]['employee_id'] is None
         idle(journal)
         with Session(engine) as db:
             row = db.query(HumanVisit).one()
@@ -339,10 +343,13 @@ def test_crowded_camera_cannot_starve_another_camera_at_crop_capacity():
 
 def test_costed_optional_body_chunk_finishes_before_the_next_live_deadline():
     class CostedBody(Body):
+        last_batch_size = 1  # worker startup warms exactly one crop
         def embed(self, crops):
             due = min(worker.scheduler.deadlines[key] for key in worker._last_received)
             result = super().embed(crops)
-            clock.advance(.02 * len(crops))
+            # Real CUDA replay: changing N costs ~270ms, even returning to N=1.
+            clock.advance(.02 * len(crops) + (.27 if len(crops) != self.last_batch_size else 0))
+            self.last_batch_size = len(crops)
             finished.append((clock.mono, due))
             return result
     body, finished = CostedBody(), []

@@ -47,8 +47,8 @@ class DetectionState:
         self._published_at: dict[int, float] = {}
 
     def update(self, camera_id: int, detections, *, packet=None, generation=None, configuration=None,
-               identities: dict[int, tuple[int, str, str | None]] | None = None) -> None:
-        """`identities` maps track_id to (employee_id, source, name) for tracks whose employee is known."""
+               identities: dict[int, tuple[int, str, str | None]] | None = None,
+               person_detections=()) -> None:
         identities = identities or {}
         tracks = []
         for d in detections:
@@ -68,6 +68,22 @@ class DetectionState:
                 "identity_reason_codes": list(d.identity_reason_codes),
                 "visit_id": d.visit_id,
             })
+        if packet is not None:
+            represented = {tuple(track["bbox"]) for track in tracks}
+            for bbox, score in person_detections:
+                # Display current strong detections even when association is
+                # tentative/ambiguous. These never enter presence or the gallery.
+                if not np.isfinite(score) or score < settings.tracker_new_track_threshold:
+                    continue
+                normalized = tuple(bbox)
+                if normalized in represented:
+                    continue
+                tracks.append(dict(
+                    track_id=None, bbox=normalized, state="detecting",
+                    employee_id=None, employee_name=None, identity_source=None,
+                    confidence=0., person_score=float(score), face_similarity=None,
+                    global_id=None, visit_id=None, identity_reason_codes=["ASSOCIATION_UNCONFIRMED"],
+                ))
         with self._lock:
             self._published_at[camera_id] = time.monotonic()
             self._data[camera_id] = {
@@ -252,6 +268,14 @@ class AIWorker(threading.Thread):
     def run(self):
         logger.info("AI worker started")
         try:
+            if self.reid is not None:
+                # CUDA initializes kernels per calling thread. Warm this owner,
+                # not the constructing thread, before measuring live budgets.
+                from app.ai.reid import INPUT_H, INPUT_W
+                try:
+                    self.reid.embed([np.full((INPUT_H, INPUT_W, 3), 127, dtype=np.uint8)])
+                except Exception:
+                    logger.exception("Optional appearance warmup unavailable")
             while not self._stop_event.is_set():
                 if not self.step():
                     self._stop_event.wait(self._idle_delay(time.monotonic()))
@@ -451,7 +475,8 @@ class AIWorker(threading.Thread):
                         self.doorway.process(packet, camera_id, outcome, config.calibration), configurations)
                 self.state.update(camera_id, outcome.detections, packet=packet,
                                   generation=outcome.tracking_generation, configuration=config,
-                                  identities=identities)
+                                  identities=identities,
+                                  person_detections=zip(outcome.person_regions, outcome.person_scores))
                 self._queue_appearance(submission, outcome, revision)
                 finished = time.monotonic()
                 self.metrics.complete(camera_id, packet.received_mono, finished, skipped=skipped,
@@ -498,6 +523,14 @@ class AIWorker(threading.Thread):
         """Update sticky track identities and report presence; returns the overlay identity map."""
         generation = outcome.tracking_generation
         day = local_date(milliseconds(packet.received_at))
+        for transition in outcome.track_lifecycle:
+            key = (camera_id, generation, transition.track_id)
+            if transition.state == "EXPIRED":
+                self._identities.pop(key, None)
+            elif transition.state == "AMBIGUOUS":
+                identity = self._identities.get(key)
+                if identity is not None:
+                    identity.clear()
         known = {}
         for person in outcome.detections:
             key = (camera_id, generation, person.track_id)
@@ -530,9 +563,6 @@ class AIWorker(threading.Thread):
                         else self.service.store.employee_name(identity.employee_id)
                         if self.service.store is not None else None)
                 known[person.track_id] = (identity.employee_id, identity.source, name)
-        for transition in outcome.track_lifecycle:
-            if transition.state == "EXPIRED":
-                self._identities.pop((camera_id, generation, transition.track_id), None)
         return known
 
     def _drain_journal(self, configurations):
@@ -635,8 +665,8 @@ class AIWorker(threading.Thread):
                                      work.gallery_revision, configurations))
 
     def _appearance_limit(self, now, active):
-        # Probe one crop before estimating a chunk. Native calls are not
-        # preemptible; reserve time for the next live deadline, not merely 20ms.
+        # Bound the group by the next mandatory frame deadline. Native calls use
+        # one crop each below to avoid CUDA's expensive batch-shape changes.
         estimate = (self._appearance_seconds_per_crop or .02) * 1.25
         reserve = max(.005, settings.ai_batch_wait_ms / 1000.)
         slack = self.scheduler.delay(now, 16 * estimate + reserve, camera_ids=active) - reserve
@@ -678,9 +708,12 @@ class AIWorker(threading.Thread):
             if not batch:
                 return
             chunk_started = time.monotonic()
-            vectors = self.reid.embed([work.crop for work in batch])
-            if len(vectors) != len(batch):
-                raise ValueError("Appearance batch omitted an observation")
+            vectors = []
+            for work in batch:
+                result = self.reid.embed([work.crop])
+                if len(result) != 1:
+                    raise ValueError("Appearance inference omitted an observation")
+                vectors.append(result[0])
             # Never hold the publication guard during a model call.
             with publication_guard(self.presence.engine):
                 configurations = self._read_configurations()
@@ -839,13 +872,14 @@ class AIWorker(threading.Thread):
                     self._reset_camera(camera_id, "FRAME_GAP")
                 continue
             if packet.seq <= self._last_seq.get(camera_id, 0):
-                if camera_id in self._last_received and age > settings.attendance_max_frame_gap:
+                if config.attendance and camera_id in self._last_received and age > settings.attendance_max_frame_gap:
                     self._reset_camera(camera_id, "FRAME_GAP")
                     self._streams[camera_id] = stream
                     self._last_seq[camera_id] = packet.seq
                 continue
             previous_receipt = self._last_received.get(camera_id)
-            if previous_receipt is not None and packet.received_mono - previous_receipt > settings.attendance_max_frame_gap:
+            if (config.attendance and previous_receipt is not None
+                    and packet.received_mono - previous_receipt > settings.attendance_max_frame_gap):
                 self._reset_camera(camera_id, "FRAME_GAP")
                 self._streams[camera_id] = stream
                 self.metrics.configure(camera_id, self._fps(config), now)

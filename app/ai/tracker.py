@@ -228,7 +228,10 @@ class ByteTracker:
         eligible = overlaps >= self.match_threshold
 
         def close_pair(scores: np.ndarray) -> bool:
-            return bool(np.any(np.diff(np.sort(scores)) <= .10 + 1e-12))
+            if len(scores) < 2:
+                return False
+            best = np.partition(scores, -2)[-2:]
+            return bool(abs(best[1] - best[0]) <= .10 + 1e-12)
 
         tracks = {row for row in range(overlaps.shape[0])
                   if close_pair(overlaps[row, eligible[row]])}
