@@ -29,7 +29,8 @@ from fastapi.routing import APIRoute
 
 from app.config import settings
 from app.database.database import get_db, publication_guard
-from app.database.models import AttendanceCamera, AttendanceRuntime, CameraProfile
+from app.database.models import (
+    AttendanceCamera, AttendanceRuntime, CameraProfile, RecognitionLearningRuntime)
 from app.rtsp.manager import ReaderManager
 from app.rtsp.jpeg_cache import JPEG_QUALITY
 from app.rtsp.reader import CameraStatus, FramePacket, RTSPReader
@@ -39,6 +40,43 @@ from app.api.operator_security import require_operator_request
 from app.services.dahua_service import DahuaSetup
 
 logger = logging.getLogger("app.api.cameras")
+
+def _fence_reid_overlay(data: dict, runtime) -> dict:
+    """Drop cached body-appearance names after a newer committed learning revision.
+
+    Runs under publication_guard before the worker's next pass. Boxes, geometry,
+    face names and the cached state itself stay; only REID-sourced identity and the
+    derived known/unknown counts change. A missing durable revision or token
+    cannot authorize cached REID names.
+    """
+    if (runtime is not None and data.get("learning_revision") == runtime.revision
+            or not any(track.get("identity_source") == "REID" for track in data["tracks"])):
+        return data
+    tracks = []
+    for track in data["tracks"]:
+        if track.get("identity_source") == "REID":
+            track = {**track, "employee_id": None, "employee_name": None,
+                     "identity_source": None, "face_similarity": None}
+        tracks.append(track)
+    known = sum(1 for track in tracks if track["employee_id"])
+    return {**data, "tracks": tracks, "known_count": known,
+            "unknown_count": len(tracks) - known}
+
+
+def _overlay_counts(db: Session, request: Request, camera_ids) -> dict[int, tuple[int, int, int]]:
+    state = _detection_state(request)
+    if state is None:
+        return {}
+    with publication_guard(db.get_bind().engine):
+        runtime = db.get(RecognitionLearningRuntime, 1, populate_existing=True)
+        counts = {}
+        for camera_id in camera_ids:
+            data = state.camera(camera_id)
+            if data is not None:
+                visible = _fence_reid_overlay(data, runtime)
+                counts[camera_id] = (visible["people_count"], visible["known_count"], visible["unknown_count"])
+        return counts
+
 
 class _CameraRoute(APIRoute):
     def get_route_handler(self):
@@ -88,18 +126,13 @@ def _camera_or_404(db: Session, camera_id: int):
 
 
 def _camera_response(camera, manager: ReaderManager, request: Request, db: Session,
-                     profiles: dict | None = None) -> dict:
+                     profiles: dict | None = None, counts: tuple[int, int, int] | None = None) -> dict:
     """Камера без пароля + live-статус + счётчики людей (AI)."""
     data = service.camera_out(db, camera, profiles)
     data.update(manager.status(camera.id))
-    state = _detection_state(request)
-    if state is not None:
-        people, known, unknown = state.counts(camera.id)
-        data["people_count"] = people
-        data["known_count"] = known
-        data["unknown_count"] = unknown
-    else:
-        data["people_count"] = data["known_count"] = data["unknown_count"] = 0
+    if counts is None:
+        counts = _overlay_counts(db, request, (camera.id,)).get(camera.id, (0, 0, 0))
+    data["people_count"], data["known_count"], data["unknown_count"] = counts
     recordings = getattr(request.app.state, "recordings", None)
     sessions = recordings.list_sessions(camera_id=camera.id, limit=1) if recordings is not None else []
     data["recording"] = sessions[0].model_dump(mode="json") if sessions else None
@@ -209,8 +242,10 @@ def api_list_cameras(
     manager: ReaderManager = Depends(get_manager),
 ):
     cameras = service.list_cameras(db)
-    profiles = service.profiles_by_camera(db, [camera.id for camera in cameras])
-    return [_camera_response(c, manager, request, db, profiles) for c in cameras]
+    camera_ids = [camera.id for camera in cameras]
+    profiles = service.profiles_by_camera(db, camera_ids)
+    counts = _overlay_counts(db, request, camera_ids)
+    return [_camera_response(c, manager, request, db, profiles, counts.get(c.id, (0, 0, 0))) for c in cameras]
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_operator_request)])
@@ -428,6 +463,8 @@ def api_camera_detections(
                 or data.get("calibration_revision") != configuration.revision
                 or data.get("gallery_revision") != runtime.gallery_revision)):
             data = None
+        if data is not None:
+            data = _fence_reid_overlay(data, db.get(RecognitionLearningRuntime, 1, populate_existing=True))
         if data is not None:
             profile = db.get(CameraProfile, camera_id)
             fps = profile.ai_fps if profile is not None and profile.ai_fps is not None else settings.ai_fps

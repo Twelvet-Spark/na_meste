@@ -40,7 +40,7 @@ from app.ai.face_recognition import EmbeddingStore
 from app.database.database import get_db, immediate_session
 from app.database.models import (
     AttendanceRuntime, Camera, Employee, EmployeeFace, FaceModelMetadata, HumanJournalGap, HumanVisit,
-    HumanVisitEvent, PresenceSegment,
+    HumanVisitEvent, PresenceSegment, RecognitionFeedback,
 )
 from operator_test_support import Client, multipart
 from test_operator_storage import database, dump, legacy, schema, STAMP
@@ -1108,6 +1108,34 @@ def test_closed_visit_identification_history_blocks_employee_deletion_after_rest
 @test
 def test_conflicted_visit_identification_history_blocks_employee_deletion():
     historical_employee_deletion("conflict")
+
+
+@test
+def test_revoked_learning_reference_protects_employee_with_no_visit_label():
+    from hashlib import sha256
+
+    with api() as (client, engine, _model, _store, _root):
+        employee = create(client)
+        visit_id, feedback_id = str(uuid4()), str(uuid4())
+        image_digest = sha256(b'Evidence').hexdigest()
+        with immediate_session(engine) as db:
+            db.add(Camera(id=12, name='Journal', nvr_host='unused', username='', password='', channel=12))
+            db.flush()
+            db.add(HumanVisit(id=visit_id, camera_id=12, tracking_generation='review', track_id=1,
+                              source_revision=1, stream_id='known', identity_state='UNKNOWN',
+                              started_at=STAMP, last_seen_at=STAMP, last_bbox=[0., 0., 1., 1.],
+                              max_person_score=.9, image_expires_at=STAMP))
+            db.flush()
+            db.add(RecognitionFeedback(id=feedback_id, visit_id=visit_id, employee_id=employee['id'],
+                                       source='UPLOAD', action='ACCEPT', source_sha256=image_digest,
+                                       image_sha256=image_digest, crop=[0., 0., 1., 1.], created_at=STAMP,
+                                       actor='Operator', reason='Reviewed', face_status='INELIGIBLE',
+                                       revoked_at=STAMP, revoked_by='Operator', revoke_reason='Removed'))
+        before = dump(engine)
+        result = client.json('DELETE', f"/api/employees/{employee['id']}", status=409)
+        assert 'отключите активность' in result['detail']
+        assert dump(engine) == before
+        assert detail(client, employee['id'])['usable_faces_count'] == 1
 
 
 if __name__ == "__main__":

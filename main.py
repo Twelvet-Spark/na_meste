@@ -19,9 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.ai.face_recognition import EmbeddingStore
+from app.ai.recognition_learning import RecognitionLearningStore
 from app.ai.model_bundle import ModelBundle
 from app.ai.providers import provider_label, resolve_providers
-from app.ai.worker import build_ai_worker, build_enroll_engine, loaded_providers
+from app.ai.worker import (
+    build_ai_worker, build_body_enroll_engine, build_enroll_engine, loaded_providers)
 from app.ai.scene_detector import SceneObjectDetector
 from app.ai.scene_segmenter import SceneSegmenter
 from app.api.attendance import router as attendance_router
@@ -51,6 +53,7 @@ from app.services.setup_transfer_service import SetupTransferService
 from app.services.gallery_migration import rebuild_gallery
 from app.services.human_journal import HumanJournal
 from app.services.visit_sample_service import VisitSampleService
+from app.services.recognition_learning_service import RecognitionLearningService
 from app.services.scene_service import SceneService
 from app.services.scene_assistance import SceneAssistanceService
 
@@ -150,6 +153,20 @@ async def lifespan(app: FastAPI):
 
     # One separate enrollment owner and one live owner; no per-request engine.
     app.state.face_engine = build_enroll_engine(bundle)
+    app.state.body_engine = build_body_enroll_engine(bundle)
+    app.state.recognition_learning_service = None
+    app.state.learning_store = None
+    if app.state.body_engine is not None:
+        try:
+            learning_store = RecognitionLearningStore(engine, app.state.body_engine.model_id)
+            app.state.learning_store = learning_store
+            try:
+                learning_store.refresh()
+            except Exception as exc:
+                # The worker retries on its own cadence; learning stays unavailable until then.
+                logger.error("Learning examples unavailable: %s", getattr(exc, "code", type(exc).__name__))
+        except Exception as exc:
+            logger.error("Learning store unavailable: %s", getattr(exc, "code", type(exc).__name__))
     app.state.enrollment_lock = threading.BoundedSemaphore(1)
     app.state.embedding_store = None
     app.state.ai_worker = None
@@ -187,7 +204,16 @@ async def lifespan(app: FastAPI):
             worker = build_ai_worker(
                 app.state.manager, app.state.presence, app.state.embedding_store,
                 bundle=bundle, session_factory=SessionLocal, notifier=notifier,
-                journal=app.state.human_journal)
+                journal=app.state.human_journal, learning_store=app.state.learning_store)
+            if worker is not None and worker.learning_store is None and worker.reid is not None:
+                # Enrollment body model is unavailable but the live one loaded: durable
+                # matching still needs a store bound to the live model. Assign before start.
+                try:
+                    app.state.learning_store = worker.learning_store = RecognitionLearningStore(
+                        engine, worker.reid.model_id)
+                    worker.learning_store.refresh()
+                except Exception as exc:
+                    logger.error("Learning examples unavailable: %s", getattr(exc, "code", type(exc).__name__))
             if worker is not None:
                 worker.start()
                 app.state.ai_worker = worker
@@ -200,6 +226,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("AI отключён (AI_ENABLED=false)")
     worker = app.state.ai_worker
+    try:
+        app.state.recognition_learning_service = RecognitionLearningService(
+            engine, app.state.body_engine, app.state.face_engine, app.state.face_model_id,
+            app.state.enrollment_lock, store=app.state.embedding_store,
+            learning_store=app.state.learning_store,
+            appearance_gallery=worker.appearance_gallery if worker is not None else None)
+    except Exception as exc:
+        logger.error("Learning service unavailable: %s", getattr(exc, "code", type(exc).__name__))
     app.state.ai_providers = loaded_providers(
         detector=worker.service.detector if worker is not None else None,
         live=worker.service.faces if worker is not None else None,
@@ -241,6 +275,11 @@ async def lifespan(app: FastAPI):
         # stop timestamp before stopping readers or notification delivery.
         if app.state.ai_worker is not None:
             app.state.ai_worker.stop()
+        if app.state.recognition_learning_service is not None:
+            try:
+                app.state.recognition_learning_service.close()
+            except Exception:
+                logger.error("Learning native work unresolved at shutdown")
         app.state.scene_close_result = asdict(app.state.scene_assistance.close())
         if not app.state.scene_close_result["closed"]:
             logger.error("Scene native work unresolved at shutdown: %s", app.state.scene_close_result)

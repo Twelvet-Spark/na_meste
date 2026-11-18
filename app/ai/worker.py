@@ -21,6 +21,7 @@ from app.ai.doorway import DoorwayCalibration, DoorwayDetector
 from app.ai.employee_appearance import LEARN_FACE_SECONDS, REID_VOTES, EmployeeAppearanceGallery
 from app.ai.face_detector import FaceEngine
 from app.ai.face_recognition import EmbeddingStore
+from app.ai.recognition_learning import LearningSnapshot, match_body
 from app.ai.model_bundle import ModelBundle
 from app.ai.providers import provider_label, resolve_providers, setup_cuda_dlls
 from app.ai.recognition_service import RecognitionInput, RecognitionService
@@ -30,7 +31,9 @@ from app.ai.inference_metrics import InferenceMetrics
 from app.attendance_types import milliseconds
 from app.config import BASE_DIR, settings
 from app.database.database import publication_guard, read_snapshot
-from app.database.models import AttendanceCamera, AttendanceRuntime, Camera, CameraProfile
+from app.database.models import (
+    AttendanceCamera, AttendanceRuntime, Camera, CameraProfile, RecognitionLearningRuntime,
+)
 from app.rtsp.manager import ReaderManager
 from app.rtsp.reader import CameraStatus
 from app.time_utils import local_date, utcnow
@@ -48,7 +51,7 @@ class DetectionState:
 
     def update(self, camera_id: int, detections, *, packet=None, generation=None, configuration=None,
                identities: dict[int, tuple[int, str, str | None]] | None = None,
-               person_detections=()) -> None:
+               person_detections=(), learning_revision=None) -> None:
         identities = identities or {}
         tracks = []
         for d in detections:
@@ -97,6 +100,7 @@ class DetectionState:
                 "frame_height": int(packet.frame.shape[0]) if packet is not None else None,
                 "gallery_revision": configuration.gallery_revision if configuration is not None else None,
                 "calibration_revision": configuration.calibration_revision if configuration is not None else None,
+                "learning_revision": learning_revision,
                 "observed_at": ((packet.received_at.replace(tzinfo=timezone.utc)
                                  if packet.received_at.tzinfo is None else packet.received_at)
                                 .astimezone(timezone.utc).isoformat()) if packet is not None else None,
@@ -155,6 +159,9 @@ class _CameraConfiguration:
     ai_fps: float | None = field(default=None, compare=False)
     # Toggling time tracking must not reset a camera either.
     time_tracking: bool = field(default=False, compare=False)
+    # Revision coherence token of the durable BODY-learning runtime (-1: runtime row missing). It
+    # must neither reset a camera nor change source equality: BODY feedback never resets tracks.
+    learning_revision: int = field(default=0, compare=False)
 
 
 @dataclass(slots=True)
@@ -186,6 +193,8 @@ class _AppearanceWork:
     gallery_revision: int | None
     reader_token: int
     crop: np.ndarray
+    # Durable learning revision the BODY snapshot had when queued; None while body naming was unavailable.
+    learning_revision: int | None = None
 
 
 @dataclass(slots=True)
@@ -198,11 +207,13 @@ class _TrackIdentity:
     reid_candidate: int | None = None
     reid_votes: int = 0
     reid_day: date | None = None
+    learning_revision: int | None = None  # durable revision a REID identity was admitted under
 
     def clear(self) -> None:
         self.employee_id = self.source = self.last_face_mono = self.reid_candidate = None
         self.reid_votes = 0
         self.last_face_day = self.reid_day = None
+        self.learning_revision = None
 
     def roll_day(self, day: date) -> None:
         if self.last_face_day != day:
@@ -233,7 +244,7 @@ def loaded_providers(*, detector=None, live=None, enroll=None, reid=None, scene=
 
 class AIWorker(threading.Thread):
     def __init__(self, manager, service, presence, detection_state, global_manager=None,
-                 *, doorway=None, journal=None, reid=None, appearance_gallery=None):
+                 *, doorway=None, journal=None, reid=None, appearance_gallery=None, learning_store=None):
         super().__init__(name="ai-worker", daemon=True)
         self.manager, self.service, self.presence = manager, service, presence
         self.state, self.global_manager = detection_state, global_manager
@@ -256,6 +267,12 @@ class AIWorker(threading.Thread):
         self._appearance_seconds_per_crop = None
         self.model_ids = {}
         self._runnable_ids = set()
+        # Durable supervised BODY evidence. Omitted (legacy/fixtures): face-derived-only matching.
+        # The attribute may be assigned before the thread starts. `_learning` is the one snapshot
+        # this worker has adopted; it is compared with the durable revision at every consumer.
+        self.learning_store = learning_store
+        self._learning: LearningSnapshot | None = None
+        self._learning_retry_at = float("-inf")
 
     def stop(self, timeout=None):
         self._stop_event.set()
@@ -300,6 +317,7 @@ class AIWorker(threading.Thread):
             return
         with publication_guard(self.presence.engine):
             current = self._read_configurations() if configurations is None else configurations
+            self._fence_learning_identities(current)
             for crossing in crossings:
                 if crossing.direction not in ("ENTRY", "EXIT"):
                     continue
@@ -310,7 +328,14 @@ class AIWorker(threading.Thread):
                 employee_id = crossing.confirmed_employee_id
                 if employee_id is None:
                     identity = self._identities.get((camera_id, generation, track))
-                    employee_id = identity.employee_id if identity is not None else None
+                    if identity is not None and identity.source == "REID" and self.learning_store is not None:
+                        # Supervised BODY evidence admits a crossing only in its own current epoch and day.
+                        current_body = (self._journal_generations.get(camera_id) == generation
+                                        and self._reid_current(identity)
+                                        and identity.reid_day == local_date(milliseconds(crossing.occurred_at)))
+                        employee_id = identity.employee_id if current_body else None
+                    else:
+                        employee_id = identity.employee_id if identity is not None else None
                 if employee_id is None:
                     continue
                 self.presence.record_crossing(
@@ -322,6 +347,94 @@ class AIWorker(threading.Thread):
         if self.appearance_gallery is not None:
             self.appearance_gallery.clear()
         self._appearance_pending.clear()
+
+    @staticmethod
+    def _durable_token(configurations):
+        for config in configurations.values():
+            return config.learning_revision, config.gallery_revision
+        return None
+
+    def _clear_reid(self):
+        """Drop BODY evidence only: queued crops, votes and REID names. FACE identities, camera
+        generations, journal visits and trackers are untouched. Caller holds the publication guard."""
+        self._appearance_pending.clear()
+        for identity in self._identities.values():
+            if identity.source == "REID":
+                identity.clear()
+            identity.reid_candidate, identity.reid_votes = None, 0
+
+    def _fence_learning_identities(self, configurations):
+        """Disable BODY naming the instant the durable revision differs from the adopted snapshot.
+
+        Must run under the publication guard with configurations read in that same guard, before
+        any consumer of cached REID names. Never refreshes (no database read under the guard)."""
+        snapshot = self._learning
+        if self.learning_store is None or snapshot is None:
+            return  # body naming is already disabled: no REID identity or vote can exist
+        token = self._durable_token(configurations)
+        model_id = getattr(self.reid, "model_id", None)
+        if (token is not None and model_id is not None and snapshot.body_model_id == model_id
+                and token == (snapshot.revision, snapshot.gallery_revision) and token[0] >= 0):
+            return
+        self._learning = None
+        self._clear_reid()
+
+    def _refresh_learning(self, configurations):
+        """Adopt the store's snapshot once it equals the durable revisions; retry on a slow cadence."""
+        store = self.learning_store
+        token = self._durable_token(configurations)
+        if store is None or token is None or token[0] < 0:
+            return
+        snapshot = self._learning
+        if snapshot is not None and token == (snapshot.revision, snapshot.gallery_revision):
+            return
+        model_id = getattr(self.reid, "model_id", None)
+        if self.reid is None or model_id is None or store.body_model_id != model_id:
+            return
+
+        def acceptable(candidate):
+            return (candidate.loaded and candidate.body_model_id == model_id
+                    and (candidate.revision, candidate.gallery_revision) == token)
+
+        candidate = store.snapshot()
+        if not acceptable(candidate):
+            now = time.monotonic()
+            if now < self._learning_retry_at:
+                return
+            try:
+                candidate = store.refresh()
+            except Exception:
+                self._learning_retry_at = now + 1.
+                logger.exception("Learned appearance unavailable")
+                return
+            if not acceptable(candidate):
+                # A commit raced this read; the next cycle re-reads the durable revision.
+                self._learning_retry_at = now + .25
+                return
+        with publication_guard(self.presence.engine):
+            self._learning = candidate
+            self._clear_reid()
+
+    def _reid_current(self, identity):
+        snapshot = self._learning
+        return (snapshot is not None and identity.learning_revision == snapshot.revision
+                and identity.employee_id in snapshot.names)
+
+    def _learning_work_current(self, work, configurations):
+        if self.learning_store is None:
+            return True
+        snapshot = self._learning
+        if work.learning_revision is None:
+            return snapshot is None  # face teaching only, while body naming is unavailable
+        token = self._durable_token(configurations)
+        return (snapshot is not None and work.learning_revision == snapshot.revision
+                and token == (snapshot.revision, snapshot.gallery_revision))
+
+    def _queued_learning_revision(self):
+        return self._learning.revision if self.learning_store is not None and self._learning is not None else None
+
+    def _published_learning_revision(self, config):
+        return config.learning_revision if self.learning_store is not None and config.learning_revision >= 0 else None
 
     def flush(self, reason):
         for camera_id in list(self._configurations):
@@ -383,6 +496,7 @@ class AIWorker(threading.Thread):
                 self._reset_camera(camera_id, "CONFIGURATION_UNAVAILABLE")
             self._record_crossings(self.doorway.expire(now))
             return False
+        self._refresh_learning(configurations)
         candidates = {camera_id: config for camera_id, _packet, config in packets}
         if selected and configurations:
             self.service.set_expected_gallery_revision(next(iter(configurations.values())).gallery_revision)
@@ -454,6 +568,7 @@ class AIWorker(threading.Thread):
     def _publish_outcomes(self, submissions, outcomes, revision, started, completed):
         with publication_guard(self.presence.engine):
             configurations = self._read_configurations()
+            self._fence_learning_identities(configurations)
             self._drain_journal(configurations)
             for submission, outcome in zip(submissions, outcomes):
                 camera_id, packet, config, reader, epoch = submission
@@ -476,7 +591,8 @@ class AIWorker(threading.Thread):
                 self.state.update(camera_id, outcome.detections, packet=packet,
                                   generation=outcome.tracking_generation, configuration=config,
                                   identities=identities,
-                                  person_detections=zip(outcome.person_regions, outcome.person_scores))
+                                  person_detections=zip(outcome.person_regions, outcome.person_scores),
+                                  learning_revision=self._published_learning_revision(config))
                 self._queue_appearance(submission, outcome, revision)
                 finished = time.monotonic()
                 self.metrics.complete(camera_id, packet.received_mono, finished, skipped=skipped,
@@ -532,6 +648,21 @@ class AIWorker(threading.Thread):
                 if identity is not None:
                     identity.clear()
         known = {}
+        body = self.learning_store is not None
+        observed = {person.track_id for person in outcome.observed_tracks}
+        if body:
+            # An authoritative FACE employee supersedes a same-camera REID holder of that employee
+            # on any other track, before any overlay or attendance, whatever the iteration order.
+            authoritative: dict[int, set] = {}
+            for person in outcome.detections:
+                if (person.employee_id is not None and not person.association_uncertain
+                        and _GALLERY_LOST.isdisjoint(person.identity_reason_codes)):
+                    authoritative.setdefault(person.employee_id, set()).add(person.track_id)
+            for other_key, other in self._identities.items():
+                faces = authoritative.get(other.employee_id)
+                if (faces is not None and other_key[0] == camera_id and other.source == "REID"
+                        and not (other_key[1] == generation and other_key[2] in faces)):
+                    other.clear()
         for person in outcome.detections:
             key = (camera_id, generation, person.track_id)
             identity = self._identities.get(key)
@@ -542,10 +673,13 @@ class AIWorker(threading.Thread):
             else:
                 self._identities.move_to_end(key)
             identity.roll_day(day)
-            if person.association_uncertain or not _GALLERY_LOST.isdisjoint(person.identity_reason_codes):
+            if identity.source == "REID" and body and not self._reid_current(identity):
+                identity.clear()
+            lost = not _GALLERY_LOST.isdisjoint(person.identity_reason_codes)
+            if person.association_uncertain or (lost and not body):
                 identity.clear()
             else:
-                if person.employee_id is not None:
+                if person.employee_id is not None and not lost:
                     if identity.employee_id != person.employee_id or identity.source != "FACE":
                         if identity.employee_id != person.employee_id:
                             identity.last_face_mono = None
@@ -556,12 +690,20 @@ class AIWorker(threading.Thread):
                             and evidence.confirmed_employee_id == person.employee_id):
                         identity.last_face_mono = packet.received_mono
                         identity.last_face_day = day
-                if identity.employee_id is not None and config.time_tracking:
+                elif lost and identity.source == "FACE":
+                    # Face-store loss drops FACE only; unconfirmed BODY votes and REID names persist.
+                    identity.employee_id = identity.source = identity.last_face_mono = None
+                    identity.last_face_day = None
+                if (identity.employee_id is not None and config.time_tracking
+                        and (identity.source != "REID" or not body or person.track_id in observed)):
                     self.presence.observe(camera_id, identity.employee_id, identity.source, packet.received_at)
             if identity.employee_id is not None:
-                name = (person.employee_name if person.employee_id == identity.employee_id
-                        else self.service.store.employee_name(identity.employee_id)
-                        if self.service.store is not None else None)
+                if identity.source == "REID" and body:
+                    name = self._learning.names.get(identity.employee_id)
+                else:
+                    name = (person.employee_name if person.employee_id == identity.employee_id
+                            else self.service.store.employee_name(identity.employee_id)
+                            if self.service.store is not None else None)
                 known[person.track_id] = (identity.employee_id, identity.source, name)
         return known
 
@@ -599,7 +741,7 @@ class AIWorker(threading.Thread):
 
     def _queue_appearance(self, submission, outcome, revision):
         if self.reid is None or self.journal is None or (
-                self.global_manager is None and self.appearance_gallery is None):
+                self.global_manager is None and self.appearance_gallery is None and self.learning_store is None):
             return
         camera_id, packet, config, reader, epoch = submission
         day = local_date(milliseconds(packet.received_at))
@@ -650,7 +792,7 @@ class AIWorker(threading.Thread):
                 packet.source_revision, packet.stream_id, packet.seq, packet.received_at,
                 packet.received_mono, person.bbox, (bottom - top) / (right - left),
                 min(1., max(0., float(person.person_score))), employee_id, learn_employee_id, config, epoch,
-                revision, id(reader), resized)
+                revision, id(reader), resized, self._queued_learning_revision())
             if work.visit_id not in self._appearance_pending:
                 counts[camera_id] = counts.get(camera_id, 0) + 1
             self._appearance_pending[work.visit_id] = work
@@ -661,6 +803,7 @@ class AIWorker(threading.Thread):
                 and self._journal_generations.get(work.camera_id) == work.tracking_generation
                 and self._last_seq.get(work.camera_id) == work.seq
                 and time.monotonic() - work.received_mono <= settings.track_lost_timeout
+                and self._learning_work_current(work, configurations)
                 and self._is_current(work.camera_id, work, work.config, reader, work.epoch,
                                      work.gallery_revision, configurations))
 
@@ -689,6 +832,7 @@ class AIWorker(threading.Thread):
         try:
             with publication_guard(self.presence.engine):
                 configurations = self._read_configurations()
+                self._fence_learning_identities(configurations)
                 while self._appearance_pending and len(batch) < limit:
                     cameras = sorted({work.camera_id for work in self._appearance_pending.values()})
                     camera_id = next((key for key in cameras if key > self._appearance_cursor), cameras[0])
@@ -717,6 +861,7 @@ class AIWorker(threading.Thread):
             # Never hold the publication guard during a model call.
             with publication_guard(self.presence.engine):
                 configurations = self._read_configurations()
+                self._fence_learning_identities(configurations)
                 self._drain_journal(configurations)
                 items = []
                 for work, vector in zip(batch, vectors):
@@ -728,15 +873,18 @@ class AIWorker(threading.Thread):
                         continue
                     binding.last_appearance = work.received_mono
                     store = self.service.store
-                    if (self.appearance_gallery is not None and store is not None
-                            and store.revision == work.config.gallery_revision):
-                        if work.learn_employee_id is not None and store.is_active(work.learn_employee_id):
-                            self.appearance_gallery.learn(work.learn_employee_id, vector, work.received_at)
-                        else:
-                            identity = self._identities.get(
-                                (work.camera_id, work.tracking_generation, work.track_id))
-                            if identity is not None and identity.source != "FACE":
-                                self._match_appearance(work, identity, vector)
+                    face_ready = (self.appearance_gallery is not None and store is not None
+                                  and store.revision == work.config.gallery_revision)
+                    identity = self._identities.get((work.camera_id, work.tracking_generation, work.track_id))
+                    if (face_ready and work.learn_employee_id is not None
+                            and store.is_active(work.learn_employee_id)):
+                        self.appearance_gallery.learn(work.learn_employee_id, vector, work.received_at)
+                    elif identity is not None and identity.source != "FACE":
+                        if self.learning_store is not None:
+                            if work.learning_revision is not None:
+                                self._match_learning(work, identity, vector)
+                        elif face_ready:
+                            self._match_appearance(work, identity, vector)
                     if self.global_manager is not None:
                         items.append(EmbeddingItem(
                             work.visit_id, work.camera_id, work.tracking_generation, work.track_id,
@@ -781,6 +929,35 @@ class AIWorker(threading.Thread):
             return
         identity.employee_id, identity.source = matched, "REID"
 
+    def _match_learning(self, work, identity, vector):
+        """Supervised BODY match: durable same-day examples plus transient FACE-derived samples.
+
+        Same vote/occupancy safeguards as the face-derived path; the store is the only source of
+        active owners and names, so no face-gallery membership is required."""
+        day = local_date(milliseconds(work.received_at))
+        identity.roll_day(day)
+        snapshot = self._learning
+        if snapshot is None or work.learning_revision != snapshot.revision:
+            identity.reid_candidate, identity.reid_votes = None, 0
+            return
+        transient = self.appearance_gallery.samples_for_day(day) if self.appearance_gallery is not None else {}
+        ranked = match_body(snapshot, vector, observed_at=work.received_at, transient_samples=transient)
+        if ranked is None:
+            identity.reid_candidate, identity.reid_votes = None, 0
+            return
+        matched = ranked.employee_id
+        if matched != identity.reid_candidate:
+            identity.reid_candidate, identity.reid_votes = matched, 1
+        else:
+            identity.reid_votes += 1
+        if identity.reid_votes < REID_VOTES:
+            return
+        if any(other is not identity and other.employee_id == matched
+               for key, other in self._identities.items() if key[0] == work.camera_id):
+            return
+        identity.employee_id, identity.source = matched, "REID"
+        identity.learning_revision = snapshot.revision
+
     def _reset_camera(self, camera_id, reason="STREAM_RESET"):
         self._reset_epochs[camera_id] = self._reset_epochs.get(camera_id, 0) + 1
         generation = self._journal_generations.pop(camera_id, None)
@@ -806,6 +983,10 @@ class AIWorker(threading.Thread):
             runtime = db.get(AttendanceRuntime, 1)
             if runtime is None:
                 raise SQLAlchemyError("Attendance runtime unavailable")
+            learning = 0
+            if self.learning_store is not None:
+                row = db.get(RecognitionLearningRuntime, 1)
+                learning = int(row.revision) if row is not None else -1
             for config, camera_enabled, profile in db.query(AttendanceCamera, Camera.enabled, CameraProfile).join(
                     Camera, Camera.id == AttendanceCamera.camera_id).join(
                     CameraProfile, CameraProfile.camera_id == AttendanceCamera.camera_id):
@@ -819,7 +1000,7 @@ class AIWorker(threading.Thread):
                 result[config.camera_id] = _CameraConfiguration(
                     config.source_revision, config.revision, camera_enabled,
                     attendance, config.role, calibration, runtime.gallery_revision,
-                    profile.ai_enabled, profile.ai_fps, profile.time_tracking)
+                    profile.ai_enabled, profile.ai_fps, profile.time_tracking, learning)
             return result
         return read_snapshot(self.presence.engine, read)
 
@@ -911,9 +1092,22 @@ def build_enroll_engine(bundle: ModelBundle | None) -> Optional[FaceEngine]:
         return None
 
 
+def build_body_enroll_engine(bundle: ModelBundle | None, providers: list | None = None):
+    """Separate enrollment-owned body extractor; never shares the live worker's session."""
+    if bundle is None:
+        return None
+    setup_cuda_dlls()
+    try:
+        from app.ai.reid import PersonReID
+        return PersonReID(bundle, providers or resolve_providers(settings.ai_device))
+    except Exception as exc:
+        logger.error("Enrollment body model unavailable: %s", getattr(exc, "code", type(exc).__name__))
+        return None
+
+
 def build_ai_worker(
     manager: ReaderManager, presence, store: EmbeddingStore | None,
-    *, bundle: ModelBundle | None, session_factory, journal, notifier=None,
+    *, bundle: ModelBundle | None, session_factory, journal, notifier=None, learning_store=None,
 ) -> Optional[AIWorker]:
     """Require people and journal storage, not face/gallery/appearance availability."""
     if bundle is None or session_factory is None:
@@ -939,17 +1133,21 @@ def build_ai_worker(
         logger.error("Live face model unavailable: %s", getattr(exc, "code", type(exc).__name__))
     global_manager = None
     reid = None
-    if settings.multi_camera_tracking_enabled:
+    try:
+        # Local supervised BODY recognition does not depend on cross-camera linking.
+        from app.ai.reid import PersonReID
+        reid = PersonReID(bundle, providers)
+    except Exception as exc:
+        logger.error("Optional appearance unavailable: %s", getattr(exc, "code", type(exc).__name__))
+    if reid is not None and settings.multi_camera_tracking_enabled:
         try:
             from app.ai.global_tracker import CameraTopology, GlobalIdentityManager
-            from app.ai.reid import PersonReID
             topology_path = Path(settings.topology_config)
             if not topology_path.is_absolute():
                 topology_path = BASE_DIR / topology_path
-            reid = PersonReID(bundle, providers)
             global_manager = GlobalIdentityManager(CameraTopology.load(str(topology_path)), notifier=notifier)
         except Exception as exc:
-            logger.error("Optional appearance unavailable: %s", getattr(exc, "code", type(exc).__name__))
+            logger.error("Cross-camera linking unavailable: %s", getattr(exc, "code", type(exc).__name__))
     service = RecognitionService(
         detector, face_engine, store,
         min_confidence=settings.min_recognition_confidence,
@@ -960,7 +1158,7 @@ def build_ai_worker(
     state = DetectionState()
     logger.info("AI Provider: %s", provider_label(detector.session.get_providers()))
     worker = AIWorker(manager, service, presence, state, global_manager=global_manager,
-                      journal=journal, reid=reid,
+                      journal=journal, reid=reid, learning_store=learning_store,
                       appearance_gallery=EmployeeAppearanceGallery() if reid is not None else None)
     worker.model_ids = {
         "bundle": bundle.bundle_id, "face": bundle.face_model_id,
