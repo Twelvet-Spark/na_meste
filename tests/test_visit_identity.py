@@ -105,6 +105,10 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual([r["id"] for r in selected], [identifier])
             self.assertEqual(client.json("GET", "/api/global-persons/visits?employee_id=8")["items"], [])
             self.assertNotIn("snapshot", selected[0])
+            restored = client.json("POST", url + "/identity",
+                                   identity_body(expected_revision=1, mode="AI", employee_id=None))
+            self.assertEqual(restored["ai_employee_name"], "AI's different employee")
+            self.assertEqual(restored["employee_name"], restored["ai_employee_name"])
 
     def test_unknown_restore_and_idempotency_are_audited(self):
         with api() as (client, engine):

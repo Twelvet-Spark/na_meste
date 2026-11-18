@@ -61,6 +61,16 @@ def post_photo(client, visit_id, data, files=(), **kwargs):
 
 
 class VisitPhotoTests(unittest.TestCase):
+    def test_enrollment_availability_is_independent_of_retained_face(self):
+        with fixture() as (engine, service, _, _, visit_id, _):
+            service.face_engine = Faces()
+            with immediate_session(engine) as db:
+                db.get(HumanVisit, visit_id).face_thumbnail = None
+            client = client_for(engine, service)
+            self.assertTrue(client.json('GET', f'/api/global-persons/visits/{visit_id}')['enrollment_available'])
+            service.face_engine = None
+            self.assertFalse(client.json('GET', f'/api/global-persons/visits/{visit_id}')['enrollment_available'])
+
     def test_upload_matches_real_gallery_and_last_sample_can_be_removed_without_model(self):
         with fixture() as (engine, service, _, clock, visit_id, original):
             service.face_engine = Faces()
@@ -83,6 +93,10 @@ class VisitPhotoTests(unittest.TestCase):
             items = client.json('GET', f"/api/global-persons/visits/{visit_id}/employee-samples")['items']
             self.assertEqual(len(items), 1)
             self.assertFalse(items[0]['present'])
+            self.assertEqual(items[0]['removal']['actor'], 'Operator')
+            self.assertEqual(items[0]['removal']['reason'], 'Wrong sample')
+            self.assertEqual(items[0]['removal']['request_id'], remove['request_id'])
+            self.assertIsNotNone(items[0]['removal']['created_at'])
             with Session(engine) as db:
                 self.assertEqual(db.query(EmployeeFace).count(), 0)
                 self.assertEqual(db.query(FaceModelMetadata).count(), 0)

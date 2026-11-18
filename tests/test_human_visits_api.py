@@ -44,6 +44,9 @@ class SampleBoundary:
     def __init__(self, error=None):
         self.error = error
 
+    def model_available(self):
+        return True
+
     def eligibility(self, visit):
         return bool(visit.face_thumbnail), None if visit.face_thumbnail else "VISIT_FACE_MISSING"
 

@@ -86,7 +86,7 @@ class VisitSampleService:
         self.store = store
         self.now = now
 
-    def _model_available(self):
+    def model_available(self):
         return (self.face_engine is not None and self.face_model_id is not None
                 and self.face_engine.model_id == self.face_model_id
                 and self.face_engine.alignment_id == ALIGNMENT_ID)
@@ -124,7 +124,7 @@ class VisitSampleService:
             self._checked_face(visit, decode=True)
         except HTTPException as exc:
             return False, exc.detail["code"]
-        return (True, None) if self._model_available() else (False, "FACE_MODEL_UNAVAILABLE")
+        return (True, None) if self.model_available() else (False, "FACE_MODEL_UNAVAILABLE")
 
     @staticmethod
     def _digest(visit_id, employee_id, expected_revision, face_sha256, actor, reason):
@@ -148,7 +148,7 @@ class VisitSampleService:
                 blob, image = self._checked_face(reader.get(HumanVisit, visit_id), face_sha256, decode=True)
                 if reader.query(EmployeeFace).filter_by(employee_id=employee_id).count() >= 15:
                     raise _error(409, "FACE_LIMIT_REACHED")
-            if not self._model_available():
+            if not self.model_available():
                 raise _error(503, "FACE_MODEL_UNAVAILABLE")
             # No read/write transaction remains open while acquiring or using the engine.
             with employees.enrollment_slot(self.semaphore):
@@ -158,7 +158,7 @@ class VisitSampleService:
                 except Exception as exc:
                     logger.exception("Visit face preparation unavailable")
                     raise _error(503, "FACE_MODEL_UNAVAILABLE") from exc
-            if vector is None or not self._model_available():
+            if vector is None or not self.model_available():
                 raise _error(503, "FACE_MODEL_UNAVAILABLE")
             prepared = employees.PreparedFace(f"visit-{visit_id}.jpg", vector.tobytes(), blob,
                                                self.face_model_id, ALIGNMENT_ID)
@@ -231,7 +231,7 @@ class VisitSampleService:
                 saved = check_source(reader.get(HumanVisit, visit_id))
                 if reader.query(EmployeeFace).filter_by(employee_id=payload.employee_id).count() >= 15:
                     raise _error(409, "FACE_LIMIT_REACHED")
-            if not self._model_available():
+            if not self.model_available():
                 raise _error(503, "FACE_MODEL_UNAVAILABLE")
             if payload.source == "PHOTO_CROP":
                 filename = f"visit-{visit_id}.png"
@@ -258,7 +258,7 @@ class VisitSampleService:
                     raise _error(503, "FACE_MODEL_UNAVAILABLE") from exc
             if isinstance(prepared, employees.FaceEnrollResult):
                 raise employees.photo_failure([{"filename": filename, "error": prepared.error}])
-            if not self._model_available():
+            if not self.model_available():
                 raise _error(503, "FACE_MODEL_UNAVAILABLE")
             return self._commit_sample(
                 visit_id, payload.employee_id, payload.expected_revision, payload.request_id, digest,
@@ -308,6 +308,15 @@ class VisitSampleService:
                 OperatorRequest.operation.in_((OPERATION, PHOTO_OPERATION)),
                 func.json_extract(OperatorRequest.result, "$.visit_id") == str(visit_id),
             ).order_by(OperatorRequest.created_at.desc(), OperatorRequest.id.desc()).all()
+            removals = db.query(OperatorRequest).filter(
+                OperatorRequest.operation == REMOVE_OPERATION,
+                func.json_extract(OperatorRequest.result, "$.visit_id") == str(visit_id),
+            ).all()
+            removal_by_sample = {
+                row.result["sample_request_id"]: dict(request_id=row.id,
+                    created_at=attendance_iso(row.created_at), actor=row.result["actor"], reason=row.result["reason"])
+                for row in removals
+            }
             faces = {row.id: row for row in db.query(EmployeeFace).filter(
                 EmployeeFace.id.in_([r.result["face_id"] for r in rows])).all()} if rows else {}
             return {"items": [dict(
@@ -318,4 +327,5 @@ class VisitSampleService:
                           row.result["sample_key"] == _sample_key(faces[row.result["face_id"]]))
                          if "sample_key" in row.result else None),
                 removable="sample_key" in row.result,
+                removal=removal_by_sample.get(row.id),
             ) for row in rows]}

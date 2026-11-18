@@ -215,7 +215,8 @@ def api_get_visit(visit_id: UUID, request: Request, db: Session = Depends(get_db
     result.update(face_sha256=(hashlib.sha256(visit.face_thumbnail).hexdigest()
                                if result["face_status"] == "AVAILABLE" and visit.face_thumbnail else None),
                   face_quality=_public_scalars(visit.face_quality, _FACE_QUALITY),
-                  employee_sample_eligible=eligible, employee_sample_reason=reason)
+                  employee_sample_eligible=eligible, employee_sample_reason=reason,
+                  enrollment_available=service is not None and service.model_available())
     result["photo_sha256"] = (hashlib.sha256(visit.snapshot).hexdigest()
                               if result["photo_status"] == "AVAILABLE" and visit.snapshot else None)
     result["time_bounds"] = {"started_at": attendance_iso(milliseconds(visit.started_at)),

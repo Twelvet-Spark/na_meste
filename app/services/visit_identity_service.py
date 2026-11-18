@@ -39,13 +39,15 @@ def effective_identity(db, visit):
     mode = revision.mode if revision else "AI"
     employee_id = visit.employee_id if mode == "AI" else revision.employee_id
     employee = db.get(Employee, employee_id) if employee_id is not None else None
+    ai_employee = db.get(Employee, visit.employee_id) if visit.employee_id is not None else None
     return dict(identity_revision=revision.revision if revision else 0,
                 identity_source="AI" if mode == "AI" else "OPERATOR",
                 identity_state=(visit.identity_state if mode == "AI" else
                                 "OPERATOR_CONFIRMED" if mode == "EMPLOYEE" else "OPERATOR_UNKNOWN"),
                 employee_id=employee_id, employee_name=employee.name if employee else None,
                 employee_active=employee.active if employee else None,
-                ai_employee_id=visit.employee_id, ai_identity_state=visit.identity_state)
+                ai_employee_id=visit.employee_id, ai_employee_name=ai_employee.name if ai_employee else None,
+                ai_identity_state=visit.identity_state)
 
 
 class VisitIdentityService:

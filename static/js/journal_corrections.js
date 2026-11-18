@@ -7,6 +7,10 @@
   const endpoint = `/api/global-persons/visits/${encodeURIComponent(root.dataset.visitId)}`;
   const states = Object.fromEntries(['identity', 'sample', 'time'].map((name) => [name, { busy: false, pending: null }]));
   const errors = {
+    FACE_MODEL_UNAVAILABLE: 'Модель лиц недоступна. Добавление фото отключено; исправление личности и удаление образцов доступны. Проверьте диагностику и обновите наблюдение после восстановления модели.',
+    ENROLLMENT_UNAVAILABLE: 'Подготовка фото недоступна. Исправление личности и удаление образцов доступны. Проверьте диагностику и обновите наблюдение.',
+    VISIT_SAMPLE_ALREADY_REMOVED: 'Этот образец уже удалён. История обновлена.',
+    VISIT_SAMPLE_NOT_FOUND: 'Запись об этом образце не найдена. История обновлена.',
     IDENTITY_REVISION_CONFLICT: 'Личность уже изменена. Обновите наблюдение и проверьте решение заново.',
     VISIT_FACE_MISSING: 'Сохранённого лица нет. Выберите фрагмент снимка или загрузите фотографию.',
     VISIT_FACE_EXPIRED: 'Срок хранения лица истёк. Загрузите фотографию; личность можно исправить без неё.',
@@ -70,7 +74,7 @@
     $('identity-search').disabled = $('identity-mode').value !== 'EMPLOYEE';
     const chosen = employees.find((row) => String(row.id) === $('identity-employee').value);
     $('identity-employee-status').textContent = chosen && !chosen.active ? 'Сотрудник неактивен. Историческое исправление разрешено; оно не включает сотрудника.' : '';
-    $('sample-submit').disabled = refreshBusy || states.sample.busy || !visit || (!states.sample.pending && (employeeLoading || !employee || employee.faces_count >= 15 || !sourceReady() || !$('sample-confirm').checked));
+    $('sample-submit').disabled = refreshBusy || states.sample.busy || !visit || (!states.sample.pending && (!visit.enrollment_available || employeeLoading || !employee || employee.faces_count >= 15 || !sourceReady() || !$('sample-confirm').checked));
     $('sample-submit').textContent = states.sample.pending ? 'Повторить тот же запрос' : 'Добавить образец';
     $('sample-reconcile').disabled = blocked('sample') || employeeLoading;
     $('sample-employee').disabled = employeeLoading;
@@ -97,15 +101,28 @@
     try {
       result = await UI.api(endpoint + frozen.path, { method: 'POST', ...frozen.options });
     } catch (error) {
-      const uncertain = !error.status || error.status < 400 || error.status === 408 || error.status >= 500;
+      const unavailable = name === 'sample' && error.status === 503 && ['FACE_MODEL_UNAVAILABLE', 'ENROLLMENT_UNAVAILABLE'].includes(error.detail?.code);
+      const uncertain = !unavailable && (!error.status || error.status < 400 || error.status === 408 || error.status >= 500);
       if (uncertain) message(name, errorText(error) + ' Результат не подтверждён. Повторите тот же запрос: сотрудник, данные и номер запроса зафиксированы. Не обновляйте страницу.', true);
       else {
         state.pending = null;
-        if (name === 'sample') { $('sample-confirm').checked = false; if (error.status === 409) employee = null; }
+        if (name === 'sample') {
+          $('sample-confirm').checked = false;
+          if (error.status === 409) employee = null;
+          if (unavailable) visit.enrollment_available = false;
+          if (error.detail?.code === 'VISIT_PHOTO_CHANGED') delete digests.photo;
+          if (error.detail?.code === 'VISIT_FACE_CHANGED') delete digests.face;
+          sourceChanged();
+        }
         if (name === 'time') invalidatePreview();
         message(name, errorText(error) + ' Эта операция не выполнена.', true);
       }
-      state.busy = false; sync(); return;
+      state.busy = false;
+      if (!uncertain && name === 'sample') {
+        loadHistory();
+        if (error.status === 409) loadEmployee();
+      }
+      sync(); return;
     }
     state.pending = null; state.busy = false;
     if (name === 'identity') {
@@ -181,8 +198,11 @@
     $('sample-confirm').checked = false;
     const source = $('sample-source').value;
     $('sample-crop').hidden = source !== 'PHOTO_CROP'; $('sample-upload').hidden = source !== 'UPLOAD';
+    bounds.forEach((input) => { input.disabled = source !== 'PHOTO_CROP'; });
+    $('sample-file').disabled = source !== 'UPLOAD';
     const ready = sourceReady();
-    $('sample-eligibility').textContent = source === 'UPLOAD' ? 'Выберите JPEG или PNG с одним чётким лицом. Файл проверяется сервером.'
+    $('sample-eligibility').textContent = !visit?.enrollment_available ? errors.FACE_MODEL_UNAVAILABLE
+      : source === 'UPLOAD' ? 'Выберите JPEG или PNG с одним чётким лицом. Файл проверяется сервером.'
       : ready ? 'Проверьте показанное изображение и выберите сотрудника вручную.'
         : source === 'PHOTO_CROP' ? 'Снимок недоступен. Обновите наблюдение или загрузите фотографию.'
           : errors[visit?.employee_sample_reason] || 'Подходящее сохранённое лицо недоступно. Выберите фрагмент снимка или загрузите фотографию.';
@@ -197,11 +217,14 @@
     if (!file) return;
     if (file.size > 15 * 1024 * 1024 || !['image/jpeg', 'image/png'].includes(file.type)) { message('sample', 'Нужен JPEG или PNG размером до 15 МиБ.', true); return; }
     try {
-      const url = URL.createObjectURL(file); uploadURL = url;
+      const blob = new Blob([await file.arrayBuffer()], { type: file.type });
+      if (ticket !== uploadVersion) return;
+      const url = URL.createObjectURL(blob); uploadURL = url;
       const decoded = new Image(); decoded.src = url; await decoded.decode();
       if (ticket !== uploadVersion) return;
       if (decoded.naturalWidth * decoded.naturalHeight > 20000000) throw new Error('Изображение больше 20 мегапикселей. Выберите меньший исходник.');
-      $('sample-upload-preview').src = url; $('sample-upload-preview').hidden = false; uploadFile = file;
+      $('sample-upload-preview').src = url; $('sample-upload-preview').hidden = false;
+      uploadFile = Object.freeze({ blob, name: file.name });
       message('sample', 'Фотография загружена для проверки. Подтвердите сотрудника.');
     } catch (error) { if (ticket === uploadVersion) message('sample', 'Не удалось открыть фотографию. ' + error.message, true); }
     if (ticket === uploadVersion) sync();
@@ -226,7 +249,7 @@
             if (blocked(name)) return;
             const human = audit(name); if (human) mutate(name, jsonRequest('/identity/restore', { ...human, expected_revision: visit.identity_revision, restore_revision: row.revision }));
           });
-          else if (name === 'sample') historyRow(target, `${row.employee_name} · ${row.source} · ${row.present === null ? 'Старый образец: наличие не подтверждено, удаление через карточку сотрудника' : row.present ? 'В галерее' : 'Удалён'} · ${auditText}`, 'Удалить этот образец', row.present && row.removable ? async () => {
+          else if (name === 'sample') historyRow(target, `${row.employee_name} · ${row.source} · ${row.present === null ? 'Старый образец: наличие не подтверждено, замена через карточку сотрудника' : row.present ? 'В галерее' : 'Удалён'} · ${auditText}${row.removal ? ` · Удаление: ${stamp(row.removal.created_at)} · ${row.removal.actor} · ${row.removal.reason}` : ''}`, 'Удалить этот образец', row.present && row.removable ? async () => {
             if (blocked(name)) return;
             const human = audit(name); if (!human) return;
             states.sample.busy = true; sync();
@@ -273,7 +296,7 @@
     Object.assign(payload, { source });
     if (source === 'PHOTO_CROP') Object.assign(payload, { crop: [...selection], photo_sha256: digests.photo });
     const body = new FormData(); body.append('metadata', JSON.stringify(payload));
-    if (source === 'UPLOAD') body.append('file', uploadFile, uploadFile.name);
+    if (source === 'UPLOAD') body.append('file', uploadFile.blob, uploadFile.name);
     mutate('sample', { path: '/employee-photo', options: { body } });
   };
   $('time-form').onsubmit = async (event) => {
@@ -309,6 +332,9 @@
   $('time-enabled').onchange = () => { $('time-form').hidden = !$('time-enabled').checked; invalidatePreview(); sync(); };
   $('identity-mode').onchange = sync; $('identity-employee').onchange = sync;
   for (const name of ['identity', 'sample']) $(name + '-search').oninput = () => { optionsFor(name); sync(); };
+  for (const name of ['identity', 'sample']) $(name + '-search').onkeydown = (event) => {
+    if (event.key === 'Enter') event.preventDefault();
+  };
   $('employees-retry').onclick = loadEmployees;
   $('sample-employee').onchange = loadEmployee; $('sample-reconcile').onclick = loadEmployee;
   $('sample-confirm').onchange = sync; $('sample-source').onchange = sourceChanged; $('sample-file').onchange = loadUpload;
